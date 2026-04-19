@@ -1,0 +1,9 @@
+# Subprojects have their own git repos; managed independently.
+/scalachess/
+/server/
+/chessground/
+
+# Local Claude Code configuration
+/.claude/
+
+.DS_Store
