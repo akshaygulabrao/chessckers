@@ -58,4 +58,5 @@ class EngineHandler(BaseHTTPRequestHandler):
 
 def make_server(host: str, port: int, client: ServerClient) -> ThreadingHTTPServer:
     handler_cls = type("BoundEngineHandler", (EngineHandler,), {"client": client})
+    ThreadingHTTPServer.allow_reuse_address = True
     return ThreadingHTTPServer((host, port), handler_cls)
