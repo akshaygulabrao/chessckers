@@ -13,9 +13,12 @@ that score to get the score from the perspective of the player who moved.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Protocol
 
 from chessckers_engine.material import material_for_side_to_move
+
+log = logging.getLogger("chessckers_engine.material_player")
 
 
 class _Mover(Protocol):
@@ -37,7 +40,16 @@ def pick_material(state: GameState, client: _Mover) -> LegalMove | None:
     best_score = None
     best_move: LegalMove | None = None
     for move in legal_moves:
-        new_state = client.make_move(fen, move["uci"])
+        try:
+            new_state = client.make_move(fen, move["uci"])
+        except Exception as e:  # noqa: BLE001
+            # Server can return moves in legalMoves that its own validator then
+            # rejects (known scalachess bug around e.p.-shaped captures against
+            # Chessckers towers). Skip those candidates rather than crash; if
+            # every candidate is rejected, fall back to the first legal move
+            # so the game can still progress.
+            log.debug("skipping unreachable candidate uci=%s: %s", move["uci"], e)
+            continue
         post_fen = new_state["fen"]
         # material_for_side_to_move(post_fen) is from the next-mover's perspective.
         # Negate to get the score from the perspective of the player who just moved.
@@ -45,4 +57,4 @@ def pick_material(state: GameState, client: _Mover) -> LegalMove | None:
         if best_score is None or score > best_score:
             best_score = score
             best_move = move
-    return best_move
+    return best_move if best_move is not None else legal_moves[0]

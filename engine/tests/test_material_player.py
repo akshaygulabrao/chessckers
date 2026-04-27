@@ -81,6 +81,39 @@ def test_calls_make_move_once_per_legal_move():
     assert len(client.calls) == 5
 
 
+def test_skips_candidates_whose_make_move_raises():
+    """When the server rejects a candidate (e.g. the e.p. bug), pick_material
+    should silently skip it and keep evaluating the rest."""
+    good = {"uci": "GOOD"}
+    broken = {"uci": "BROKEN"}
+
+    class PartialClient:
+        def make_move(self, fen: str, uci: str):
+            if uci == "BROKEN":
+                raise RuntimeError("server rejected this move")
+            return {"fen": _post_fen("", "b")}  # post: zero black material
+
+        def __init__(self) -> None:
+            pass
+
+    state = {"fen": BEFORE_WHITE_TO_MOVE, "legalMoves": [broken, good]}
+    chosen = pick_material(state, PartialClient())
+    assert chosen is good
+
+
+def test_falls_back_to_first_legal_when_every_candidate_raises():
+    a = {"uci": "A"}
+    b = {"uci": "B"}
+
+    class AllBrokenClient:
+        def make_move(self, fen, uci):
+            raise RuntimeError("boom")
+
+    state = {"fen": BEFORE_WHITE_TO_MOVE, "legalMoves": [a, b]}
+    chosen = pick_material(state, AllBrokenClient())
+    assert chosen is a  # first legal move
+
+
 def test_score_is_from_mover_perspective_for_black():
     """Black's turn. After Black's move, side to move is White. The picker should
     pick the move whose post-FEN is *worst for White* (i.e. best for Black, because
