@@ -1,22 +1,37 @@
+import logging
+import os
 import sys
 
 import httpx
 
-from chessckers_engine import ServerClient
+from chessckers_engine.http_server import make_server
+from chessckers_engine.server_client import ServerClient
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    log = logging.getLogger("chessckers_engine")
+
+    api_url = os.environ.get("API_URL", "http://localhost:8080")
+    host = os.environ.get("ENGINE_HOST", "127.0.0.1")
+    port = int(os.environ.get("ENGINE_PORT", "8082"))
+
+    client = ServerClient(base_url=api_url)
     try:
-        with ServerClient() as c:
-            state = c.new_game()
+        client.new_game()
     except httpx.ConnectError:
-        print("engine: cannot reach API at http://localhost:8080 (start the server first)")
+        log.error("cannot reach API at %s (start the server first)", api_url)
         return 1
-    print("engine: connected to server")
-    print(f"engine: starting FEN = {state['fen']}")
-    print(f"engine: legal moves at start = {len(state['legalMoves'])}")
-    print(f"engine: turn = {state['turn']}")
-    print("engine: placeholder run complete (self-play loop lands in milestone 3)")
+
+    server = make_server(host, port, client)
+    log.info("random-move opponent listening on http://%s:%d/move", host, port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log.info("shutting down")
+    finally:
+        server.server_close()
+        client.close()
     return 0
 
 

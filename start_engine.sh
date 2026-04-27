@@ -7,8 +7,10 @@ FRONT_DIR="$ROOT/chessground"
 ENGINE_DIR="$ROOT/engine"
 FRONT_PORT="${FRONT_PORT:-5173}"
 API_PORT="${API_PORT:-8080}"
+ENGINE_PORT="${ENGINE_PORT:-8082}"
 FRONT_URL="http://localhost:${FRONT_PORT}/chessckers.html"
 API_URL="http://localhost:${API_PORT}"
+ENGINE_URL="http://localhost:${ENGINE_PORT}"
 
 pids=()
 cleanup() {
@@ -45,8 +47,8 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
-echo "[3/3] Starting engine ..."
-( cd "$ENGINE_DIR" && uv run python -m chessckers_engine ) &
+echo "[3/3] Starting engine on port $ENGINE_PORT ..."
+( cd "$ENGINE_DIR" && API_URL="$API_URL" ENGINE_PORT="$ENGINE_PORT" uv run python -m chessckers_engine ) &
 pids+=($!)
 
 if command -v open >/dev/null 2>&1; then
@@ -58,6 +60,6 @@ fi
 echo
 echo "Frontend: $FRONT_URL"
 echo "API:      $API_URL"
-echo "Engine:   running (placeholder; behavior lands in milestone 3)"
+echo "Engine:   $ENGINE_URL (random-move opponent)"
 echo "Press Ctrl+C to stop all."
 wait
