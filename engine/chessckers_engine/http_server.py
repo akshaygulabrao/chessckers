@@ -1,12 +1,15 @@
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
 
-from chessckers_engine.random_player import pick_random
 from chessckers_engine.server_client import ServerClient
 
 log = logging.getLogger("chessckers_engine.http")
+
+GameState = dict[str, Any]
+LegalMove = dict[str, Any]
+Picker = Callable[[GameState], LegalMove | None]
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -17,6 +20,7 @@ CORS_HEADERS = {
 
 class EngineHandler(BaseHTTPRequestHandler):
     client: ServerClient
+    picker: Picker
 
     def log_message(self, fmt: str, *args: Any) -> None:
         log.info("%s - %s", self.address_string(), fmt % args)
@@ -52,11 +56,13 @@ class EngineHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(502, {"error": f"upstream API failed: {e}"})
             return
-        chosen = pick_random(state.get("legalMoves") or [])
+        chosen = self.picker(state)
         self._send_json(200, {"uci": chosen["uci"] if chosen else None})
 
 
-def make_server(host: str, port: int, client: ServerClient) -> ThreadingHTTPServer:
-    handler_cls = type("BoundEngineHandler", (EngineHandler,), {"client": client})
+def make_server(host: str, port: int, client: ServerClient, picker: Picker) -> ThreadingHTTPServer:
+    handler_cls = type(
+        "BoundEngineHandler", (EngineHandler,), {"client": client, "picker": staticmethod(picker)}
+    )
     ThreadingHTTPServer.allow_reuse_address = True
     return ThreadingHTTPServer((host, port), handler_cls)

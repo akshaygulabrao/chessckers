@@ -1,9 +1,10 @@
 import threading
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
 from chessckers_engine.http_server import make_server
+from chessckers_engine.random_player import pick_random
 
 
 class FakeClient:
@@ -16,9 +17,16 @@ class FakeClient:
         return self._state
 
 
-def _serve(state: dict[str, Any]) -> tuple[str, FakeClient, threading.Thread, Any]:
+def _random_picker(state: dict[str, Any]) -> dict[str, Any] | None:
+    return pick_random(state.get("legalMoves") or [])
+
+
+def _serve(
+    state: dict[str, Any],
+    picker: Callable[[dict[str, Any]], dict[str, Any] | None] = _random_picker,
+) -> tuple[str, FakeClient, threading.Thread, Any]:
     client = FakeClient(state)
-    server = make_server("127.0.0.1", 0, client)  # type: ignore[arg-type]
+    server = make_server("127.0.0.1", 0, client, picker)  # type: ignore[arg-type]
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -61,5 +69,22 @@ def test_options_preflight() -> None:
         r = httpx.options(f"{url}/move", timeout=2.0)
         assert r.status_code == 204
         assert r.headers["access-control-allow-origin"] == "*"
+    finally:
+        server.shutdown()
+
+
+def test_custom_picker_is_invoked_with_full_state() -> None:
+    state = {"fen": "FEN", "legalMoves": [{"uci": "e2e4"}, {"uci": "d2d4"}]}
+    seen: list[dict[str, Any]] = []
+
+    def fixed_picker(s: dict[str, Any]) -> dict[str, Any]:
+        seen.append(s)
+        return s["legalMoves"][1]
+
+    url, _c, _t, server = _serve(state, picker=fixed_picker)
+    try:
+        r = httpx.post(f"{url}/move", json={"fen": "FEN"}, timeout=2.0)
+        assert r.json() == {"uci": "d2d4"}
+        assert seen == [state]
     finally:
         server.shutdown()

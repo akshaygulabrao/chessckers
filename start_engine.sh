@@ -8,6 +8,8 @@ ENGINE_DIR="$ROOT/engine"
 FRONT_PORT="${FRONT_PORT:-5173}"
 API_PORT="${API_PORT:-8080}"
 ENGINE_PORT="${ENGINE_PORT:-8082}"
+ENGINE_PLAYER="${ENGINE_PLAYER:-random}"  # 'random' or 'nn'
+ENGINE_MODEL="${ENGINE_MODEL:-}"           # optional path to a torch state_dict for ENGINE_PLAYER=nn
 FRONT_URL="http://localhost:${FRONT_PORT}/chessckers.html"
 API_URL="http://localhost:${API_PORT}"
 ENGINE_URL="http://localhost:${ENGINE_PORT}"
@@ -49,8 +51,13 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
-echo "[3/3] Starting engine on port $ENGINE_PORT ..."
-( cd "$ENGINE_DIR" && API_URL="$API_URL" ENGINE_PORT="$ENGINE_PORT" exec uv run python -m chessckers_engine ) &
+echo "[3/3] Starting engine on port $ENGINE_PORT (player=$ENGINE_PLAYER) ..."
+( cd "$ENGINE_DIR" \
+  && API_URL="$API_URL" \
+     ENGINE_PORT="$ENGINE_PORT" \
+     ENGINE_PLAYER="$ENGINE_PLAYER" \
+     ENGINE_MODEL="$ENGINE_MODEL" \
+     exec uv run python -m chessckers_engine ) &
 pids+=($!)
 
 if command -v open >/dev/null 2>&1; then
@@ -62,6 +69,6 @@ fi
 echo
 echo "Frontend: $FRONT_URL"
 echo "API:      $API_URL"
-echo "Engine:   $ENGINE_URL (random-move opponent)"
+echo "Engine:   $ENGINE_URL ($ENGINE_PLAYER opponent)"
 echo "Press Ctrl+C to stop all."
 wait

@@ -1,0 +1,161 @@
+"""FEN and LegalMove tensor encodings for the Chessckers neural-net player.
+
+Position tensor: shape (14, 8, 8), dtype float32. Channels:
+   0  White Pawn          (one-hot per square from board bitboard)
+   1  White Knight
+   2  White Bishop
+   3  White Rook
+   4  White Queen
+   5  White King
+   6  Stone-top           (Chessckers convention: Black-Pawn bitboard = Stone top)
+   7  King-top            (Black-King bitboard = King top)
+   8  tower_height        (len(stack) / 24)
+   9  stone_count         (count(Stone) / 24)
+  10  king_count          (count(King) / 24)
+  11  top_is_unmoved_stone (1 iff stack top is unmoved Stone 's')
+  12  second_is_king      (1 iff stack[-2] is a King)
+  13  side_to_move        (all-1 if Black to move, else all-0)
+
+Squares use (file, rank) → tensor index (rank, file). Internal y axis runs
+0 (rank 1) to 7 (rank 8); FEN ranks are read top-to-bottom, so FEN's first
+rank string corresponds to y = 7.
+
+Move feature vector: shape (140,), dtype float32:
+   bits  0..63   from_square one-hot
+   bits 64..127  to_square one-hot
+   bit  128      is_capture
+   bit  129      is_chain         (waypoints non-empty)
+   bit  130      is_deploy        (deployCount set)
+   bit  131      is_ortho         (demotionsRequired set)
+   bit  132      chain_length / 8
+   bit  133      deploy_count / 24
+   bit  134      demotions_required / 8
+   bits 135..139 promotion one-hot over (none, q, r, b, n)
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+import torch
+
+POS_C = 14
+MOVE_D = 140
+
+# Position channel indices
+CH_W_PAWN, CH_W_KNIGHT, CH_W_BISHOP, CH_W_ROOK, CH_W_QUEEN, CH_W_KING = range(6)
+CH_STONE_TOP, CH_KING_TOP = 6, 7
+CH_TOWER_HEIGHT, CH_STONE_COUNT, CH_KING_COUNT = 8, 9, 10
+CH_TOP_IS_UNMOVED_STONE, CH_SECOND_IS_KING = 11, 12
+CH_SIDE_TO_MOVE = 13
+
+_WHITE_PIECE_CH = {
+    "P": CH_W_PAWN,
+    "N": CH_W_KNIGHT,
+    "B": CH_W_BISHOP,
+    "R": CH_W_ROOK,
+    "Q": CH_W_QUEEN,
+    "K": CH_W_KING,
+}
+_BLACK_BITBOARD_CH = {"p": CH_STONE_TOP, "k": CH_KING_TOP}
+
+# Move feature offsets
+MV_CAPTURE = 128
+MV_CHAIN = 129
+MV_DEPLOY = 130
+MV_ORTHO = 131
+MV_CHAIN_LEN = 132
+MV_DEPLOY_COUNT = 133
+MV_DEMOTIONS_REQ = 134
+MV_PROMO_BASE = 135  # 5 entries: none, q, r, b, n
+_PROMO_INDEX = {None: 0, "q": 1, "r": 2, "b": 3, "n": 4}
+
+_FEN_HEAD = re.compile(r"^([^\s\[]+)(?:\[([^\]]*)\])?\s+([wb])\b")
+
+
+def square_xy(square: str) -> tuple[int, int]:
+    """Return (file 0..7, rank 0..7) for a square name like 'a1' or 'h8'."""
+    return ord(square[0]) - ord("a"), int(square[1]) - 1
+
+
+def square_index(square: str) -> int:
+    """Return 0..63 with a1=0, b1=1, ..., h8=63."""
+    f, r = square_xy(square)
+    return r * 8 + f
+
+
+def encode_position(fen: str) -> torch.Tensor:
+    """Encode a Chessckers FEN as a (14, 8, 8) float32 tensor."""
+    m = _FEN_HEAD.match(fen)
+    if not m:
+        raise ValueError(f"unrecognized Chessckers FEN: {fen!r}")
+    board, overlay, turn = m.group(1), m.group(2), m.group(3)
+
+    out = torch.zeros((POS_C, 8, 8), dtype=torch.float32)
+
+    ranks = board.split("/")
+    if len(ranks) != 8:
+        raise ValueError(f"FEN board must have 8 ranks: {board!r}")
+    for fen_rank_idx, rank_str in enumerate(ranks):
+        y = 7 - fen_rank_idx
+        x = 0
+        for ch in rank_str:
+            if ch.isdigit():
+                x += int(ch)
+                continue
+            if ch in _WHITE_PIECE_CH:
+                out[_WHITE_PIECE_CH[ch], y, x] = 1.0
+            elif ch in _BLACK_BITBOARD_CH:
+                out[_BLACK_BITBOARD_CH[ch], y, x] = 1.0
+            # Other Black piece glyphs (n/b/r/q) shouldn't appear in Chessckers; ignored.
+            x += 1
+
+    if overlay:
+        for entry in overlay.split(","):
+            if ":" not in entry:
+                continue
+            sq, pieces = entry.split(":", 1)
+            x, y = square_xy(sq)
+            height = len(pieces)
+            if height == 0:
+                continue
+            stones = sum(1 for p in pieces if p in "sS")
+            kings = sum(1 for p in pieces if p == "k")
+            out[CH_TOWER_HEIGHT, y, x] = height / 24.0
+            out[CH_STONE_COUNT, y, x] = stones / 24.0
+            out[CH_KING_COUNT, y, x] = kings / 24.0
+            if pieces[-1] == "s":
+                out[CH_TOP_IS_UNMOVED_STONE, y, x] = 1.0
+            if height >= 2 and pieces[-2] == "k":
+                out[CH_SECOND_IS_KING, y, x] = 1.0
+
+    if turn == "b":
+        out[CH_SIDE_TO_MOVE].fill_(1.0)
+
+    return out
+
+
+def encode_move(move: dict[str, Any]) -> torch.Tensor:
+    """Encode a LegalMove dict (as returned by the API) as a (140,) float32 vector."""
+    out = torch.zeros(MOVE_D, dtype=torch.float32)
+    out[square_index(move["from"])] = 1.0
+    out[64 + square_index(move["to"])] = 1.0
+
+    if move.get("capture") is not None:
+        out[MV_CAPTURE] = 1.0
+    waypoints = move.get("waypoints") or []
+    if waypoints:
+        out[MV_CHAIN] = 1.0
+    if move.get("deployCount") is not None:
+        out[MV_DEPLOY] = 1.0
+    if move.get("demotionsRequired") is not None:
+        out[MV_ORTHO] = 1.0
+
+    out[MV_CHAIN_LEN] = len(waypoints) / 8.0
+    out[MV_DEPLOY_COUNT] = (move.get("deployCount") or 0) / 24.0
+    out[MV_DEMOTIONS_REQ] = (move.get("demotionsRequired") or 0) / 8.0
+
+    promo = move.get("promotion")
+    out[MV_PROMO_BASE + _PROMO_INDEX.get(promo, 0)] = 1.0
+    return out
