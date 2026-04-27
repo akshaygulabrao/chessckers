@@ -4,6 +4,7 @@ import sys
 
 import httpx
 
+from chessckers_engine.checkpoints import latest_checkpoint
 from chessckers_engine.http_server import GameState, LegalMove, Picker, make_server
 from chessckers_engine.material_player import pick_material
 from chessckers_engine.random_player import pick_random
@@ -56,8 +57,16 @@ def main() -> int:
     api_url = os.environ.get("API_URL", "http://localhost:8080")
     host = os.environ.get("ENGINE_HOST", "127.0.0.1")
     port = int(os.environ.get("ENGINE_PORT", "8082"))
-    model_path = os.environ.get("ENGINE_MODEL") or None
     default_picker = os.environ.get("ENGINE_DEFAULT_PICKER", "random")
+
+    # ENGINE_MODEL takes precedence; if unset, auto-pick the latest .pt under weights/.
+    model_path = os.environ.get("ENGINE_MODEL")
+    if not model_path:
+        latest = latest_checkpoint()
+        if latest is not None:
+            model_path = str(latest)
+            log.info("auto-selected latest checkpoint: %s", model_path)
+    model_path = model_path or None
 
     client = ServerClient(base_url=api_url)
     try:

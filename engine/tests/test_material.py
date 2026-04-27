@@ -72,3 +72,16 @@ def test_invalid_fen_raises():
 
     with pytest.raises(ValueError):
         material("not a fen")
+
+
+def test_king_value_override_zeros_out_king_for_training_targets():
+    # King is the only White piece; default value -> 1000, override -> 0
+    fen = "8/8/8/8/8/8/8/4K3 w - - 0 1"
+    assert material(fen) == 1000
+    assert material(fen, king_value=0) == 0
+
+
+def test_king_value_override_propagates_through_side_to_move_helper():
+    fen = "8/8/8/8/8/8/8/4K3 b - - 0 1"  # black to move; sign flips
+    assert material_for_side_to_move(fen) == -1000
+    assert material_for_side_to_move(fen, king_value=0) == 0

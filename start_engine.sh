@@ -11,7 +11,10 @@ ENGINE_PORT="${ENGINE_PORT:-8082}"
 # Engine hosts all pickers (random, material, nn); UI picks per-request via the
 # White/Black dropdowns. ENGINE_DEFAULT_PICKER only matters for non-UI clients.
 ENGINE_DEFAULT_PICKER="${ENGINE_DEFAULT_PICKER:-random}"
-ENGINE_MODEL="${ENGINE_MODEL:-}"  # optional path to a torch state_dict for the 'nn' picker
+# ENGINE_MODEL: explicit path to a torch state_dict for the 'nn' picker.
+# If unset, the engine auto-loads the most-recently-modified *.pt under
+# engine/weights/, or falls back to random init if that dir is empty.
+ENGINE_MODEL="${ENGINE_MODEL:-}"
 FRONT_URL="http://localhost:${FRONT_PORT}/chessckers.html"
 API_URL="http://localhost:${API_PORT}"
 ENGINE_URL="http://localhost:${ENGINE_PORT}"

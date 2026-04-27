@@ -19,20 +19,27 @@ from __future__ import annotations
 
 import re
 
-WHITE_VALUES: dict[str, int] = {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9, "K": 1000}
+WHITE_VALUES_DEFAULT: dict[str, int] = {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9, "K": 1000}
 BLACK_STONE_VALUE = 1
 BLACK_KING_VALUE = 2
 
 _FEN_HEAD = re.compile(r"^([^\s\[]+)(?:\[([^\]]*)\])?\s+([wb])\b")
 
 
-def material(fen: str) -> int:
+def material(fen: str, king_value: int = 1000) -> int:
+    """White material minus Black material.
+
+    `king_value` overrides the value of the White King. Default 1000 keeps the
+    1-ply picker from voluntarily losing its king. For supervised training
+    targets, pass `king_value=0` (king capture = mate, handled at status level).
+    """
     m = _FEN_HEAD.match(fen)
     if not m:
         raise ValueError(f"unrecognized FEN: {fen!r}")
     board, overlay = m.group(1), m.group(2)
 
-    white = sum(WHITE_VALUES[ch] for ch in board if ch in WHITE_VALUES)
+    values = {**WHITE_VALUES_DEFAULT, "K": king_value}
+    white = sum(values[ch] for ch in board if ch in values)
 
     black = 0
     if overlay:
@@ -49,10 +56,10 @@ def material(fen: str) -> int:
     return white - black
 
 
-def material_for_side_to_move(fen: str) -> int:
+def material_for_side_to_move(fen: str, king_value: int = 1000) -> int:
     m = _FEN_HEAD.match(fen)
     if not m:
         raise ValueError(f"unrecognized FEN: {fen!r}")
     turn = m.group(3)
-    raw = material(fen)
+    raw = material(fen, king_value=king_value)
     return raw if turn == "w" else -raw
