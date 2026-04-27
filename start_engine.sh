@@ -8,8 +8,10 @@ ENGINE_DIR="$ROOT/engine"
 FRONT_PORT="${FRONT_PORT:-5173}"
 API_PORT="${API_PORT:-8080}"
 ENGINE_PORT="${ENGINE_PORT:-8082}"
-ENGINE_PLAYER="${ENGINE_PLAYER:-random}"  # 'random' or 'nn'
-ENGINE_MODEL="${ENGINE_MODEL:-}"           # optional path to a torch state_dict for ENGINE_PLAYER=nn
+# Engine hosts all pickers (random, material, nn); UI picks per-request via the
+# White/Black dropdowns. ENGINE_DEFAULT_PICKER only matters for non-UI clients.
+ENGINE_DEFAULT_PICKER="${ENGINE_DEFAULT_PICKER:-random}"
+ENGINE_MODEL="${ENGINE_MODEL:-}"  # optional path to a torch state_dict for the 'nn' picker
 FRONT_URL="http://localhost:${FRONT_PORT}/chessckers.html"
 API_URL="http://localhost:${API_PORT}"
 ENGINE_URL="http://localhost:${ENGINE_PORT}"
@@ -51,11 +53,11 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
-echo "[3/3] Starting engine on port $ENGINE_PORT (player=$ENGINE_PLAYER) ..."
+echo "[3/3] Starting engine on port $ENGINE_PORT (default picker=$ENGINE_DEFAULT_PICKER) ..."
 ( cd "$ENGINE_DIR" \
   && API_URL="$API_URL" \
      ENGINE_PORT="$ENGINE_PORT" \
-     ENGINE_PLAYER="$ENGINE_PLAYER" \
+     ENGINE_DEFAULT_PICKER="$ENGINE_DEFAULT_PICKER" \
      ENGINE_MODEL="$ENGINE_MODEL" \
      exec uv run python -m chessckers_engine ) &
 pids+=($!)
@@ -69,6 +71,6 @@ fi
 echo
 echo "Frontend: $FRONT_URL"
 echo "API:      $API_URL"
-echo "Engine:   $ENGINE_URL ($ENGINE_PLAYER opponent)"
+echo "Engine:   $ENGINE_URL (pickers: random, material, nn; UI selects per side)"
 echo "Press Ctrl+C to stop all."
 wait

@@ -1,9 +1,9 @@
 import threading
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 
-from chessckers_engine.http_server import make_server
+from chessckers_engine.http_server import Picker, make_server
 from chessckers_engine.random_player import pick_random
 
 
@@ -23,17 +23,24 @@ def _random_picker(state: dict[str, Any]) -> dict[str, Any] | None:
 
 def _serve(
     state: dict[str, Any],
-    picker: Callable[[dict[str, Any]], dict[str, Any] | None] = _random_picker,
+    pickers: dict[str, Picker] | None = None,
+    default: str = "random",
 ) -> tuple[str, FakeClient, threading.Thread, Any]:
     client = FakeClient(state)
-    server = make_server("127.0.0.1", 0, client, picker)  # type: ignore[arg-type]
+    server = make_server(
+        "127.0.0.1",
+        0,
+        client,  # type: ignore[arg-type]
+        pickers if pickers is not None else {"random": _random_picker},
+        default_picker=default,
+    )
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return f"http://127.0.0.1:{port}", client, thread, server
 
 
-def test_move_picks_from_legal_moves() -> None:
+def test_move_uses_default_picker_when_request_has_no_picker_field() -> None:
     state = {"legalMoves": [{"uci": "f6g5"}, {"uci": "f6h4"}]}
     url, client, _t, server = _serve(state)
     try:
@@ -73,18 +80,40 @@ def test_options_preflight() -> None:
         server.shutdown()
 
 
-def test_custom_picker_is_invoked_with_full_state() -> None:
+def test_picker_field_routes_to_named_picker() -> None:
     state = {"fen": "FEN", "legalMoves": [{"uci": "e2e4"}, {"uci": "d2d4"}]}
-    seen: list[dict[str, Any]] = []
 
-    def fixed_picker(s: dict[str, Any]) -> dict[str, Any]:
-        seen.append(s)
-        return s["legalMoves"][1]
+    def picker_a(_s):
+        return {"uci": "FROM_A"}
 
-    url, _c, _t, server = _serve(state, picker=fixed_picker)
+    def picker_b(_s):
+        return {"uci": "FROM_B"}
+
+    url, _c, _t, server = _serve(state, pickers={"a": picker_a, "b": picker_b}, default="a")
     try:
+        r = httpx.post(f"{url}/move", json={"fen": "FEN", "picker": "b"}, timeout=2.0)
+        assert r.json() == {"uci": "FROM_B"}
+        # Default kicks in when picker is omitted
         r = httpx.post(f"{url}/move", json={"fen": "FEN"}, timeout=2.0)
-        assert r.json() == {"uci": "d2d4"}
-        assert seen == [state]
+        assert r.json() == {"uci": "FROM_A"}
     finally:
         server.shutdown()
+
+
+def test_unknown_picker_returns_400() -> None:
+    state = {"fen": "FEN", "legalMoves": [{"uci": "e2e4"}]}
+    url, _c, _t, server = _serve(state, pickers={"random": _random_picker}, default="random")
+    try:
+        r = httpx.post(f"{url}/move", json={"fen": "FEN", "picker": "no-such"}, timeout=2.0)
+        assert r.status_code == 400
+        assert "no-such" in r.json()["error"]
+    finally:
+        server.shutdown()
+
+
+def test_make_server_rejects_default_picker_not_in_pickers() -> None:
+    import pytest
+
+    client = FakeClient({"legalMoves": []})
+    with pytest.raises(ValueError):
+        make_server("127.0.0.1", 0, client, {"a": _random_picker}, default_picker="b")  # type: ignore[arg-type]

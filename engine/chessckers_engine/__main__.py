@@ -5,44 +5,48 @@ import sys
 import httpx
 
 from chessckers_engine.http_server import GameState, LegalMove, Picker, make_server
+from chessckers_engine.material_player import pick_material
 from chessckers_engine.random_player import pick_random
 from chessckers_engine.server_client import ServerClient
 
 
-def _build_random_picker() -> Picker:
-    def picker(state: GameState) -> LegalMove | None:
+def _build_pickers(client: ServerClient, model_path: str | None, log: logging.Logger) -> dict[str, Picker]:
+    pickers: dict[str, Picker] = {}
+
+    def random_picker(state: GameState) -> LegalMove | None:
         return pick_random(state.get("legalMoves") or [])
 
-    return picker
+    pickers["random"] = random_picker
 
+    def material_picker(state: GameState) -> LegalMove | None:
+        return pick_material(state, client)
 
-def _build_nn_picker(model_path: str | None, log: logging.Logger) -> Picker:
-    import torch
+    pickers["material"] = material_picker
 
-    from chessckers_engine.model import ChesskersScorer
-    from chessckers_engine.nn_player import pick_nn
+    # NN picker (lazy: only import torch if requested)
+    try:
+        import torch
 
-    model = ChesskersScorer()
-    if model_path:
-        log.info("loading model weights from %s", model_path)
-        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(state_dict)
-    else:
-        log.info("no ENGINE_MODEL set; using random-init weights (plays random-ish)")
-    model.eval()
+        from chessckers_engine.model import ChesskersScorer
+        from chessckers_engine.nn_player import pick_nn
 
-    def picker(state: GameState) -> LegalMove | None:
-        return pick_nn(state, model)
+        model = ChesskersScorer()
+        if model_path:
+            log.info("loading NN weights from %s", model_path)
+            state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+            model.load_state_dict(state_dict)
+        else:
+            log.info("no ENGINE_MODEL set; NN picker uses random-init weights")
+        model.eval()
 
-    return picker
+        def nn_picker(state: GameState) -> LegalMove | None:
+            return pick_nn(state, model)
 
+        pickers["nn"] = nn_picker
+    except Exception as e:  # noqa: BLE001
+        log.warning("NN picker unavailable (%s: %s); 'random' and 'material' still work", type(e).__name__, e)
 
-def _select_picker(player: str, model_path: str | None, log: logging.Logger) -> tuple[Picker, str]:
-    if player == "random":
-        return _build_random_picker(), "random-move"
-    if player == "nn":
-        return _build_nn_picker(model_path, log), "neural-net"
-    raise ValueError(f"ENGINE_PLAYER must be 'random' or 'nn'; got {player!r}")
+    return pickers
 
 
 def main() -> int:
@@ -52,8 +56,8 @@ def main() -> int:
     api_url = os.environ.get("API_URL", "http://localhost:8080")
     host = os.environ.get("ENGINE_HOST", "127.0.0.1")
     port = int(os.environ.get("ENGINE_PORT", "8082"))
-    player = os.environ.get("ENGINE_PLAYER", "random")
     model_path = os.environ.get("ENGINE_MODEL") or None
+    default_picker = os.environ.get("ENGINE_DEFAULT_PICKER", "random")
 
     client = ServerClient(base_url=api_url)
     try:
@@ -62,15 +66,15 @@ def main() -> int:
         log.error("cannot reach API at %s (start the server first)", api_url)
         return 1
 
-    try:
-        picker, label = _select_picker(player, model_path, log)
-    except ValueError as e:
-        log.error(str(e))
+    pickers = _build_pickers(client, model_path, log)
+    if default_picker not in pickers:
+        log.error("ENGINE_DEFAULT_PICKER=%r is not in available pickers %s", default_picker, sorted(pickers))
         client.close()
         return 2
 
-    server = make_server(host, port, client, picker)
-    log.info("%s opponent listening on http://%s:%d/move", label, host, port)
+    server = make_server(host, port, client, pickers, default_picker=default_picker)
+    log.info("listening on http://%s:%d/move; pickers=%s; default=%s",
+             host, port, sorted(pickers), default_picker)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

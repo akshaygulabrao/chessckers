@@ -20,7 +20,8 @@ CORS_HEADERS = {
 
 class EngineHandler(BaseHTTPRequestHandler):
     client: ServerClient
-    picker: Picker
+    pickers: dict[str, Picker]
+    default_picker_name: str
 
     def log_message(self, fmt: str, *args: Any) -> None:
         log.info("%s - %s", self.address_string(), fmt % args)
@@ -51,18 +52,42 @@ class EngineHandler(BaseHTTPRequestHandler):
         if not isinstance(fen, str) or not fen:
             self._send_json(400, {"error": "missing 'fen'"})
             return
+
+        picker_name = body.get("picker") or self.default_picker_name
+        picker = self.pickers.get(picker_name)
+        if picker is None:
+            self._send_json(
+                400,
+                {"error": f"unknown picker {picker_name!r}; known: {sorted(self.pickers)}"},
+            )
+            return
+
         try:
             state = self.client.new_game(fen)
         except Exception as e:
             self._send_json(502, {"error": f"upstream API failed: {e}"})
             return
-        chosen = self.picker(state)
+        chosen = picker(state)
         self._send_json(200, {"uci": chosen["uci"] if chosen else None})
 
 
-def make_server(host: str, port: int, client: ServerClient, picker: Picker) -> ThreadingHTTPServer:
+def make_server(
+    host: str,
+    port: int,
+    client: ServerClient,
+    pickers: dict[str, Picker],
+    default_picker: str = "random",
+) -> ThreadingHTTPServer:
+    if default_picker not in pickers:
+        raise ValueError(f"default picker {default_picker!r} not in pickers {sorted(pickers)}")
     handler_cls = type(
-        "BoundEngineHandler", (EngineHandler,), {"client": client, "picker": staticmethod(picker)}
+        "BoundEngineHandler",
+        (EngineHandler,),
+        {
+            "client": client,
+            "pickers": pickers,
+            "default_picker_name": default_picker,
+        },
     )
     ThreadingHTTPServer.allow_reuse_address = True
     return ThreadingHTTPServer((host, port), handler_cls)
