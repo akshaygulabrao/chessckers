@@ -18,6 +18,7 @@ def main() -> int:
     host = os.environ.get("ENGINE_HOST", "127.0.0.1")
     port = int(os.environ.get("ENGINE_PORT", "8082"))
     default_picker = os.environ.get("ENGINE_DEFAULT_PICKER", "random")
+    mcts_sims = int(os.environ.get("ENGINE_MCTS_SIMS", "100"))
 
     # ENGINE_MODEL takes precedence; if unset, auto-pick the latest .pt under weights/.
     model_path = os.environ.get("ENGINE_MODEL")
@@ -35,7 +36,7 @@ def main() -> int:
         log.error("cannot reach API at %s (start the server first)", api_url)
         return 1
 
-    pickers = build_pickers(client, model_path, log)
+    pickers = build_pickers(client, model_path, log, mcts_sims=mcts_sims)
     if default_picker not in pickers:
         log.error("ENGINE_DEFAULT_PICKER=%r is not in available pickers %s", default_picker, sorted(pickers))
         client.close()

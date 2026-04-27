@@ -12,12 +12,17 @@ import logging
 
 from chessckers_engine.http_server import GameState, LegalMove, Picker
 from chessckers_engine.material_player import pick_material
+from chessckers_engine.mcts import pick_mcts
 from chessckers_engine.random_player import pick_random
 from chessckers_engine.server_client import ServerClient
 
 
 def build_pickers(
-    client: ServerClient, model_path: str | None, log: logging.Logger
+    client: ServerClient,
+    model_path: str | None,
+    log: logging.Logger,
+    mcts_sims: int = 100,
+    puct_sims: int = 50,
 ) -> dict[str, Picker]:
     pickers: dict[str, Picker] = {}
 
@@ -31,17 +36,20 @@ def build_pickers(
 
     pickers["material"] = material_picker
 
-    try:
-        import torch
+    def mcts_picker(state: GameState) -> LegalMove | None:
+        return pick_mcts(state, client, n_sims=mcts_sims)
 
+    pickers["mcts"] = mcts_picker
+
+    try:
+        from chessckers_engine.checkpoints import load_checkpoint
         from chessckers_engine.model import ChesskersScorer
         from chessckers_engine.nn_player import pick_nn
 
         model = ChesskersScorer()
         if model_path:
             log.info("loading NN weights from %s", model_path)
-            state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-            model.load_state_dict(state_dict)
+            load_checkpoint(model, model_path)
         else:
             log.info("no model path provided; NN picker uses random-init weights")
         model.eval()
@@ -50,8 +58,15 @@ def build_pickers(
             return pick_nn(state, model)
 
         pickers["nn"] = nn_picker
+
+        from chessckers_engine.mcts_puct import pick_puct
+
+        def puct_picker(state: GameState) -> LegalMove | None:
+            return pick_puct(state, client, model, n_sims=puct_sims)
+
+        pickers["puct"] = puct_picker
     except Exception as e:  # noqa: BLE001
-        log.warning("NN picker unavailable (%s: %s); 'random' and 'material' still work",
+        log.warning("NN-based pickers unavailable (%s: %s); 'random'/'material' still work",
                     type(e).__name__, e)
 
     return pickers

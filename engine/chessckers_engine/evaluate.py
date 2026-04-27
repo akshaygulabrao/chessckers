@@ -108,8 +108,9 @@ def format_results(white_name: str, black_name: str, counts: dict[str, int]) -> 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     p = argparse.ArgumentParser()
-    p.add_argument("--white", required=True, choices=["random", "material", "nn"])
-    p.add_argument("--black", required=True, choices=["random", "material", "nn"])
+    p.add_argument("--white", required=True, choices=["random", "material", "mcts", "nn"])
+    p.add_argument("--black", required=True, choices=["random", "material", "mcts", "nn"])
+    p.add_argument("--mcts-sims", type=int, default=100, help="MCTS simulations per move")
     p.add_argument("--games", type=int, default=20)
     p.add_argument("--max-plies", type=int, default=400)
     p.add_argument("--model", default=None, help="Path to .pt weights for nn (default: auto-discovery)")
@@ -130,7 +131,7 @@ def main() -> int:
         log.error("cannot reach API at %s: %s", args.api_url, e)
         return 1
 
-    pickers = build_pickers(client, model_path, log)
+    pickers = build_pickers(client, model_path, log, mcts_sims=args.mcts_sims)
     if args.white not in pickers or args.black not in pickers:
         log.error("requested picker not available; available=%s", sorted(pickers))
         client.close()
