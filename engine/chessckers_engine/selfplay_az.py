@@ -102,8 +102,15 @@ def play_az_game(
     temperature: float = 1.0,
     max_plies: int = 400,
     rng: torch.Generator | None = None,
+    dirichlet_alpha: float | None = 0.3,
+    dirichlet_eps: float = 0.25,
 ) -> AZGame:
-    """Play one self-play game using PUCT MCTS at each move."""
+    """Play one self-play game using PUCT MCTS at each move.
+
+    `dirichlet_alpha=0.3` (AlphaZero-chess default) injects Dirichlet noise
+    into root priors at every move, ensuring exploration of low-prior moves.
+    Set to None to disable (e.g., for deterministic eval-style games).
+    """
     state = client.new_game()
     records: list[AZRecord] = []
     ply = 0
@@ -111,7 +118,12 @@ def play_az_game(
         legal = state.get("legalMoves") or []
         if not legal:
             break
-        result = run_mcts(state, client, model, n_sims=n_sims, c_puct=c_puct)
+        result = run_mcts(
+            state, client, model,
+            n_sims=n_sims, c_puct=c_puct,
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_eps=dirichlet_eps,
+        )
         visits = _aligned_visits(result.visit_distribution, legal)
         records.append(
             AZRecord(

@@ -67,6 +67,8 @@ def run_az_iterations(
     eval_games: int,
     weights_dir: Path,
     seed: int = 0,
+    dirichlet_alpha: float | None = 0.3,
+    dirichlet_eps: float = 0.25,
 ) -> list[dict]:
     weights_dir.mkdir(parents=True, exist_ok=True)
     summaries: list[dict] = []
@@ -79,7 +81,13 @@ def run_az_iterations(
         outcomes = {"white": 0, "black": 0, "draw": 0}
         examples = []
         for gi in range(games_per_iter):
-            game = play_az_game(model, client, n_sims=n_sims, c_puct=c_puct, temperature=temp, rng=g)
+            game = play_az_game(
+                model, client,
+                n_sims=n_sims, c_puct=c_puct,
+                temperature=temp, rng=g,
+                dirichlet_alpha=dirichlet_alpha,
+                dirichlet_eps=dirichlet_eps,
+            )
             outcomes[game.outcome] += 1
             examples.extend(az_game_to_examples(game))
             log.info("  game %d/%d done: %s, %d records", gi + 1, games_per_iter, game.outcome, len(game.records))
@@ -132,6 +140,13 @@ def main() -> int:
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--temperature-final", type=float, default=0.3)
     p.add_argument("--eval-games", type=int, default=5)
+    p.add_argument(
+        "--dirichlet-alpha",
+        type=float,
+        default=0.3,
+        help="Dirichlet noise concentration for root priors during self-play (set <=0 to disable)",
+    )
+    p.add_argument("--dirichlet-eps", type=float, default=0.25)
     p.add_argument("--base", default=None)
     p.add_argument("--weights-dir", default=str(DEFAULT_WEIGHTS_DIR))
     p.add_argument("--seed", type=int, default=0)
@@ -150,6 +165,7 @@ def main() -> int:
         log.info("warm-starting from %s", args.base)
         load_checkpoint(model, args.base)
 
+    alpha = args.dirichlet_alpha if args.dirichlet_alpha > 0 else None
     summaries = run_az_iterations(
         model=model,
         client=client,
@@ -164,6 +180,8 @@ def main() -> int:
         eval_games=args.eval_games,
         weights_dir=Path(args.weights_dir),
         seed=args.seed,
+        dirichlet_alpha=alpha,
+        dirichlet_eps=args.dirichlet_eps,
     )
 
     print("\n  iter | τ     | examples | policy | value  | self-play W/B/D | puct(W)vs.rand | puct(B)vs.rand")

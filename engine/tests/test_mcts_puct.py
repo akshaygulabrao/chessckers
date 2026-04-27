@@ -180,3 +180,119 @@ def test_pick_puct_falls_back_when_every_candidate_fails():
     model = ChesskersScorer().eval()
     chosen = pick_puct(state, client, model, n_sims=5)
     assert chosen is a
+
+
+# ---- Dirichlet noise ----
+
+
+def test_dirichlet_noise_changes_root_priors_when_enabled():
+    """With and without noise, the root's priors after expansion should differ."""
+    a, b, c = _move("A"), _move("B"), _move("C")
+    state = {"fen": FEN_W, "legalMoves": [a, b, c]}
+    client = _StubClient(
+        {
+            (FEN_W, "A"): {"fen": FEN_B, "legalMoves": []},
+            (FEN_W, "B"): {"fen": FEN_B, "legalMoves": []},
+            (FEN_W, "C"): {"fen": FEN_B, "legalMoves": []},
+        }
+    )
+    torch.manual_seed(0)
+    model = ChesskersScorer().eval()
+
+    torch.manual_seed(42)
+    no_noise = run_mcts(state, client, model, n_sims=5, dirichlet_alpha=None)
+    no_noise_priors = [c.prior for c in no_noise.root.children.values()]
+
+    torch.manual_seed(42)
+    with_noise = run_mcts(state, client, model, n_sims=5, dirichlet_alpha=0.3, dirichlet_eps=0.25)
+    with_noise_priors = [c.prior for c in with_noise.root.children.values()]
+
+    assert no_noise_priors != with_noise_priors
+
+
+def test_dirichlet_noise_preserves_prior_sum_to_one():
+    """After mixing, the priors at the root should still sum to ~1."""
+    a, b, c, d = _move("A"), _move("B"), _move("C"), _move("D")
+    state = {"fen": FEN_W, "legalMoves": [a, b, c, d]}
+    client = _StubClient(
+        {(FEN_W, m["uci"]): {"fen": FEN_B, "legalMoves": []} for m in [a, b, c, d]}
+    )
+    torch.manual_seed(0)
+    model = ChesskersScorer().eval()
+    result = run_mcts(state, client, model, n_sims=2, dirichlet_alpha=0.3, dirichlet_eps=0.25)
+    total = sum(c.prior for c in result.root.children.values())
+    assert abs(total - 1.0) < 1e-5
+
+
+def test_dirichlet_noise_with_eps_zero_is_a_no_op():
+    """eps=0 means the noise contributes nothing; priors should equal raw NN softmax."""
+    a, b = _move("A"), _move("B")
+    state = {"fen": FEN_W, "legalMoves": [a, b]}
+    client = _StubClient({(FEN_W, "A"): {"fen": FEN_B, "legalMoves": []},
+                          (FEN_W, "B"): {"fen": FEN_B, "legalMoves": []}})
+    torch.manual_seed(0)
+    model = ChesskersScorer().eval()
+
+    torch.manual_seed(7)
+    no_noise = run_mcts(state, client, model, n_sims=2, dirichlet_alpha=None)
+    torch.manual_seed(7)
+    eps_zero = run_mcts(state, client, model, n_sims=2, dirichlet_alpha=0.3, dirichlet_eps=0.0)
+
+    no_priors = [c.prior for c in no_noise.root.children.values()]
+    eps0_priors = [c.prior for c in eps_zero.root.children.values()]
+    for p1, p2 in zip(no_priors, eps0_priors):
+        assert abs(p1 - p2) < 1e-6
+
+
+def test_dirichlet_noise_only_at_root_not_at_deeper_nodes():
+    """A child of the root, even if it gets expanded, should NOT have noise
+    applied to its own children's priors. Only the root's children priors are
+    affected."""
+    a, b = _move("A"), _move("B")
+    a1, a2 = _move("A1"), _move("A2")  # children at the next level (after playing 'A')
+
+    state = {"fen": FEN_W, "legalMoves": [a, b]}
+    # Stub returns fresh state with two legal moves after A (so child gets expanded too)
+    after_a = {"fen": FEN_B, "legalMoves": [a1, a2]}
+    client_table = {
+        (FEN_W, "A"): after_a,
+        (FEN_W, "B"): {"fen": FEN_B, "legalMoves": []},
+        (FEN_B, "A1"): {"fen": FEN_W, "legalMoves": []},
+        (FEN_B, "A2"): {"fen": FEN_W, "legalMoves": []},
+    }
+
+    class Client:
+        def new_game(self, fen=None):
+            if fen == FEN_B:
+                return after_a
+            return {"fen": fen, "legalMoves": []}
+
+        def make_move(self, fen, uci):
+            if (fen, uci) not in client_table:
+                raise RuntimeError("no")
+            return client_table[(fen, uci)]
+
+    torch.manual_seed(0)
+    model = ChesskersScorer().eval()
+
+    # Run enough sims to expand both the root and its 'A' child.
+    torch.manual_seed(123)
+    no_noise_result = run_mcts(state, Client(), model, n_sims=10, dirichlet_alpha=None)
+    torch.manual_seed(123)
+    with_noise_result = run_mcts(state, Client(), model, n_sims=10, dirichlet_alpha=0.3, dirichlet_eps=0.5)
+
+    # Root priors should differ (noise applied).
+    no_root_priors = [c.prior for c in no_noise_result.root.children.values()]
+    noisy_root_priors = [c.prior for c in with_noise_result.root.children.values()]
+    assert no_root_priors != noisy_root_priors
+
+    # But the child node 'A's grandchildren priors should be identical
+    # between the two runs (same seed → same NN output → same softmax;
+    # noise only touches the root).
+    a_child_no_noise = no_noise_result.root.children["A"]
+    a_child_noisy = with_noise_result.root.children["A"]
+    if a_child_no_noise.children and a_child_noisy.children:
+        no_grand = [c.prior for c in a_child_no_noise.children.values()]
+        noisy_grand = [c.prior for c in a_child_noisy.children.values()]
+        for p1, p2 in zip(no_grand, noisy_grand):
+            assert abs(p1 - p2) < 1e-6

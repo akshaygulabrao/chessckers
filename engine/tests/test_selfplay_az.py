@@ -92,11 +92,13 @@ class _GameClient:
         return self.states[self.cursor]
 
 
-def _fake_run_mcts_returning_uniform_visits(state, client, model, n_sims=8, c_puct=1.5):
-    """Stand-in for run_mcts that distributes visits uniformly across legal moves."""
+def _fake_run_mcts_returning_uniform_visits(state, client, model, **_kwargs):
+    """Stand-in for run_mcts that distributes visits uniformly across legal moves.
+    Accepts and ignores all kwargs (n_sims, c_puct, dirichlet_alpha, dirichlet_eps)."""
     from chessckers_engine.mcts_puct import MctsResult, PuctNode
 
     legal = state.get("legalMoves") or []
+    n_sims = _kwargs.get("n_sims", 8)
     visit_dist = {m["uci"]: max(n_sims // max(len(legal), 1), 1) for m in legal}
     chosen = legal[0] if legal else None
     return MctsResult(chosen=chosen, visit_distribution=visit_dist, root=PuctNode(fen=state["fen"], move_to_here=None))

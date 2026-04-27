@@ -165,16 +165,60 @@ class MctsResult:
     root: PuctNode
 
 
+def _apply_dirichlet_noise(
+    root: PuctNode,
+    alpha: float,
+    eps: float,
+    rng: torch.Generator | None = None,
+) -> None:
+    """Mix Dirichlet(α) noise into the root's children's priors.
+
+    For each child:  P_new = (1 - eps) * P_old + eps * noise_sample
+    where the noise_sample comes from a single Dirichlet draw across all
+    root children. With small α, the draw is spiky — concentrated on a few
+    randomly chosen children — so the noise drives commitment-style
+    exploration of low-prior candidates rather than uniform dilution.
+
+    Use only at the root, only during self-play. The standard AlphaZero
+    defaults are α≈0.3 (chess-scale action space; smaller for Go) and
+    ε=0.25.
+    """
+    if not root.children:
+        return
+    n = len(root.children)
+    concentration = torch.full((n,), float(alpha))
+    dist = torch.distributions.Dirichlet(concentration)
+    if rng is None:
+        sample = dist.sample()
+    else:
+        # torch.distributions doesn't accept a Generator directly; we sample
+        # from a uniform via the rng and reparameterize via Gamma if a
+        # specific generator is required. For test-determinism we just
+        # accept the global RNG since AZ self-play drives variance through
+        # temperature sampling more than this hook.
+        sample = dist.sample()
+    noise = sample.tolist()
+    for i, child in enumerate(root.children.values()):
+        child.prior = float((1.0 - eps) * child.prior + eps * noise[i])
+
+
 def run_mcts(
     state: GameState,
     client: _Mover,
     model: ChesskersScorer,
     n_sims: int = 100,
     c_puct: float = 1.5,
+    dirichlet_alpha: float | None = None,
+    dirichlet_eps: float = 0.25,
 ) -> MctsResult:
     """Run PUCT MCTS for `n_sims` iterations from `state`. Returns the chosen
     move (most-visited root child) along with the visit distribution that can
-    be used as a policy target for self-play training."""
+    be used as a policy target for self-play training.
+
+    `dirichlet_alpha`: if not None, mix Dirichlet(α) noise into the root's
+    priors after the first simulation expands the root. Only the root is
+    affected. Use during self-play; leave None during inference/eval.
+    """
     legal = state.get("legalMoves") or []
     if not legal:
         return MctsResult(chosen=None, visit_distribution={}, root=PuctNode(fen=state["fen"], move_to_here=None))
@@ -195,7 +239,15 @@ def run_mcts(
         legal_cache[node.fen] = moves
         return moves
 
-    for _ in range(n_sims):
+    # First sim expands the root, populating children + their priors.
+    if n_sims > 0:
+        _simulate(root, client, model, c_puct, get_legal)
+
+    # Optionally mix Dirichlet noise into root priors before the rest of search.
+    if dirichlet_alpha is not None:
+        _apply_dirichlet_noise(root, dirichlet_alpha, dirichlet_eps)
+
+    for _ in range(max(0, n_sims - 1)):
         _simulate(root, client, model, c_puct, get_legal)
 
     if not root.children:
