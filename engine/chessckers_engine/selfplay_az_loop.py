@@ -69,6 +69,7 @@ def run_az_iterations(
     seed: int = 0,
     dirichlet_alpha: float | None = 0.3,
     dirichlet_eps: float = 0.25,
+    grad_clip: float | None = 1.0,
 ) -> list[dict]:
     weights_dir.mkdir(parents=True, exist_ok=True)
     summaries: list[dict] = []
@@ -94,7 +95,11 @@ def run_az_iterations(
 
         log.info("iter %d/%d: %d examples; outcomes %s",
                  it + 1, n_iters, len(examples), outcomes)
-        result = train_az(model, examples, epochs=epochs, lr=lr, seed=seed + it, log_every=0)
+        result = train_az(
+            model, examples,
+            epochs=epochs, lr=lr, seed=seed + it, log_every=0,
+            grad_clip=grad_clip,
+        )
         ckpt = weights_dir / f"iter-az-{it + 1:03d}.pt"
         save_checkpoint(model, ckpt)
 
@@ -147,6 +152,8 @@ def main() -> int:
         help="Dirichlet noise concentration for root priors during self-play (set <=0 to disable)",
     )
     p.add_argument("--dirichlet-eps", type=float, default=0.25)
+    p.add_argument("--grad-clip", type=float, default=1.0,
+                   help="Max gradient norm; <=0 to disable")
     p.add_argument("--base", default=None)
     p.add_argument("--weights-dir", default=str(DEFAULT_WEIGHTS_DIR))
     p.add_argument("--seed", type=int, default=0)
@@ -166,6 +173,7 @@ def main() -> int:
         load_checkpoint(model, args.base)
 
     alpha = args.dirichlet_alpha if args.dirichlet_alpha > 0 else None
+    grad_clip = args.grad_clip if args.grad_clip > 0 else None
     summaries = run_az_iterations(
         model=model,
         client=client,
@@ -182,6 +190,7 @@ def main() -> int:
         seed=args.seed,
         dirichlet_alpha=alpha,
         dirichlet_eps=args.dirichlet_eps,
+        grad_clip=grad_clip,
     )
 
     print("\n  iter | τ     | examples | policy | value  | self-play W/B/D | puct(W)vs.rand | puct(B)vs.rand")

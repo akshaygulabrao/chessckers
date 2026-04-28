@@ -70,6 +70,37 @@ def test_empty_examples_returns_zero_losses_without_crashing():
     assert all(e["total"] == 0.0 for e in result.epoch_losses)
 
 
+def test_grad_clip_keeps_weights_finite_under_aggressive_lr():
+    """At a learning rate high enough to cause numerical blow-up, clipping
+    should keep the model's parameters finite (no NaN / Inf)."""
+    torch.manual_seed(0)
+    examples = [_example([0.0, 1.0, 0.0], 0.0) for _ in range(16)]
+
+    torch.manual_seed(0)
+    clipped = ChesskersScorer()
+    train_az(clipped, examples, epochs=4, lr=1.0, log_every=0, grad_clip=1.0)
+    for p in clipped.parameters():
+        assert torch.isfinite(p.data).all().item(), "clipping should prevent NaN/Inf"
+
+
+def test_grad_clip_disabled_with_none_or_zero():
+    """Sanity: a model trained with grad_clip=None and one with grad_clip=0
+    behave identically (both skip clipping)."""
+    torch.manual_seed(0)
+    examples = [_example([0.4, 0.6], 0.2) for _ in range(8)]
+
+    torch.manual_seed(0)
+    a = ChesskersScorer()
+    train_az(a, examples, epochs=2, lr=1e-3, log_every=0, grad_clip=None)
+
+    torch.manual_seed(0)
+    b = ChesskersScorer()
+    train_az(b, examples, epochs=2, lr=1e-3, log_every=0, grad_clip=0)
+
+    for pa, pb in zip(a.parameters(), b.parameters()):
+        assert torch.allclose(pa.data, pb.data)
+
+
 def test_checkpoint_save_and_load_roundtrip(tmp_path):
     torch.manual_seed(0)
     model = ChesskersScorer()

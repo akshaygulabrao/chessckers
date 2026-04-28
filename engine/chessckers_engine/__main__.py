@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+from pathlib import Path
 
 import httpx
 
@@ -8,6 +9,8 @@ from chessckers_engine.checkpoints import latest_checkpoint
 from chessckers_engine.http_server import make_server
 from chessckers_engine.runtime import build_pickers
 from chessckers_engine.server_client import ServerClient
+
+DEFAULT_GAMES_PATH = Path(__file__).resolve().parent.parent / "games" / "games.jsonl"
 
 
 def main() -> int:
@@ -42,9 +45,11 @@ def main() -> int:
         client.close()
         return 2
 
-    server = make_server(host, port, client, pickers, default_picker=default_picker)
-    log.info("listening on http://%s:%d/move; pickers=%s; default=%s",
-             host, port, sorted(pickers), default_picker)
+    games_path_str = os.environ.get("ENGINE_GAMES_PATH", str(DEFAULT_GAMES_PATH))
+    games_path = Path(games_path_str) if games_path_str else None
+    server = make_server(host, port, client, pickers, default_picker=default_picker, games_path=games_path)
+    log.info("listening on http://%s:%d/move; pickers=%s; default=%s; games=%s",
+             host, port, sorted(pickers), default_picker, games_path)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

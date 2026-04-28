@@ -1,3 +1,4 @@
+import json
 import threading
 from typing import Any
 
@@ -25,6 +26,7 @@ def _serve(
     state: dict[str, Any],
     pickers: dict[str, Picker] | None = None,
     default: str = "random",
+    games_path=None,
 ) -> tuple[str, FakeClient, threading.Thread, Any]:
     client = FakeClient(state)
     server = make_server(
@@ -33,6 +35,7 @@ def _serve(
         client,  # type: ignore[arg-type]
         pickers if pickers is not None else {"random": _random_picker},
         default_picker=default,
+        games_path=games_path,
     )
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -117,3 +120,60 @@ def test_make_server_rejects_default_picker_not_in_pickers() -> None:
     client = FakeClient({"legalMoves": []})
     with pytest.raises(ValueError):
         make_server("127.0.0.1", 0, client, {"a": _random_picker}, default_picker="b")  # type: ignore[arg-type]
+
+
+def test_save_game_writes_to_jsonl(tmp_path) -> None:
+    games_path = tmp_path / "games.jsonl"
+    url, _c, _t, server = _serve({"legalMoves": []}, games_path=games_path)
+    try:
+        body = {
+            "history": [{"fen": "F1", "uci": "M1"}, {"fen": "F2", "uci": "M2"}],
+            "outcome": "black",
+            "controllers": {"white": "random", "black": "player"},
+        }
+        r = httpx.post(f"{url}/save-game", json=body, timeout=2.0)
+        assert r.status_code == 200
+        assert r.json()["saved"] is True
+        assert games_path.exists()
+        line = games_path.read_text().strip()
+        loaded = json.loads(line)
+        assert loaded["history"] == body["history"]
+        assert loaded["outcome"] == "black"
+        assert "saved_at" in loaded
+    finally:
+        server.shutdown()
+
+
+def test_save_game_returns_503_when_no_games_path() -> None:
+    url, _c, _t, server = _serve({"legalMoves": []})  # default games_path=None
+    try:
+        r = httpx.post(f"{url}/save-game", json={"history": [], "outcome": "draw"}, timeout=2.0)
+        assert r.status_code == 503
+    finally:
+        server.shutdown()
+
+
+def test_save_game_400_on_missing_fields(tmp_path) -> None:
+    games_path = tmp_path / "games.jsonl"
+    url, _c, _t, server = _serve({"legalMoves": []}, games_path=games_path)
+    try:
+        r = httpx.post(f"{url}/save-game", json={"outcome": "draw"}, timeout=2.0)
+        assert r.status_code == 400
+        r = httpx.post(f"{url}/save-game", json={"history": []}, timeout=2.0)
+        assert r.status_code == 400
+    finally:
+        server.shutdown()
+
+
+def test_save_game_appends_multiple_games(tmp_path) -> None:
+    games_path = tmp_path / "games.jsonl"
+    url, _c, _t, server = _serve({"legalMoves": []}, games_path=games_path)
+    try:
+        for outcome in ["white", "black", "draw"]:
+            r = httpx.post(f"{url}/save-game", json={"history": [], "outcome": outcome}, timeout=2.0)
+            assert r.status_code == 200
+        lines = games_path.read_text().strip().split("\n")
+        assert len(lines) == 3
+        assert [json.loads(l)["outcome"] for l in lines] == ["white", "black", "draw"]
+    finally:
+        server.shutdown()

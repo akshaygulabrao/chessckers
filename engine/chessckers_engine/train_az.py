@@ -63,6 +63,7 @@ def train_az(
     seed: int = 0,
     log_every: int = 0,
     value_loss_weight: float = 1.0,
+    grad_clip: float | None = 1.0,
 ) -> AZTrainResult:
     """Run dual-loss training over `examples` for `epochs` passes."""
     torch.manual_seed(seed)
@@ -87,6 +88,8 @@ def train_az(
             p_loss, v_loss = _example_loss(model, ex, None, value_loss_fn)
             total = p_loss + value_loss_weight * v_loss
             total.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             opt.step()
             running_p += float(p_loss.item())
             running_v += float(v_loss.item())
