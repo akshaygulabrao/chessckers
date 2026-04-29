@@ -219,7 +219,59 @@ def test_diff_make_move_black_elimination(scalachess):
     assert py_after["winner"] == sc_after["winner"]
 
 
-@pytest.mark.skip(reason="black-side move-gen not yet ported")
+@pytest.mark.parametrize("fen", [
+    # Lone Stone-top tower at e6 → 2 forward diagonals (d5, f5).
+    "8/8/4p3/8/8/8/8/4K3[e6:s] b - - 0 1",
+    # Stone-top at corner a6 → only forward-right (b5).
+    "8/8/p7/8/8/8/8/4K3[a6:s] b - - 0 1",
+    # Stone-top at corner h6 → only forward-left (g5).
+    "8/8/7p/8/8/8/8/4K3[h6:s] b - - 0 1",
+    # Two Stone-tops far from White: e6 and d5. e6 can merge onto d5
+    # (e6→d5), or move to f5; d5 has c4/e4 forward.
+    "8/8/4p3/3p4/8/8/8/4K3[d5:s,e6:s] b - - 0 1",
+])
+def test_diff_black_diagonal_quiet_stone_top(scalachess, fen):
+    """Phase 2A — height-1 Stone-top diagonals only. Positions are
+    constructed so scalachess emits exclusively diagonal-quiet moves
+    (no captures available, no rank-8 sprint, height=1 so no deploy,
+    no King so no charge)."""
+    assert_legal_moves_match(PyVariantClient(), scalachess, fen)
+
+
+@pytest.mark.parametrize("fen", [
+    # Height-2 Stone-top tower at d6 (sS = unmoved-bottom, moved-top stone).
+    # Should produce 4 full-tower diag moves (range 2 forward) + 2 deploys
+    # (s=1, range 1 forward).
+    "8/8/3p4/8/8/8/8/4K3[d6:sS] b - - 0 1",
+    # Height-3 Stone-top in middle — 6 diag moves (range 3) × forward only,
+    # plus deploys with s=1 and s=2.
+    "8/8/3p4/8/8/8/8/4K3[d6:ssS] b - - 0 1",
+])
+def test_diff_black_quiet_plus_deploy_stone_top(scalachess, fen):
+    """Phase 2B — height ≥ 2 Stone-top stacks emit both full-tower diagonal
+    quiets and deploy sub-moves. No captures available, no mandate, no
+    sprint, no charge (Stone-top can't charge)."""
+    assert_legal_moves_match(PyVariantClient(), scalachess, fen)
+
+
+@pytest.mark.parametrize("fen", [
+    # Lone unmoved Stone at e8 → 2 normal diags (d7, f7) + 2 sprints (c6, g6).
+    "4p3/8/8/8/8/8/8/4K3[e8:s] b - - 0 1",
+    # MOVED Stone at e8 → no sprint, just 2 diag moves.
+    "4p3/8/8/8/8/8/8/4K3[e8:S] b - - 0 1",
+    # Sprint at corner a8: only one forward diagonal exists (b7), so only one
+    # normal diag and one sprint (b7, c6).
+    "p7/8/8/8/8/8/8/4K3[a8:s] b - - 0 1",
+    # Sprint blocked: friendly tower on intervening square (d7) blocks e8 sprint to c6.
+    "4p3/3p4/8/8/8/8/8/4K3[d7:s,e8:s] b - - 0 1",
+])
+def test_diff_black_back_rank_sprint(scalachess, fen):
+    """Phase 2C — back-rank sprint. Height-1 unmoved Stone-top on rank 8
+    can move 2 squares forward-diagonal when path is clear."""
+    assert_legal_moves_match(PyVariantClient(), scalachess, fen)
+
+
+@pytest.mark.skip(reason="King-top emits charges too — handled in 2E/2F")
 def test_diff_starting_position_black_moves(scalachess):
     py = PyVariantClient()
     BLACK_TO_MOVE = (

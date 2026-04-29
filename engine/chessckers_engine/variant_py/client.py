@@ -21,6 +21,10 @@ from typing import Any
 
 import chess
 
+from chessckers_engine.variant_py.moves_black import (
+    black_deploy_moves,
+    black_diagonal_quiet_moves,
+)
 from chessckers_engine.variant_py.moves_white import (
     apply_white_move,
     white_legal_moves,
@@ -56,7 +60,12 @@ def _state_to_dict(state: State, fen_override: str | None = None) -> GameState:
         # all, so check is meaningless there.
         check = False
     status, winner = _detect_status(state)
-    legal_moves = white_legal_moves(state) if state.board.turn == chess.WHITE else []
+    if state.board.turn == chess.WHITE:
+        legal_moves = white_legal_moves(state)
+    else:
+        # Black: incremental — quiet diagonals + deploys wired. Sprint,
+        # captures, charges, mandate filter still pending.
+        legal_moves = black_diagonal_quiet_moves(state) + black_deploy_moves(state)
     return {
         "fen": fen,
         "turn": turn,
