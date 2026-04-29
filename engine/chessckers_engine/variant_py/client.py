@@ -22,6 +22,7 @@ from typing import Any
 import chess
 
 from chessckers_engine.variant_py.moves_black import (
+    apply_black_move,
     black_charge_moves,
     black_deploy_moves,
     black_diagonal_capture_moves,
@@ -119,15 +120,12 @@ class PyVariantClient:
         return _state_to_dict(state, fen_override=input_fen)
 
     def make_move(self, fen: str, uci: str) -> GameState:
-        """Apply a UCI move to the position. Currently White-only — Black
-        moves will land with the Black move-gen port."""
+        """Apply a UCI move to the position."""
         state = parse_fen(fen)
         if state.board.turn == chess.WHITE:
             new_state = apply_white_move(state, uci)
         else:
-            raise NotImplementedError(
-                "PyVariantClient.make_move: Black-side moves not yet ported"
-            )
+            new_state = apply_black_move(state, uci)
         return _state_to_dict(new_state)
 
     def moves_at(self, fen: str, square: str) -> list[dict[str, Any]]:

@@ -8,7 +8,7 @@ Phase status:
 - [~] 2D: Diagonal capture chains (single hop, no rim, no chain, no promote)
 - [x] 2E: Charge (orthogonal capture)
 - [x] 2F: Mandatory rule filter
-- [ ] 2G: State transition (apply Black move)
+- [~] 2G: State transition (quiet, deploy, charge, simple capture)
 """
 
 from __future__ import annotations
@@ -322,6 +322,186 @@ def filter_for_mandate(state: State, all_moves: list[dict[str, Any]]) -> list[di
     if not black_mandatory_capture_active(state):
         return all_moves
     return [m for m in all_moves if m.get("capture") is not None]
+
+
+# ---------------- Phase 2G: applying Black moves ----------------
+
+def _all_black_legal(state: State) -> list[dict[str, Any]]:
+    """Aggregate all currently-legal Black moves with mandate applied."""
+    return filter_for_mandate(
+        state,
+        black_diagonal_quiet_moves(state)
+        + black_deploy_moves(state)
+        + black_charge_moves(state)
+        + black_diagonal_capture_moves(state),
+    )
+
+
+def _set_top_piece_on_board(state: State, sq: chess.Square, top_char: str) -> None:
+    """Sync the bitboard's piece at `sq` with the stack's top character.
+    Stone-top (s/S) → black pawn; King-top (k) → black king.
+    Empty stack → remove any piece at sq."""
+    state.board.remove_piece_at(sq)
+    if top_char == "k":
+        state.board.set_piece_at(sq, chess.Piece(chess.KING, chess.BLACK))
+    elif top_char in ("s", "S"):
+        state.board.set_piece_at(sq, chess.Piece(chess.PAWN, chess.BLACK))
+
+
+def _move_full_tower(state: State, from_sq: chess.Square, to_sq: chess.Square,
+                     pieces_override: str | None = None) -> None:
+    """Move the entire stack from `from_sq` to `to_sq` (merging onto a
+    friendly destination if present). `pieces_override` lets the caller
+    substitute different stack contents (e.g. after sprinting a Stone:
+    's' → 'S')."""
+    moving = pieces_override if pieces_override is not None else state.stacks[from_sq]
+    state.stacks.pop(from_sq, None)
+    state.board.remove_piece_at(from_sq)
+    existing = state.stacks.get(to_sq, "")
+    new_stack = existing + moving  # incoming on top
+    state.stacks[to_sq] = new_stack
+    _set_top_piece_on_board(state, to_sq, new_stack[-1])
+
+
+def _apply_quiet_or_sprint(state: State, move: dict[str, Any]) -> None:
+    from_sq = chess.parse_square(move["from"])
+    to_sq = chess.parse_square(move["to"])
+    pieces = state.stacks[from_sq]
+    # Sprint: a height-1 unmoved Stone moving 2 squares from rank 8 marks the Stone as moved.
+    is_sprint = (
+        len(pieces) == 1 and pieces == "s"
+        and chess.square_rank(from_sq) == 7
+        and abs(chess.square_rank(to_sq) - chess.square_rank(from_sq)) == 2
+    )
+    pieces_override = "S" if is_sprint else None
+    _move_full_tower(state, from_sq, to_sq, pieces_override=pieces_override)
+
+
+def _apply_deploy(state: State, move: dict[str, Any]) -> None:
+    from_sq = chess.parse_square(move["from"])
+    to_sq = chess.parse_square(move["to"])
+    s = move["deployCount"]
+    pieces = state.stacks[from_sq]
+    sub = pieces[-s:]
+    remainder = pieces[:-s]
+    state.stacks[from_sq] = remainder
+    _set_top_piece_on_board(state, from_sq, remainder[-1])
+    existing = state.stacks.get(to_sq, "")
+    new_stack = existing + sub
+    state.stacks[to_sq] = new_stack
+    _set_top_piece_on_board(state, to_sq, new_stack[-1])
+
+
+def _apply_charge(state: State, move: dict[str, Any]) -> None:
+    from_sq = chess.parse_square(move["from"])
+    to_sq = chess.parse_square(move["to"])
+    pieces = state.stacks[from_sq]
+    n = len(pieces)
+    df = (chess.square_file(to_sq) - chess.square_file(from_sq))
+    dr = (chess.square_rank(to_sq) - chess.square_rank(from_sq))
+    d = max(abs(df), abs(dr))
+    df_sign = (df // d) if d else 0
+    dr_sign = (dr // d) if d else 0
+
+    # Capture path Whites at steps 1..d-1.
+    for k in range(1, d):
+        f = chess.square_file(from_sq) + k * df_sign
+        r = chess.square_rank(from_sq) + k * dr_sign
+        sq = chess.square(f, r)
+        p = state.board.piece_at(sq)
+        if p is not None and p.color == chess.WHITE:
+            state.board.remove_piece_at(sq)
+
+    target = state.board.piece_at(to_sq)
+    is_ram = target is not None and target.color == chess.WHITE
+    if is_ram:
+        # Tower destroyed at landing; landing White stays.
+        state.stacks.pop(from_sq, None)
+        state.board.remove_piece_at(from_sq)
+        return
+
+    # Compute demotion choice. With explicit `demotedKings`, use it; otherwise
+    # the forced-choice path demotes ALL Kings (for n_kings == d).
+    king_positions = [i + 1 for i, p in enumerate(pieces) if p == "k"]
+    chosen = move.get("demotedKings") or king_positions
+    new_pieces = list(pieces)
+    for pos in chosen:
+        new_pieces[pos - 1] = "S"
+    new_stack = "".join(new_pieces)
+    _move_full_tower(state, from_sq, to_sq, pieces_override=new_stack)
+
+
+def _apply_diagonal_capture(state: State, move: dict[str, Any]) -> None:
+    from_sq = chess.parse_square(move["from"])
+    to_sq = chess.parse_square(move["to"])
+    df = chess.square_file(to_sq) - chess.square_file(from_sq)
+    dr = chess.square_rank(to_sq) - chess.square_rank(from_sq)
+    d = max(abs(df), abs(dr))
+    df_sign = df // d if d else 0
+    dr_sign = dr // d if d else 0
+
+    # Capture path Whites at steps 1..d-1.
+    for k in range(1, d):
+        f = chess.square_file(from_sq) + k * df_sign
+        r = chess.square_rank(from_sq) + k * dr_sign
+        sq = chess.square(f, r)
+        p = state.board.piece_at(sq)
+        if p is not None and p.color == chess.WHITE:
+            state.board.remove_piece_at(sq)
+
+    target = state.board.piece_at(to_sq)
+    is_ram = target is not None and target.color == chess.WHITE
+    if is_ram:
+        state.stacks.pop(from_sq, None)
+        state.board.remove_piece_at(from_sq)
+        return
+
+    _move_full_tower(state, from_sq, to_sq)
+
+
+def apply_black_move(state: State, uci: str) -> State:
+    """Parse and apply a Black move. Looks up the UCI in the current legal
+    move list and dispatches based on the move's shape. Raises ValueError
+    if the UCI doesn't match a legal move.
+
+    Limitations of this initial cut:
+    - Chain captures (`uci` containing `~`) and rim/promotion are not yet
+      handled — calling apply_black_move on those raises NotImplementedError.
+    """
+    if "~" in uci:
+        raise NotImplementedError(
+            "apply_black_move: chain captures (UCI with '~') not yet ported"
+        )
+    legal = _all_black_legal(state)
+    matches = [m for m in legal if m["uci"] == uci]
+    if not matches:
+        raise ValueError(f"illegal or unrecognized Black move: {uci!r}")
+    move = matches[0]
+    new_state = state.copy()
+
+    if move.get("deployCount") is not None:
+        _apply_deploy(new_state, move)
+    elif _is_orthogonal_move(move):
+        _apply_charge(new_state, move)
+    elif move.get("capture") is not None:
+        _apply_diagonal_capture(new_state, move)
+    else:
+        _apply_quiet_or_sprint(new_state, move)
+
+    # scalachess Chessckers doesn't auto-bump halfmove/fullmove the way
+    # python-chess does in standard chess; preserve them from the input
+    # state and let scalachess parity dictate per-position behavior.
+    new_state.board.turn = chess.WHITE
+    return new_state
+
+
+def _is_orthogonal_move(move: dict[str, Any]) -> bool:
+    fr = chess.parse_square(move["from"])
+    to = chess.parse_square(move["to"])
+    return (
+        chess.square_file(fr) == chess.square_file(to)
+        or chess.square_rank(fr) == chess.square_rank(to)
+    ) and fr != to
 
 
 def black_charge_moves(state: State) -> list[dict[str, Any]]:

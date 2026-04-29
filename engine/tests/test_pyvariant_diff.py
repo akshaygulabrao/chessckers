@@ -211,6 +211,31 @@ def test_diff_make_move_white(scalachess, fen, uci):
         )
 
 
+@pytest.mark.parametrize("fen,uci", [
+    # Quiet diagonal: lone Stone-top moves forward-right.
+    ("8/8/4p3/8/8/8/8/4K3[e6:s] b - - 0 1", "e6f5"),
+    # Sprint: unmoved Stone moves 2 squares (must mark moved).
+    ("4p3/8/8/8/8/8/8/4K3[e8:s] b - - 0 1", "e8c6"),
+    # Diagonal capture: ram on White piece.
+    ("8/8/8/1p6/2K5/8/8/8[b5:s] b - - 0 1", "b5c4"),
+    # Charge with forced demotion (height-1 King-top).
+    ("8/8/4p3/8/8/8/8/4K3[e6:k] b - - 0 1", "e6e7"),
+    # Deploy from height-2 stack.
+    ("8/8/3p4/8/8/8/8/4K3[d6:sS] b - - 0 1", "d6c5[1]"),
+])
+def test_diff_make_move_black(scalachess, fen, uci):
+    """Phase 2G — apply a Black move and assert the resulting state matches
+    scalachess on fen/turn/check/status/winner."""
+    py = PyVariantClient()
+    py_after = py.make_move(fen, uci)
+    sc_after = scalachess.make_move(fen, uci)
+    for k in ("fen", "turn", "check", "status", "winner"):
+        assert py_after.get(k) == sc_after.get(k), (
+            f"{k} diverges for fen={fen!r} uci={uci!r}: "
+            f"py={py_after.get(k)!r} scala={sc_after.get(k)!r}"
+        )
+
+
 def test_diff_make_move_black_elimination(scalachess):
     """Capturing the last Black stack should yield variantEnd / winner=white."""
     py = PyVariantClient()
