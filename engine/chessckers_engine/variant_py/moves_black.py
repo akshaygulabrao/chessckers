@@ -302,13 +302,25 @@ def black_diagonal_capture_moves(state: State) -> list[dict[str, Any]]:
 
 
 def black_mandatory_capture_active(state: State) -> bool:
-    """§4 — mandate fires when at least one diagonal capture has a normal
-    (empty-board) landing. Rams alone do not trigger; rim-only landings
-    do not trigger (we don't emit them yet, but if/when we do, they
-    should not count). Charge captures don't trigger either — only
-    diagonal hops with normal landings."""
+    """§4 mandate trigger — fires only when:
+      (a) a Black tower has a diagonally **adjacent** White (distance 1),
+      (b) at least one diagonal hop from that tower in that direction lands
+          on an empty board square (a normal landing — rams and rim-only
+          landings don't count).
+
+    My earlier (broader) version flagged any first-enemy capture as
+    triggering, which incorrectly fired on Whites at distance 2+. That
+    over-suppressed quiet moves in real positions."""
     for cap in black_diagonal_capture_moves(state):
-        # Normal landing = empty board square.
+        from_sq = chess.parse_square(cap["from"])
+        capture_sq = chess.parse_square(cap["capture"]) if cap.get("capture") else None
+        if capture_sq is None:
+            continue
+        # First-enemy distance = Chebyshev distance from source to first captured square.
+        df = chess.square_file(capture_sq) - chess.square_file(from_sq)
+        dr = chess.square_rank(capture_sq) - chess.square_rank(from_sq)
+        if max(abs(df), abs(dr)) != 1:
+            continue  # first enemy not adjacent — doesn't fire mandate
         to_sq = chess.parse_square(cap["to"])
         if state.board.piece_at(to_sq) is None:
             return True
