@@ -19,8 +19,12 @@ These examples drop into the dual-loss training step in `train.py`.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Protocol
 
 import torch
@@ -37,6 +41,38 @@ LegalMove = dict[str, Any]
 class _Mover(Protocol):
     def new_game(self, fen: str | None = None) -> GameState: ...
     def make_move(self, fen: str, uci: str) -> GameState: ...
+
+
+class WatchSink(Protocol):
+    """Receives per-move snapshots and per-game completion events for a
+    spectator UI. `play_az_game` calls these synchronously."""
+
+    def on_move(self, snapshot: dict[str, Any]) -> None: ...
+    def on_game_end(self, game_log: dict[str, Any]) -> None: ...
+
+
+class JsonlWatchSink:
+    """Writes `current.json` (atomically replaced on every move) and appends
+    finished games as one JSON line per game to `games.jsonl`. The viewer
+    polls `current.json` to follow the live game and reads `games.jsonl` to
+    let the user scrub through completed ones."""
+
+    def __init__(self, watch_dir: Path):
+        self.dir = Path(watch_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.current_path = self.dir / "current.json"
+        self.games_path = self.dir / "games.jsonl"
+
+    def on_move(self, snapshot: dict[str, Any]) -> None:
+        tmp = self.current_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot))
+        os.replace(tmp, self.current_path)  # atomic on POSIX
+
+    def on_game_end(self, game_log: dict[str, Any]) -> None:
+        game_log.setdefault("saved_at", datetime.now(timezone.utc).isoformat())
+        with self.games_path.open("a") as f:
+            f.write(json.dumps(game_log))
+            f.write("\n")
 
 
 @dataclass
@@ -62,7 +98,26 @@ class AZExample:
     value_target: float              # in {-1.0, 0.0, 1.0}
 
 
-def _outcome_from_status(status: str | None) -> str:
+def _outcome_from_state(state: dict[str, Any]) -> str:
+    """Authoritative outcome from a terminal game state.
+
+    The server distinguishes Black's two win paths via `status` AND `winner`:
+      - status='mate', winner='black'        → standard checkmate (chess-style)
+      - status='variantEnd', winner='black'  → Black captured the White king
+                                               directly via a chain/suicide move
+    Both are Black wins. A previous version of this function keyed on
+    `status` alone and treated 'variantEnd' as White-only — silently
+    inverting value targets for every Black king-capture game.
+
+    `winner` takes precedence; status-only fallback is for test stubs that
+    don't simulate the full server response.
+    """
+    winner = state.get("winner")
+    if winner == "white":
+        return "white"
+    if winner == "black":
+        return "black"
+    status = state.get("status")
     if status == "mate":
         return "black"
     if status == "variantEnd":
@@ -104,15 +159,28 @@ def play_az_game(
     rng: torch.Generator | None = None,
     dirichlet_alpha: float | None = 0.3,
     dirichlet_eps: float = 0.25,
+    sink: WatchSink | None = None,
+    sink_context: dict[str, Any] | None = None,
 ) -> AZGame:
     """Play one self-play game using PUCT MCTS at each move.
 
     `dirichlet_alpha=0.3` (AlphaZero-chess default) injects Dirichlet noise
     into root priors at every move, ensuring exploration of low-prior moves.
     Set to None to disable (e.g., for deterministic eval-style games).
+
+    `sink` (optional) receives per-move snapshots and a per-game completion
+    event so a spectator UI can follow training. `sink_context` is merged
+    into every snapshot/log emitted (e.g. {iter, game_idx, total_games}).
     """
     state = client.new_game()
     records: list[AZRecord] = []
+    history: list[dict[str, str]] = []  # [{fen, uci}], same schema as games.jsonl
+    ctx = dict(sink_context or {})
+    start_fen = state["fen"]
+    if sink is not None:
+        sink.on_move({**ctx, "ply": 0, "fen": start_fen, "history": [], "last_uci": None,
+                      "temperature": temperature})
+
     ply = 0
     while not state.get("status") and ply < max_plies:
         legal = state.get("legalMoves") or []
@@ -135,15 +203,43 @@ def play_az_game(
         )
         idx = _sample_move_index_from_visits(visits, temperature, rng)
         chosen = legal[idx]
+        prev_fen = state["fen"]
+        history.append({"fen": prev_fen, "uci": chosen["uci"]})
         try:
-            state = client.make_move(state["fen"], chosen["uci"])
+            state = client.make_move(prev_fen, chosen["uci"])
         except Exception as e:  # noqa: BLE001
             log.debug("make_move failed at ply %d uci=%s: %s; ending game as draw", ply, chosen["uci"], e)
-            return AZGame(records=records, final_status=None, outcome="draw")
+            game = AZGame(records=records, final_status=None, outcome="draw")
+            _emit_game_end(sink, ctx, history, prev_fen, game)
+            return game
         ply += 1
+        if sink is not None:
+            sink.on_move({**ctx, "ply": ply, "fen": state["fen"], "history": list(history),
+                          "last_uci": chosen["uci"], "temperature": temperature})
 
     status = state.get("status")
-    return AZGame(records=records, final_status=status, outcome=_outcome_from_status(status))
+    game = AZGame(records=records, final_status=status, outcome=_outcome_from_state(state))
+    _emit_game_end(sink, ctx, history, state["fen"], game)
+    return game
+
+
+def _emit_game_end(
+    sink: WatchSink | None,
+    ctx: dict[str, Any],
+    history: list[dict[str, str]],
+    final_fen: str,
+    game: AZGame,
+) -> None:
+    if sink is None:
+        return
+    sink.on_game_end({
+        **ctx,
+        "history": history,
+        "final_fen": final_fen,
+        "final_status": game.final_status,
+        "outcome": game.outcome,
+        "controllers": {"white": "az", "black": "az"},
+    })
 
 
 def az_game_to_examples(game: AZGame) -> list[AZExample]:

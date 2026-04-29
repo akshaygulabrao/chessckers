@@ -1,24 +1,37 @@
 """ChesskersScorer: a (position, candidate moves) → per-move logit network,
 with an additional scalar value head for position evaluation.
 
-Architecture:
-- Position trunk (shared between heads): 2× Conv2d (c_in → 32 → 64) with 3x3
-  kernels and padding=1, ReLU between, flatten + Linear → d_hidden + ReLU.
-- Move encoder: Linear(d_move → d_hidden) + ReLU.
+Architecture (residual-tower variant, ~2.4M params at default settings):
+- Initial conv: Conv2d(c_in → c_filters) + GroupNorm + ReLU.
+- Residual tower: `n_blocks` × ResidualBlock(c_filters)
+    each block = Conv → GN → ReLU → Conv → GN → (+input) → ReLU.
+
+GroupNorm is used instead of BatchNorm because MCTS does single-position
+forward calls (batch=1). BatchNorm with batch=1 in train mode computes
+variance over a single sample (= 0) → division by ε → unstable. GroupNorm
+is invariant to batch size and avoids the train/eval-mode footgun entirely.
+- Bottleneck: Flatten + Linear(c_filters*64 → d_hidden) + LayerNorm + ReLU.
+- Move encoder: Linear(d_move → d_hidden) + LayerNorm + ReLU.
 - Policy head (`head` for backward compat with M4-phase-1 checkpoints):
   concat(pos_emb broadcast over N moves, move_emb) → Linear(2*d_hidden →
-  d_hidden) + ReLU + Linear(d_hidden → 1) → squeeze.
-- Value head: Linear(d_hidden → d_hidden//2) + ReLU + Linear(d_hidden//2 → 1)
-  + Tanh. Output in [-1, 1] matches AlphaZero-style outcome targets
-  (+1 win / 0 draw / -1 loss) from the side-to-move's perspective.
+  d_hidden) + LayerNorm + ReLU + Linear(d_hidden → 1) → squeeze.
+- Value head: Linear(d_hidden → d_hidden//2) + LayerNorm + ReLU +
+  Linear(d_hidden//2 → 1) + Tanh.
 
-`forward(position, moves)` keeps the M3 contract — returns per-move logits.
-`value(position)` is the new method MCTS leaves use.
+The residual structure replaces the previous flat 2-conv trunk. LayerNorm
+after every hidden Linear (and BatchNorm inside conv blocks) holds
+activations bounded — an earlier training run without normalization blew
+policy logits to ~3e7 by iter-2, collapsing the softmax to uniform.
+See `engine/check_dead_relu.py` for the post-mortem.
 
-The value head is randomly initialized. Pre-AlphaZero checkpoints (no
-value_head keys) load fine via `checkpoints.load_checkpoint` which uses
-strict=False; the value head stays at random init until self-play training
-fills it in.
+`forward(position, moves)` returns per-move logits.
+`value(position)` is what MCTS leaves use.
+
+Old checkpoints (different param shapes) won't load against this model;
+the residual-tower refactor is a fresh-init checkpoint compatibility break.
+`checkpoints.load_checkpoint` uses strict=False, so loading an old
+checkpoint will keep the new params at random init and log the missing
+keys, but the resulting model is effectively un-trained.
 """
 
 from __future__ import annotations
@@ -29,30 +42,60 @@ from torch import nn
 from chessckers_engine.encoding import MOVE_D, POS_C
 
 
-class ChesskersScorer(nn.Module):
-    def __init__(self, c_in: int = POS_C, d_move: int = MOVE_D, d_hidden: int = 128):
+class ResidualBlock(nn.Module):
+    """Pre-activation residual block: Conv → BN → ReLU → Conv → BN → (+x) → ReLU."""
+
+    def __init__(self, c: int):
         super().__init__()
+        self.conv1 = nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.GroupNorm(num_groups=8, num_channels=c)
+        self.conv2 = nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.GroupNorm(num_groups=8, num_channels=c)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return torch.relu(out + x)
+
+
+class ChesskersScorer(nn.Module):
+    def __init__(
+        self,
+        c_in: int = POS_C,
+        d_move: int = MOVE_D,
+        d_hidden: int = 256,
+        c_filters: int = 96,
+        n_blocks: int = 4,
+    ):
+        super().__init__()
+        # Position trunk: initial conv + residual tower + bottleneck dense.
+        # Kept as a single Sequential so existing tests that walk the trunk
+        # looking for Conv2d modules still find the input conv at index 0.
         self.position_trunk = nn.Sequential(
-            nn.Conv2d(c_in, 32, kernel_size=3, padding=1),
+            nn.Conv2d(c_in, c_filters, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=8, num_channels=c_filters),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            *[ResidualBlock(c_filters) for _ in range(n_blocks)],
             nn.Flatten(),
-            nn.Linear(64 * 8 * 8, d_hidden),
+            nn.Linear(c_filters * 8 * 8, d_hidden),
+            nn.LayerNorm(d_hidden),
             nn.ReLU(inplace=True),
         )
         self.move_encoder = nn.Sequential(
             nn.Linear(d_move, d_hidden),
+            nn.LayerNorm(d_hidden),
             nn.ReLU(inplace=True),
         )
         # Policy head; named `head` for backward compat with M4-phase-1 checkpoints.
         self.head = nn.Sequential(
             nn.Linear(2 * d_hidden, d_hidden),
+            nn.LayerNorm(d_hidden),
             nn.ReLU(inplace=True),
             nn.Linear(d_hidden, 1),
         )
         self.value_head = nn.Sequential(
             nn.Linear(d_hidden, d_hidden // 2),
+            nn.LayerNorm(d_hidden // 2),
             nn.ReLU(inplace=True),
             nn.Linear(d_hidden // 2, 1),
             nn.Tanh(),

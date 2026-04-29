@@ -6,6 +6,7 @@ from chessckers_engine.selfplay_az import (
     AZGame,
     AZRecord,
     _aligned_visits,
+    _outcome_from_state,
     _sample_move_index_from_visits,
     az_game_to_examples,
     play_az_game,
@@ -102,6 +103,19 @@ def _fake_run_mcts_returning_uniform_visits(state, client, model, **_kwargs):
     visit_dist = {m["uci"]: max(n_sims // max(len(legal), 1), 1) for m in legal}
     chosen = legal[0] if legal else None
     return MctsResult(chosen=chosen, visit_distribution=visit_dist, root=PuctNode(fen=state["fen"], move_to_here=None))
+
+
+def test_outcome_from_state_uses_winner_field():
+    """Regression: status='variantEnd' with winner='black' is the Black
+    king-capture path. Keying on status alone inverts the value target
+    for every such game — a real bug that silently corrupted training."""
+    assert _outcome_from_state({"status": "variantEnd", "winner": "black"}) == "black"
+    assert _outcome_from_state({"status": "variantEnd", "winner": "white"}) == "white"
+    assert _outcome_from_state({"status": "mate", "winner": "black"}) == "black"
+    # Status fallback when winner is missing (test-stub compatibility).
+    assert _outcome_from_state({"status": "variantEnd"}) == "white"
+    assert _outcome_from_state({"status": "mate"}) == "black"
+    assert _outcome_from_state({}) == "draw"
 
 
 def test_play_az_game_records_one_per_ply_and_outcome(monkeypatch):

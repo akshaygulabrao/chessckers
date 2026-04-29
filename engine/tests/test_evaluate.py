@@ -1,4 +1,4 @@
-from chessckers_engine.evaluate import _status_to_outcome, evaluate, format_results, play_game
+from chessckers_engine.evaluate import _state_to_outcome, _status_to_outcome, evaluate, format_results, play_game
 
 
 class _ScriptedClient:
@@ -36,6 +36,33 @@ def test_status_to_outcome_mapping():
     assert _status_to_outcome("stalemate") == "draw"
     assert _status_to_outcome(None) == "draw"
     assert _status_to_outcome("unexpected") == "draw"
+
+
+def test_state_to_outcome_uses_winner_field():
+    """Regression: when Black captures the White king via a chain or
+    suicide move, the server returns status='variantEnd' with winner='black'.
+    Outcome must respect winner — keying on status alone silently inverts
+    every Black king-capture into a White win."""
+    assert _state_to_outcome({"status": "variantEnd", "winner": "black"}) == "black"
+    assert _state_to_outcome({"status": "variantEnd", "winner": "white"}) == "white"
+    assert _state_to_outcome({"status": "mate", "winner": "black"}) == "black"
+    # Falls back to status when winner missing (test-stub compatibility).
+    assert _state_to_outcome({"status": "variantEnd"}) == "white"
+    assert _state_to_outcome({"status": "mate"}) == "black"
+    assert _state_to_outcome({}) == "draw"
+
+
+def test_play_game_black_wins_on_variantEnd_with_winner_black():
+    """End-to-end: a terminal state of (variantEnd, winner=black) — the
+    Black-king-capture path — must score as a Black win."""
+    states = [
+        _state("white"),
+        _state("black"),
+        _state("white", status="variantEnd"),
+    ]
+    states[-1]["winner"] = "black"
+    picker = lambda s: s["legalMoves"][0]
+    assert play_game(picker, picker, _ScriptedClient(states)) == "black"
 
 
 def test_play_game_white_wins_when_variantEnd_status_appears():

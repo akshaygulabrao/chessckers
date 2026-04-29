@@ -26,7 +26,7 @@ from chessckers_engine.evaluate import evaluate as run_eval
 from chessckers_engine.mcts_puct import pick_puct
 from chessckers_engine.model import ChesskersScorer
 from chessckers_engine.random_player import pick_random
-from chessckers_engine.selfplay_az import az_game_to_examples, play_az_game
+from chessckers_engine.selfplay_az import JsonlWatchSink, az_game_to_examples, play_az_game
 from chessckers_engine.server_client import ServerClient
 from chessckers_engine.train_az import save_checkpoint, train_az
 
@@ -53,6 +53,31 @@ def _make_random_picker():
     return picker
 
 
+def _play_one_game(
+    model: ChesskersScorer,
+    n_sims: int, c_puct: float, temperature: float, seed: int,
+    dirichlet_alpha: float | None, dirichlet_eps: float,
+    sink, sink_context: dict | None,
+):
+    """Worker: build a fresh ServerClient and rng, play one self-play game.
+    Each thread keeps its own httpx connection pool and torch.Generator so
+    concurrent games don't share mutable state on the explicit-rng path."""
+    from chessckers_engine.server_client import ServerClient as _SC
+    client = _SC()
+    rng = torch.Generator().manual_seed(seed)
+    try:
+        return play_az_game(
+            model, client,
+            n_sims=n_sims, c_puct=c_puct,
+            temperature=temperature, rng=rng,
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_eps=dirichlet_eps,
+            sink=sink, sink_context=sink_context,
+        )
+    finally:
+        client.close()
+
+
 def run_az_iterations(
     model: ChesskersScorer,
     client: ServerClient,
@@ -70,31 +95,73 @@ def run_az_iterations(
     dirichlet_alpha: float | None = 0.3,
     dirichlet_eps: float = 0.25,
     grad_clip: float | None = 1.0,
+    watch_dir: Path | None = None,
+    workers: int = 1,
 ) -> list[dict]:
     weights_dir.mkdir(parents=True, exist_ok=True)
+    sink = JsonlWatchSink(watch_dir) if watch_dir is not None else None
     summaries: list[dict] = []
-    g = torch.Generator().manual_seed(seed)
+    parallel = max(1, workers) > 1
+    if parallel and sink is not None:
+        log.warning("workers=%d: per-move sink snapshots disabled (would flap "
+                    "between concurrent games); games.jsonl still written on completion.",
+                    workers)
 
     for it in range(n_iters):
         temp = _temperature_for(it, n_iters, t_initial, t_final)
-        log.info("iter %d/%d: playing %d games (sims=%d, τ=%.3f)",
-                 it + 1, n_iters, games_per_iter, n_sims, temp)
+        log.info("iter %d/%d: playing %d games (sims=%d, τ=%.3f, workers=%d)",
+                 it + 1, n_iters, games_per_iter, n_sims, temp, max(1, workers))
         outcomes = {"white": 0, "black": 0, "draw": 0}
         examples = []
-        for gi in range(games_per_iter):
-            game = play_az_game(
-                model, client,
-                n_sims=n_sims, c_puct=c_puct,
-                temperature=temp, rng=g,
-                dirichlet_alpha=dirichlet_alpha,
-                dirichlet_eps=dirichlet_eps,
-            )
-            outcomes[game.outcome] += 1
-            examples.extend(az_game_to_examples(game))
-            log.info("  game %d/%d done: %s, %d records", gi + 1, games_per_iter, game.outcome, len(game.records))
+        ply_counts: list[int] = []
 
-        log.info("iter %d/%d: %d examples; outcomes %s",
-                 it + 1, n_iters, len(examples), outcomes)
+        # Each game gets a unique seed so per-thread rngs don't correlate.
+        game_seeds = [seed + it * games_per_iter + gi for gi in range(games_per_iter)]
+        sink_ctx_factory = lambda gi: ({
+            "iter": it + 1, "total_iters": n_iters,
+            "game_idx": gi + 1, "total_games": games_per_iter,
+        } if sink is not None else None)
+
+        if not parallel:
+            for gi in range(games_per_iter):
+                game = _play_one_game(
+                    model, n_sims=n_sims, c_puct=c_puct, temperature=temp,
+                    seed=game_seeds[gi],
+                    dirichlet_alpha=dirichlet_alpha, dirichlet_eps=dirichlet_eps,
+                    sink=sink, sink_context=sink_ctx_factory(gi),
+                )
+                outcomes[game.outcome] += 1
+                examples.extend(az_game_to_examples(game))
+                ply_counts.append(len(game.records))
+                log.info("  game %d/%d: %s in %d plies", gi + 1, games_per_iter, game.outcome, len(game.records))
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(
+                        _play_one_game, model,
+                        n_sims=n_sims, c_puct=c_puct, temperature=temp,
+                        seed=game_seeds[gi],
+                        dirichlet_alpha=dirichlet_alpha, dirichlet_eps=dirichlet_eps,
+                        sink=None,  # spectator sink fully disabled in parallel mode
+                        sink_context=None,
+                    ): gi for gi in range(games_per_iter)
+                }
+                for fut in as_completed(futures):
+                    gi = futures[fut]
+                    game = fut.result()
+                    outcomes[game.outcome] += 1
+                    examples.extend(az_game_to_examples(game))
+                    ply_counts.append(len(game.records))
+                    log.info("  game %d/%d: %s in %d plies", gi + 1, games_per_iter, game.outcome, len(game.records))
+
+        mean_plies = sum(ply_counts) / max(len(ply_counts), 1)
+        log.info(
+            "iter %d/%d self-play done: %dW/%dB/%dD, mean %.0f plies/game, %d examples",
+            it + 1, n_iters,
+            outcomes["white"], outcomes["black"], outcomes["draw"],
+            mean_plies, len(examples),
+        )
         result = train_az(
             model, examples,
             epochs=epochs, lr=lr, seed=seed + it, log_every=0,
@@ -113,6 +180,7 @@ def run_az_iterations(
             "iter": it + 1,
             "temperature": round(temp, 3),
             "examples": len(examples),
+            "mean_plies": round(mean_plies, 1),
             "policy_loss": round(result.epoch_losses[-1]["policy"], 4),
             "value_loss": round(result.epoch_losses[-1]["value"], 4),
             "self_play": outcomes,
@@ -122,9 +190,10 @@ def run_az_iterations(
         }
         summaries.append(summary)
         log.info(
-            "iter %d/%d done | self-play W/B/D=%d/%d/%d | puct(W)vs.rand %d/%d/%d | puct(B)vs.rand %d/%d/%d | policy=%.4f value=%.4f",
+            "iter %d/%d done | self-play %dW/%dB/%dD ply̅=%.0f | "
+            "vs.rand W:%d/%d/%d B:%d/%d/%d | policy=%.3f value=%.3f",
             it + 1, n_iters,
-            outcomes["white"], outcomes["black"], outcomes["draw"],
+            outcomes["white"], outcomes["black"], outcomes["draw"], mean_plies,
             as_white["white"], as_white["black"], as_white["draw"],
             as_black["black"], as_black["white"], as_black["draw"],
             result.epoch_losses[-1]["policy"], result.epoch_losses[-1]["value"],
@@ -134,7 +203,8 @@ def run_az_iterations(
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from chessckers_engine.runtime import setup_logging
+    setup_logging()
     p = argparse.ArgumentParser()
     p.add_argument("--iterations", type=int, default=5)
     p.add_argument("--games-per-iter", type=int, default=8)
@@ -156,6 +226,12 @@ def main() -> int:
                    help="Max gradient norm; <=0 to disable")
     p.add_argument("--base", default=None)
     p.add_argument("--weights-dir", default=str(DEFAULT_WEIGHTS_DIR))
+    p.add_argument("--watch-dir", default=None,
+                   help="If set, write current.json (live snapshot) and append finished games "
+                        "to games.jsonl in this directory for the spectator UI.")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Run this many self-play games concurrently per iter (threading; "
+                        "spectator sink disabled when >1).")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -191,19 +267,21 @@ def main() -> int:
         dirichlet_alpha=alpha,
         dirichlet_eps=args.dirichlet_eps,
         grad_clip=grad_clip,
+        watch_dir=Path(args.watch_dir) if args.watch_dir else None,
+        workers=args.workers,
     )
 
-    print("\n  iter | τ     | examples | policy | value  | self-play W/B/D | puct(W)vs.rand | puct(B)vs.rand")
-    print("  -----|-------|----------|--------|--------|-----------------|----------------|----------------")
+    print("\n  iter | τ     | ply̅  | policy | value  | self-play W/B/D | vs.rand W:W/L/D | vs.rand B:W/L/D")
+    print("  -----|-------|------|--------|--------|-----------------|-----------------|-----------------")
     for s in summaries:
         sp = s["self_play"]
         w = s["puct_as_white_vs_random"]
         b = s["puct_as_black_vs_random"]
         print(
-            f"  {s['iter']:4d} | {s['temperature']:.3f} | {s['examples']:8d} | "
+            f"  {s['iter']:4d} | {s['temperature']:.3f} | {s['mean_plies']:4.0f} | "
             f"{s['policy_loss']:6.3f} | {s['value_loss']:6.3f} | "
             f"{sp['white']:3d}/{sp['black']:3d}/{sp['draw']:3d}        | "
-            f"{w['white']:2d}/{w['black']:2d}/{w['draw']:2d}          | "
+            f"{w['white']:2d}/{w['black']:2d}/{w['draw']:2d}           | "
             f"{b['black']:2d}/{b['white']:2d}/{b['draw']:2d}"
         )
     client.close()

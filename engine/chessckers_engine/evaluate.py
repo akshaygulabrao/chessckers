@@ -65,15 +65,29 @@ def play_game(
             )
             return "draw"
         ply += 1
-    return _status_to_outcome(state.get("status"))
+    return _state_to_outcome(state)
 
 
-def _status_to_outcome(status: str | None) -> Outcome:
+def _state_to_outcome(state: dict) -> Outcome:
+    """`winner` is authoritative; status-only fallback is for test stubs.
+    See `selfplay_az._outcome_from_state` for the rationale (Black king
+    capture returns status='variantEnd', winner='black')."""
+    winner = state.get("winner")
+    if winner == "white":
+        return "white"
+    if winner == "black":
+        return "black"
+    status = state.get("status")
     if status == "mate":
         return "black"
     if status == "variantEnd":
         return "white"
-    return "draw"  # stalemate, max_plies, or no-legal-move bailout
+    return "draw"
+
+
+# Kept for any external callers; same fallback semantics as before.
+def _status_to_outcome(status: str | None) -> Outcome:
+    return _state_to_outcome({"status": status})
 
 
 def evaluate(
@@ -106,7 +120,8 @@ def format_results(white_name: str, black_name: str, counts: dict[str, int]) -> 
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from chessckers_engine.runtime import setup_logging
+    setup_logging()
     p = argparse.ArgumentParser()
     p.add_argument("--white", required=True, choices=["random", "material", "mcts", "nn"])
     p.add_argument("--black", required=True, choices=["random", "material", "mcts", "nn"])
