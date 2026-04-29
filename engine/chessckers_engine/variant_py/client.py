@@ -41,11 +41,24 @@ ChainStepResponse = dict[str, Any]
 
 
 def _detect_status(state: State) -> tuple[str | None, str | None]:
-    """Return (status, winner) for the given state. Currently only handles
-    the Black-elimination → variantEnd/winner=white path. mate / stalemate
-    / Black-king-capture detection lands when Black move-gen is ported."""
+    """Return (status, winner) for the given state.
+
+    Detection paths:
+    - Black eliminated → variantEnd / winner=white.
+    - White's king is checkmated (standard FIDE; python-chess detects this
+      correctly even with multiple Black "kings" since the encoding maps
+      Stone/King → black pawn/king on the bitboard) → mate / winner=black.
+    - All other terminal paths (Black stalemate via no-legal-moves,
+      White stalemate without check) need full Black move-gen with chains
+      to reliably classify; they're not detected yet."""
     if not state.stacks:
         return ("variantEnd", "white")
+    if state.board.turn == chess.WHITE:
+        try:
+            if state.board.is_checkmate():
+                return ("mate", "black")
+        except Exception:  # noqa: BLE001
+            pass
     return (None, None)
 
 
