@@ -76,23 +76,77 @@ def test_pyvariant_constructs():
     client.close()
 
 
-def test_stubs_raise_not_implemented():
-    """Every API method should currently raise NotImplementedError. As we
-    port each one, the corresponding test below should start passing and
-    these stub assertions should be removed."""
+def test_unported_stubs_raise_not_implemented():
+    """Black-side functionality and chain-stepping are not yet ported.
+    Removed entries here as each piece lands."""
     client = PyVariantClient()
     with pytest.raises(NotImplementedError):
-        client.new_game()
+        client.chain_step("fen", "f6", [])
     with pytest.raises(NotImplementedError):
-        client.make_move("fen", "e2e4")
-    with pytest.raises(NotImplementedError):
-        client.moves_at("fen", "e2")
+        client.chain_end("fen", "f6", [])
+
+
+# ---- new_game parity ----
+
+INITIAL_FEN_KQ = (
+    "pppppppp/kkkkkkkk/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR"
+    "[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,"
+    "a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:k,"
+    "a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQ - 0 1"
+)
+
+
+def test_new_game_default_returns_starting_position():
+    state = PyVariantClient().new_game()
+    assert state["turn"] == "white"
+    assert state["check"] is False
+    assert state["status"] is None
+    assert state["winner"] is None
+    assert "RNBQKBNR" in state["fen"]
+    # 24 stacks × ~2 chars each, so the bracket overlay should have a healthy size.
+    assert state["fen"].count(":") == 24
+
+
+def test_new_game_with_fen_echoes_input():
+    """For non-default input FENs, the returned `fen` should be the input
+    verbatim (matches scalachess's parse-time behavior)."""
+    state = PyVariantClient().new_game(INITIAL_FEN_KQ)
+    assert state["fen"] == INITIAL_FEN_KQ
+
+
+def test_new_game_diff_against_scala_white_to_move(scalachess):
+    """new_game on a White-to-move position should match scalachess on
+    fen/turn/check/status/winner."""
+    py = PyVariantClient()
+    fen = INITIAL_FEN_KQ
+    py_state = py.new_game(fen)
+    sc_state = scalachess.new_game(fen)
+    for k in ("fen", "turn", "check", "status", "winner"):
+        assert py_state.get(k) == sc_state.get(k), (
+            f"{k} diverges: py={py_state.get(k)!r} scala={sc_state.get(k)!r}"
+        )
+
+
+def test_new_game_diff_against_scala_black_to_move(scalachess):
+    """Same parity check on a Black-to-move position."""
+    py = PyVariantClient()
+    fen = (
+        "pppppppp/kkkkkkkk/pppppppp/8/8/P7/1PPPPPPP/RNBQKBNR"
+        "[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,"
+        "a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:k,"
+        "a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] b KQ - 0 1"
+    )
+    py_state = py.new_game(fen)
+    sc_state = scalachess.new_game(fen)
+    for k in ("fen", "turn", "check", "status", "winner"):
+        assert py_state.get(k) == sc_state.get(k), (
+            f"{k} diverges: py={py_state.get(k)!r} scala={sc_state.get(k)!r}"
+        )
 
 
 # ---- placeholders for upcoming differential tests ----
 # Uncomment / un-skip as each piece lands.
 
-@pytest.mark.skip(reason="white-side move-gen not yet ported")
 def test_diff_starting_position_white_moves(scalachess):
     py = PyVariantClient()
     START_FEN = (
@@ -102,6 +156,67 @@ def test_diff_starting_position_white_moves(scalachess):
         "a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQkq - 0 1"
     )
     assert_legal_moves_match(py, scalachess, START_FEN)
+
+
+@pytest.mark.parametrize("fen", [
+    # Pawn captures available against a Black "stack" on rank 6.
+    "8/8/p7/1P6/8/8/8/4K3[a6:s] w - - 0 1",
+    # Castling-eligible: White king + both rooks on home squares with clear lanes.
+    "8/8/8/8/8/8/8/R3K2R w KQ - 0 1",
+    # Pawn ready to promote on rank 7 (will produce 4 promotion moves).
+    "8/3P4/8/8/8/8/8/4K3 w - - 0 1",
+    # Mid-game position from saved games — captures + non-captures mixed.
+    "ppp1p1pp/k1kk1k2/kpppppkp/8/8/PPPPPP2/R5PP/1NBQKBNR"
+    "[a6:sk,b6:s,c6:s,d6:skS,e6:s,f6:skS,g6:sk,h6:s,a7:k,c7:k,d7:k,f7:k,a8:s,b8:s,c8:s,e8:s,g8:s,h8:s] w K - 0 1",
+])
+def test_diff_white_moves_various_positions(scalachess, fen):
+    """python-chess vs scalachess on a variety of White-to-move positions
+    (captures, castling, promotions, mid-game)."""
+    assert_legal_moves_match(PyVariantClient(), scalachess, fen)
+
+
+@pytest.mark.parametrize("fen,uci", [
+    # Simple opening pawn move (no capture).
+    (
+        "pppppppp/kkkkkkkk/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR"
+        "[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,"
+        "a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:k,"
+        "a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQkq - 0 1",
+        "e2e4",
+    ),
+    # White pawn captures Black "stack" on diagonal — captured square's
+    # entire stack should be removed from the overlay.
+    ("8/8/p7/1P6/8/8/8/4K3[a6:s] w - - 0 1", "b5a6"),
+    # Kingside castling, standard UCI.
+    ("8/8/8/8/8/8/8/R3K2R w KQ - 0 1", "e1g1"),
+    # Kingside castling, king-to-rook UCI (Chess960-style; PyVariantClient
+    # should translate this to standard before applying).
+    ("8/8/8/8/8/8/8/R3K2R w KQ - 0 1", "e1h1"),
+    # Pawn promotion to queen.
+    ("8/3P4/8/8/8/8/8/4K3 w - - 0 1", "d7d8q"),
+])
+def test_diff_make_move_white(scalachess, fen, uci):
+    """White make_move output should match scalachess on fen/turn/check/status/winner."""
+    py = PyVariantClient()
+    py_after = py.make_move(fen, uci)
+    sc_after = scalachess.make_move(fen, uci)
+    for k in ("fen", "turn", "check", "status", "winner"):
+        assert py_after.get(k) == sc_after.get(k), (
+            f"{k} diverges for fen={fen!r} uci={uci!r}: "
+            f"py={py_after.get(k)!r} scala={sc_after.get(k)!r}"
+        )
+
+
+def test_diff_make_move_black_elimination(scalachess):
+    """Capturing the last Black stack should yield variantEnd / winner=white."""
+    py = PyVariantClient()
+    fen = "8/8/p7/1P6/8/8/8/4K3[a6:s] w - - 0 1"
+    py_after = py.make_move(fen, "b5a6")
+    sc_after = scalachess.make_move(fen, "b5a6")
+    assert py_after["status"] == "variantEnd"
+    assert py_after["winner"] == "white"
+    assert py_after["status"] == sc_after["status"]
+    assert py_after["winner"] == sc_after["winner"]
 
 
 @pytest.mark.skip(reason="black-side move-gen not yet ported")
