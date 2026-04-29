@@ -34,12 +34,16 @@ def scalachess() -> ServerClient:
 
 def _normalize_legal_moves(moves: list[dict[str, Any]]) -> list[tuple]:
     """Order-independent canonical form so we can compare two engines'
-    legalMoves lists. Sort by uci. Drop fields scalachess includes that we
-    don't yet emit."""
+    legalMoves lists. Sort by uci. Coerce list fields to tuples so the
+    rows are hashable (needed for set-diff in failure messages)."""
     keep = ("uci", "from", "to", "piece", "color", "capture",
             "waypoints", "chainHops", "promotion", "demotedKings",
             "demotionsRequired", "sourceKingPositions", "deployCount")
-    rows = [tuple((k, m.get(k)) for k in keep) for m in moves]
+
+    def _coerce(v):
+        return tuple(v) if isinstance(v, list) else v
+
+    rows = [tuple((k, _coerce(m.get(k))) for k in keep) for m in moves]
     return sorted(rows)
 
 
@@ -268,6 +272,23 @@ def test_diff_black_quiet_plus_deploy_stone_top(scalachess, fen):
 def test_diff_black_back_rank_sprint(scalachess, fen):
     """Phase 2C — back-rank sprint. Height-1 unmoved Stone-top on rank 8
     can move 2 squares forward-diagonal when path is clear."""
+    assert_legal_moves_match(PyVariantClient(), scalachess, fen)
+
+
+@pytest.mark.parametrize("fen", [
+    # Lone height-1 King-top: 4 diags + 4 charges (1-square each, all demote
+    # the only King, demotion fields null).
+    "8/8/4p3/8/8/8/8/4K3[e6:k] b - - 0 1",
+    # Height-2 King-top: 8 diags + 4 deploys + 12 charges.
+    "8/8/4p3/8/8/8/8/4K3[e6:kk] b - - 0 1",
+    # Height-2 King-top with a path-blocking friendly tower.
+    "8/8/4p3/8/4p3/8/8/4K3[e6:kk,e4:k] b - - 0 1",
+    # Charge with path captures + ram landing combo.
+    "8/8/4p3/8/4P3/8/4P3/4K3[e6:kkk] b - - 0 1",
+])
+def test_diff_black_charge(scalachess, fen):
+    """Phase 2E — King-top charges: distance, demotion choice, path
+    captures, friendly merge, rams."""
     assert_legal_moves_match(PyVariantClient(), scalachess, fen)
 
 

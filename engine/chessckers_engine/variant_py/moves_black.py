@@ -6,13 +6,14 @@ Phase status:
 - [x] 2B: Deploy moves
 - [x] 2C: Back-rank sprint
 - [ ] 2D: Diagonal capture chains
-- [ ] 2E: Charge (orthogonal capture)
+- [x] 2E: Charge (orthogonal capture)
 - [ ] 2F: Mandatory rule filter
 - [ ] 2G: State transition (apply Black move)
 """
 
 from __future__ import annotations
 
+from itertools import combinations
 from typing import Any
 
 import chess
@@ -165,6 +166,163 @@ def black_deploy_moves(state: State) -> list[dict[str, Any]]:
                     if target.color == chess.BLACK and _is_black_top_at(state, to_sq):
                         moves.append(_deploy_move(from_name, to_sq, top, s))
                     break
+    return moves
+
+
+_ORTHO_DIRS = [(0, 1), (0, -1), (1, 0), (-1, 0)]
+
+
+def black_charge_moves(state: State) -> list[dict[str, Any]]:
+    """Phase 2E — Charge (orthogonal capture).
+
+    A King-top tower may move along a rank or file. Cost is one King
+    demoted per square moved. Path Whites are captured for free; landing
+    on a White piece is a ram (tower destroyed at landing, no landing
+    capture). Friendly Black towers in the path block; landing on a
+    friendly is a merge.
+
+    For non-ram landings with `n_kings > d` (charge distance), each
+    combinatorial choice of which Kings to demote produces a separate
+    move (UCI suffix `{a,b,c}`). When `n_kings == d` only one combination
+    exists and demotion fields are emitted as null. Rams always emit a
+    single move with null demotion fields (the tower dies at landing,
+    so the choice is moot).
+
+    The `capture` field — when there are path captures, scalachess emits
+    the closest-to-source captured square; for a ram with no path
+    captures, it emits the destination; otherwise null. We mirror this
+    quirk for byte-for-byte parity.
+    """
+    if state.board.turn != chess.BLACK:
+        return []
+    moves: list[dict[str, Any]] = []
+    for from_sq, pieces in state.stacks.items():
+        if not pieces or pieces[-1] != "k":
+            continue
+        n_kings = sum(1 for p in pieces if p == "k")
+        if n_kings == 0:
+            continue
+        from_file = chess.square_file(from_sq)
+        from_rank = chess.square_rank(from_sq)
+        from_name = chess.square_name(from_sq)
+        king_positions = [i + 1 for i, p in enumerate(pieces) if p == "k"]
+
+        for df, dr in _ORTHO_DIRS:
+            stop_after = False  # set when a friendly tower mid-scan blocks further walk
+            for d in range(1, n_kings + 1):
+                if stop_after:
+                    break
+                # Scan path 1..d-1 for blockers / collect path captures fresh.
+                blocked = False
+                path_captures: list[str] = []
+                for k in range(1, d):
+                    pf = from_file + k * df
+                    pr = from_rank + k * dr
+                    psq = chess.square(pf, pr)
+                    p = state.board.piece_at(psq)
+                    if p is not None:
+                        if p.color == chess.BLACK and _is_black_top_at(state, psq):
+                            blocked = True
+                            break
+                        if p.color == chess.WHITE:
+                            path_captures.append(chess.square_name(psq))
+                if blocked:
+                    break
+                tf = from_file + d * df
+                tr = from_rank + d * dr
+                if not _on_board(tf, tr):
+                    break
+                to_sq = chess.square(tf, tr)
+                to_name = chess.square_name(to_sq)
+                target = state.board.piece_at(to_sq)
+                is_ram = target is not None and target.color == chess.WHITE
+                is_friendly_merge = (
+                    target is not None
+                    and target.color == chess.BLACK
+                    and _is_black_top_at(state, to_sq)
+                )
+
+                # Capture-field convention (scalachess parity).
+                if path_captures:
+                    capture_field: str | None = path_captures[0]
+                elif is_ram:
+                    capture_field = to_name
+                else:
+                    capture_field = None
+
+                if is_ram:
+                    # Ram: tower destroyed at landing; demotion choice is moot.
+                    moves.append({
+                        "uci": f"{from_name}{to_name}",
+                        "from": from_name,
+                        "to": to_name,
+                        "piece": "king",
+                        "color": "black",
+                        "capture": capture_field,
+                        "waypoints": None,
+                        "chainHops": None,
+                        "promotion": None,
+                        "demotedKings": None,
+                        "demotionsRequired": None,
+                        "sourceKingPositions": None,
+                        "deployCount": None,
+                    })
+                    # The white at d remains on the board for OUR move-gen
+                    # purposes; longer charges pass over it as a path capture
+                    # (not a blocker). Continue scanning.
+                    continue
+
+                # Non-ram landing (empty or friendly merge).
+                if n_kings == d:
+                    # Forced demotion — null fields.
+                    new_pieces = list(pieces)
+                    for pos in king_positions:
+                        new_pieces[pos - 1] = "S"
+                    resulting_top = new_pieces[-1]
+                    moves.append({
+                        "uci": f"{from_name}{to_name}",
+                        "from": from_name,
+                        "to": to_name,
+                        "piece": _piece_name(resulting_top),
+                        "color": "black",
+                        "capture": capture_field,
+                        "waypoints": None,
+                        "chainHops": None,
+                        "promotion": None,
+                        "demotedKings": None,
+                        "demotionsRequired": None,
+                        "sourceKingPositions": None,
+                        "deployCount": None,
+                    })
+                else:
+                    # Multiple demotion choices.
+                    for choice in combinations(king_positions, d):
+                        choice_sorted = list(choice)  # combinations yields sorted
+                        new_pieces = list(pieces)
+                        for pos in choice_sorted:
+                            new_pieces[pos - 1] = "S"
+                        resulting_top = new_pieces[-1]
+                        choice_str = ",".join(str(x) for x in choice_sorted)
+                        moves.append({
+                            "uci": f"{from_name}{to_name}{{{choice_str}}}",
+                            "from": from_name,
+                            "to": to_name,
+                            "piece": _piece_name(resulting_top),
+                            "color": "black",
+                            "capture": capture_field,
+                            "waypoints": None,
+                            "chainHops": None,
+                            "promotion": None,
+                            "demotedKings": choice_sorted,
+                            "demotionsRequired": d,
+                            "sourceKingPositions": list(king_positions),
+                            "deployCount": None,
+                        })
+
+                if is_friendly_merge:
+                    # Friendly landing blocks further scanning beyond this d.
+                    stop_after = True
+
     return moves
 
 

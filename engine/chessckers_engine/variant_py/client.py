@@ -22,6 +22,7 @@ from typing import Any
 import chess
 
 from chessckers_engine.variant_py.moves_black import (
+    black_charge_moves,
     black_deploy_moves,
     black_diagonal_quiet_moves,
 )
@@ -63,9 +64,13 @@ def _state_to_dict(state: State, fen_override: str | None = None) -> GameState:
     if state.board.turn == chess.WHITE:
         legal_moves = white_legal_moves(state)
     else:
-        # Black: incremental — quiet diagonals + deploys wired. Sprint,
-        # captures, charges, mandate filter still pending.
-        legal_moves = black_diagonal_quiet_moves(state) + black_deploy_moves(state)
+        # Black: incremental — quiet diagonals + deploys + sprint + charges.
+        # Diagonal capture chains (Phase 2D) and mandate filter (2F) pending.
+        legal_moves = (
+            black_diagonal_quiet_moves(state)
+            + black_deploy_moves(state)
+            + black_charge_moves(state)
+        )
     return {
         "fen": fen,
         "turn": turn,
