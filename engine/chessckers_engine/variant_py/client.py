@@ -24,7 +24,9 @@ import chess
 from chessckers_engine.variant_py.moves_black import (
     black_charge_moves,
     black_deploy_moves,
+    black_diagonal_capture_moves,
     black_diagonal_quiet_moves,
+    filter_for_mandate,
 )
 from chessckers_engine.variant_py.moves_white import (
     apply_white_move,
@@ -64,13 +66,17 @@ def _state_to_dict(state: State, fen_override: str | None = None) -> GameState:
     if state.board.turn == chess.WHITE:
         legal_moves = white_legal_moves(state)
     else:
-        # Black: incremental — quiet diagonals + deploys + sprint + charges.
-        # Diagonal capture chains (Phase 2D) and mandate filter (2F) pending.
-        legal_moves = (
+        # Black: phases 2A-2C/2E (quiet diagonals + deploys + sprint + charges)
+        # and a simplified 2D (single-hop diagonal captures only — no chains,
+        # no rim handling, no rank-1 promotion). Mandate filter (2F) is
+        # applied last to suppress non-capturing moves when active.
+        all_moves = (
             black_diagonal_quiet_moves(state)
             + black_deploy_moves(state)
             + black_charge_moves(state)
+            + black_diagonal_capture_moves(state)
         )
+        legal_moves = filter_for_mandate(state, all_moves)
     return {
         "fen": fen,
         "turn": turn,

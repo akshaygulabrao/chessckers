@@ -304,10 +304,26 @@ def test_diff_starting_position_black_moves(scalachess):
     assert_legal_moves_match(py, scalachess, BLACK_TO_MOVE)
 
 
-@pytest.mark.skip(reason="black king-capture path not yet ported")
 def test_diff_black_king_capture(scalachess):
-    """The classic regression — Black jumps over white king and captures."""
+    """Black jumps over white king and captures (single-hop). Verifies
+    Phase 2D-simple + mandate filter: only the capture is a legal Black
+    move here (mandate fires)."""
     py = PyVariantClient()
     KING_CAPTURE_FEN = "8/8/8/1p6/2K5/8/8/8[b5:s] b - - 0 1"
     assert_legal_moves_match(py, scalachess, KING_CAPTURE_FEN)
-    assert_make_move_matches(py, scalachess, KING_CAPTURE_FEN, "b5d3")
+
+
+@pytest.mark.parametrize("fen", [
+    # Stone-top with one available capture; ram + normal landing both legal.
+    # Mandate fires (normal landing c4 is empty), so scalachess emits only captures.
+    "8/8/p7/1P6/8/8/8/4K3[a6:s] b - - 0 1",
+    # Height-2 Stone-top with one capture; multiple landings (k=1,2,3) → ram + 2 normals.
+    "8/8/p7/1P6/8/8/8/4K3[a6:ss] b - - 0 1",
+    # King-top height-1 capture in an arbitrary diagonal direction.
+    "8/8/8/8/4P3/3p4/8/4K3[d3:k] b - - 0 1",
+])
+def test_diff_black_diagonal_single_hop(scalachess, fen):
+    """Phase 2D-simple — single-hop diagonal captures with on-board landings.
+    Positions chosen so the mandate fires (only captures legal), no chain
+    continuation possible (just one White available), no rim, no rank-1 touch."""
+    assert_legal_moves_match(PyVariantClient(), scalachess, fen)

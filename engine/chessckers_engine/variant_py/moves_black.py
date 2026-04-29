@@ -5,9 +5,9 @@ Phase status:
 - [x] 2A: Diagonal quiet moves (full-tower, no deploy, no capture)
 - [x] 2B: Deploy moves
 - [x] 2C: Back-rank sprint
-- [ ] 2D: Diagonal capture chains
+- [~] 2D: Diagonal capture chains (single hop, no rim, no chain, no promote)
 - [x] 2E: Charge (orthogonal capture)
-- [ ] 2F: Mandatory rule filter
+- [x] 2F: Mandatory rule filter
 - [ ] 2G: State transition (apply Black move)
 """
 
@@ -170,6 +170,158 @@ def black_deploy_moves(state: State) -> list[dict[str, Any]]:
 
 
 _ORTHO_DIRS = [(0, 1), (0, -1), (1, 0), (-1, 0)]
+
+
+def black_diagonal_capture_moves(state: State) -> list[dict[str, Any]]:
+    """Phase 2D (simplified) — single-hop diagonal captures.
+
+    Limitations of this initial cut:
+    - Only single hops (no chains). A chain landing position with a follow-up
+      capture in another direction is not yet emitted as a multi-hop move.
+    - Only board landings. Rim landings and rim-bounces are not yet handled.
+    - No rank-1 promotion. Hops touching rank 1 don't promote yet.
+
+    Per §3B: walk up to n steps along a diagonal, find the first White at
+    distance d ∈ [1, n], pick a landing k ∈ [d, n+1]. Capture every
+    on-board White on path squares 1..k-1. Land at k:
+        empty board square → normal hop
+        White piece → ram (no landing capture; tower destroyed at landing)
+        friendly tower → that k is illegal
+    Ram-at-k=d additional reachability: k=d+1 must be on the 10x10 grid
+    and not a friendly Black tower."""
+    if state.board.turn != chess.BLACK:
+        return []
+    moves: list[dict[str, Any]] = []
+    for from_sq, pieces in state.stacks.items():
+        if not pieces:
+            continue
+        n = len(pieces)
+        top = pieces[-1]
+        directions = _ALL_DIAGS if top == "k" else _FORWARD_DIAGS
+        from_file = chess.square_file(from_sq)
+        from_rank = chess.square_rank(from_sq)
+        from_name = chess.square_name(from_sq)
+
+        for df, dr in directions:
+            # Find first enemy at d ∈ [1, n]. Friendly intervening tower
+            # blocks the scan and means no first enemy in this direction.
+            d = None
+            for step in range(1, n + 1):
+                pf = from_file + step * df
+                pr = from_rank + step * dr
+                if not _on_board(pf, pr):
+                    break
+                psq = chess.square(pf, pr)
+                p = state.board.piece_at(psq)
+                if p is None:
+                    continue
+                if p.color == chess.BLACK and _is_black_top_at(state, psq):
+                    break  # friendly blocks scan
+                d = step  # White piece — first enemy
+                break
+            if d is None:
+                continue
+
+            for k in range(d, n + 2):
+                tf = from_file + k * df
+                tr = from_rank + k * dr
+                if not _on_board(tf, tr):
+                    continue  # rim handling deferred
+                to_sq = chess.square(tf, tr)
+                to_name = chess.square_name(to_sq)
+                target = state.board.piece_at(to_sq)
+
+                # Path captures (steps 1..k-1, board squares only — rim
+                # squares capture nothing per spec, deferred).
+                path_captures: list[str] = []
+                path_off_board = False
+                for step in range(1, k):
+                    pf2 = from_file + step * df
+                    pr2 = from_rank + step * dr
+                    if not _on_board(pf2, pr2):
+                        path_off_board = True
+                        break
+                    psq2 = chess.square(pf2, pr2)
+                    p2 = state.board.piece_at(psq2)
+                    if p2 is not None and p2.color == chess.WHITE:
+                        path_captures.append(chess.square_name(psq2))
+                if path_off_board:
+                    continue  # rim path deferred
+
+                # Landing classification.
+                if target is None:
+                    is_ram = False
+                elif target.color == chess.WHITE:
+                    is_ram = True
+                else:
+                    # Friendly Black tower at landing → that k is illegal.
+                    continue
+
+                # Ram reachability (only applies when k == d).
+                if is_ram and k == d:
+                    next_f = from_file + (d + 1) * df
+                    next_r = from_rank + (d + 1) * dr
+                    # Off the 10×10 grid?
+                    if not (-1 <= next_f <= 8 and -1 <= next_r <= 8):
+                        continue
+                    # On 8×8: friendly tower disqualifies the ram.
+                    if _on_board(next_f, next_r):
+                        next_sq = chess.square(next_f, next_r)
+                        next_p = state.board.piece_at(next_sq)
+                        if (
+                            next_p is not None
+                            and next_p.color == chess.BLACK
+                            and _is_black_top_at(state, next_sq)
+                        ):
+                            continue
+
+                # `capture` field: closest path-captured White, or ram-destination.
+                if path_captures:
+                    capture_field: str | None = path_captures[0]
+                elif is_ram:
+                    capture_field = to_name
+                else:
+                    capture_field = None
+
+                moves.append({
+                    "uci": f"{from_name}{to_name}",
+                    "from": from_name,
+                    "to": to_name,
+                    "piece": _piece_name(top),
+                    "color": "black",
+                    "capture": capture_field,
+                    "waypoints": None,
+                    "chainHops": [to_name],
+                    "promotion": None,
+                    "demotedKings": None,
+                    "demotionsRequired": None,
+                    "sourceKingPositions": None,
+                    "deployCount": None,
+                })
+    return moves
+
+
+def black_mandatory_capture_active(state: State) -> bool:
+    """§4 — mandate fires when at least one diagonal capture has a normal
+    (empty-board) landing. Rams alone do not trigger; rim-only landings
+    do not trigger (we don't emit them yet, but if/when we do, they
+    should not count). Charge captures don't trigger either — only
+    diagonal hops with normal landings."""
+    for cap in black_diagonal_capture_moves(state):
+        # Normal landing = empty board square.
+        to_sq = chess.parse_square(cap["to"])
+        if state.board.piece_at(to_sq) is None:
+            return True
+    return False
+
+
+def filter_for_mandate(state: State, all_moves: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """If mandate is active, suppress non-capturing moves (quiet diagonals,
+    deploys, sprints, non-capturing charges) per §4. Capturing moves
+    (path-capture or ram) all satisfy the mandate."""
+    if not black_mandatory_capture_active(state):
+        return all_moves
+    return [m for m in all_moves if m.get("capture") is not None]
 
 
 def black_charge_moves(state: State) -> list[dict[str, Any]]:
