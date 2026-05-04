@@ -30,6 +30,8 @@ import re
 from pathlib import Path
 from typing import Any, Protocol
 
+from chessckers_engine.selfplay_az import AZExample
+
 log = logging.getLogger("chessckers_engine.demos")
 
 GameRecord = dict[str, Any]
@@ -78,9 +80,13 @@ def extract_examples(
     color: str,
     client: _Mover,
 ) -> list[Example]:
-    """For each finished game where `color` was human-played, emit one example
-    per move that color made, with target = +1/-1/0 from `color`'s perspective.
-    Each example carries the full LegalMove dict so encode_move() can be applied."""
+    """For each finished game where `color` was human-played, emit one
+    `(fen, move, target)` example per move that color made, with `target` =
+    +1/-1/0 from `color`'s perspective. Suitable for value-style scalar
+    regression (`train.train()`).
+
+    For policy imitation use `extract_az_examples` instead, which produces
+    AZExamples with one-hot visit distributions on the played move."""
     examples: list[Example] = []
     for game in games:
         outcome = game["outcome"]
@@ -95,7 +101,6 @@ def extract_examples(
                 continue
             if turn != color:
                 continue
-            # Re-query legal moves at this FEN to find the matching dict.
             try:
                 state = client.new_game(fen)
             except Exception as e:  # noqa: BLE001
@@ -107,4 +112,56 @@ def extract_examples(
                 log.debug("skipping (fen, uci)=(%s, %s) — no matching legal move", fen[:40], uci)
                 continue
             examples.append({"fen": fen, "move": match, "target": float(target)})
+    return examples
+
+
+def extract_az_examples(
+    games: list[GameRecord],
+    color: str,
+    client: _Mover,
+) -> list[AZExample]:
+    """Imitation-learning examples in AZExample shape.
+
+    For each move that `color` played:
+    - `legal_moves` = full legal-moves list at that FEN (queried from the API).
+    - `visit_distribution` = one-hot on the played move's index.
+    - `value_target` = +1/-1/0 from `color`'s perspective (game outcome).
+
+    Plug into `train_az.train_az()` to imitate the played moves (policy head,
+    via cross-entropy with the one-hot target) AND learn position values from
+    outcomes (value head, via MSE)."""
+    examples: list[AZExample] = []
+    for game in games:
+        outcome = game["outcome"]
+        target_v = _target_for_color(outcome, color)
+        history = game.get("history") or []
+        for entry in history:
+            fen = entry["fen"]
+            uci = entry["uci"]
+            try:
+                turn = _turn_from_fen(fen)
+            except ValueError:
+                continue
+            if turn != color:
+                continue
+            try:
+                state = client.new_game(fen)
+            except Exception as e:  # noqa: BLE001
+                log.debug("skipping fen=%s due to API error: %s", fen[:40], e)
+                continue
+            legal = state.get("legalMoves") or []
+            played_idx = next((i for i, m in enumerate(legal) if m.get("uci") == uci), None)
+            if played_idx is None:
+                log.debug("skipping (fen, uci)=(%s, %s) — no matching legal move", fen[:40], uci)
+                continue
+            dist = [0.0] * len(legal)
+            dist[played_idx] = 1.0
+            examples.append(
+                AZExample(
+                    fen=fen,
+                    legal_moves=legal,
+                    visit_distribution=dist,
+                    value_target=float(target_v),
+                )
+            )
     return examples

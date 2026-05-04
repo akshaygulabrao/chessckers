@@ -1,8 +1,9 @@
 import torch
+from torch import nn
 
 from chessckers_engine.model import ChesskersScorer
 from chessckers_engine.selfplay_az import AZExample
-from chessckers_engine.train_az import save_checkpoint, train_az
+from chessckers_engine.train_az import _batch_loss, _example_loss, save_checkpoint, train_az
 
 INITIAL_FEN = (
     "pppppppp/kkkkkkkk/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR"
@@ -118,3 +119,46 @@ def test_checkpoint_save_and_load_roundtrip(tmp_path):
         b_logits, b_value = fresh.policy_and_value(pos, mv)
     assert torch.allclose(a_logits, b_logits)
     assert torch.allclose(a_value, b_value)
+
+
+# ---- Mini-batched loss correctness ----
+
+
+def test_batch_loss_size_one_matches_example_loss():
+    """_batch_loss with a singleton batch must match _example_loss exactly
+    (within float precision) — the math is the same, just expressed batch-aware."""
+    torch.manual_seed(0)
+    model = ChesskersScorer().eval()
+    ex = _example([0.1, 0.7, 0.2], 0.4)
+    value_loss_fn = nn.MSELoss()
+    p1, v1 = _example_loss(model, ex, None, value_loss_fn)
+    p2, v2 = _batch_loss(model, [ex], value_loss_fn)
+    assert abs(p1.item() - p2.item()) < 1e-5
+    assert abs(v1.item() - v2.item()) < 1e-5
+
+
+def test_batch_loss_mean_equals_per_example_average():
+    """_batch_loss returns mean per-example loss over the batch. Verify this
+    matches the average of independently computed _example_loss values."""
+    torch.manual_seed(0)
+    model = ChesskersScorer().eval()
+    examples = [
+        _example([0.5, 0.3, 0.2], 1.0),
+        _example([0.1, 0.8, 0.1], -1.0),
+        _example([0.25, 0.25, 0.5], 0.0),
+    ]
+    value_loss_fn = nn.MSELoss()
+    p_b, v_b = _batch_loss(model, examples, value_loss_fn)
+    indiv_p = [_example_loss(model, ex, None, value_loss_fn)[0].item() for ex in examples]
+    indiv_v = [_example_loss(model, ex, None, value_loss_fn)[1].item() for ex in examples]
+    assert abs(p_b.item() - sum(indiv_p) / len(indiv_p)) < 1e-5
+    assert abs(v_b.item() - sum(indiv_v) / len(indiv_v)) < 1e-5
+
+
+def test_train_az_with_batch_size_decreases_loss():
+    """End-to-end: training with batch_size > 1 should still converge."""
+    torch.manual_seed(0)
+    model = ChesskersScorer()
+    examples = [_example([0.1, 0.7, 0.2], 0.5) for _ in range(64)]
+    result = train_az(model, examples, epochs=4, lr=5e-3, batch_size=16, log_every=0)
+    assert result.epoch_losses[-1]["total"] < result.epoch_losses[0]["total"]
