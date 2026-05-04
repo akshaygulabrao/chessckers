@@ -7,9 +7,10 @@ from chessckers_engine.mcts_puct import (
     TERMINAL_LOSS_VALUE,
     PuctNode,
     _backup,
-    _evaluate_with_model,
-    _expand,
+    _eval_and_priors,
+    _expand_with_priors,
     _puct_score,
+    _terminal_value,
     pick_puct,
     run_mcts,
 )
@@ -59,27 +60,24 @@ def test_puct_score_visited_child_q_dominates_eventually():
 def test_evaluate_uses_value_head_for_non_terminal_leaves():
     torch.manual_seed(0)
     model = ChesskersScorer().eval()
-    node = PuctNode(fen=FEN_W, move_to_here=None, is_terminal=False)
-    v = _evaluate_with_model(node, model)
+    v, priors = _eval_and_priors(model, FEN_W, [])
     assert -1.0 <= v <= 1.0
+    assert priors == []
 
 
-def test_evaluate_returns_terminal_loss_value_for_mate():
-    model = ChesskersScorer().eval()
+def test_terminal_value_for_mate():
     node = PuctNode(fen=FEN_W, move_to_here=None, is_terminal=True, terminal_status="mate")
-    assert _evaluate_with_model(node, model) == TERMINAL_LOSS_VALUE
+    assert _terminal_value(node) == TERMINAL_LOSS_VALUE
 
 
-def test_evaluate_returns_terminal_loss_value_for_variant_end():
-    model = ChesskersScorer().eval()
+def test_terminal_value_for_variant_end():
     node = PuctNode(fen=FEN_W, move_to_here=None, is_terminal=True, terminal_status="variantEnd")
-    assert _evaluate_with_model(node, model) == TERMINAL_LOSS_VALUE
+    assert _terminal_value(node) == TERMINAL_LOSS_VALUE
 
 
-def test_evaluate_returns_zero_for_stalemate():
-    model = ChesskersScorer().eval()
+def test_terminal_value_for_stalemate():
     node = PuctNode(fen=FEN_W, move_to_here=None, is_terminal=True, terminal_status="stalemate")
-    assert _evaluate_with_model(node, model) == TERMINAL_DRAW_VALUE
+    assert _terminal_value(node) == TERMINAL_DRAW_VALUE
 
 
 # ---- Backup ----
@@ -115,11 +113,10 @@ def test_expand_skips_candidates_that_raise():
     parent = PuctNode(fen=FEN_W, move_to_here=None)
     moves = [_move("GOOD"), _move("BAD")]
     client = _StubClient({(FEN_W, "GOOD"): {"fen": FEN_B, "legalMoves": []}})
-    model = ChesskersScorer().eval()
-    _expand(parent, moves, client, model)
+    # Priors come pre-computed (one per move) from the fused leaf eval.
+    priors = [0.5, 0.5]
+    _expand_with_priors(parent, moves, priors, client)
     assert "GOOD" in parent.children and "BAD" not in parent.children
-    # Each child has a prior; they sum to 1 across all legal moves before filtering.
-    # Surviving child kept its assigned prior (>= 0).
     assert 0.0 <= parent.children["GOOD"].prior <= 1.0
 
 
@@ -296,3 +293,74 @@ def test_dirichlet_noise_only_at_root_not_at_deeper_nodes():
         noisy_grand = [c.prior for c in a_child_noisy.children.values()]
         for p1, p2 in zip(no_grand, noisy_grand):
             assert abs(p1 - p2) < 1e-6
+
+
+# ---- Virtual-loss MCTS ----
+
+
+def test_apply_and_remove_virtual_loss_round_trip():
+    """Applying then removing virtual loss must restore exact state."""
+    from chessckers_engine.mcts_puct import _apply_virtual_loss, _remove_virtual_loss
+    a = PuctNode(fen=FEN_W, move_to_here=None, visits=5, total_value=2.0)
+    b = PuctNode(fen=FEN_B, move_to_here=None, visits=3, total_value=-1.0)
+    path = [a, b]
+    _apply_virtual_loss(path, count=2)
+    assert (a.visits, a.total_value) == (7, 0.0)
+    assert (b.visits, b.total_value) == (5, -3.0)
+    _remove_virtual_loss(path, count=2)
+    assert (a.visits, a.total_value) == (5, 2.0)
+    assert (b.visits, b.total_value) == (3, -1.0)
+
+
+def test_run_mcts_vloss_batch_produces_valid_visit_distribution():
+    """Run MCTS with vloss_batch>1 backed by an InferenceServer; the result
+    should be well-formed (visits sum to ~n_sims, all moves get a count)."""
+    from chessckers_engine.inference_server import InferenceServer
+
+    state = {"fen": FEN_W, "legalMoves": [_move("A"), _move("B"), _move("C")]}
+    table = {
+        (FEN_W, "A"): {"fen": FEN_B, "legalMoves": []},
+        (FEN_W, "B"): {"fen": FEN_B, "legalMoves": []},
+        (FEN_W, "C"): {"fen": FEN_B, "legalMoves": []},
+    }
+
+    class Client:
+        def new_game(self, fen=None):
+            return {"fen": fen, "legalMoves": []}
+        def make_move(self, fen, uci):
+            return table[(fen, uci)]
+
+    torch.manual_seed(0)
+    model = ChesskersScorer().eval()
+    n_sims = 16
+
+    with InferenceServer(model, max_batch_size=4) as srv:
+        result = run_mcts(state, Client(), srv, n_sims=n_sims, vloss_batch=4)
+
+    assert result.chosen is not None
+    assert sum(result.visit_distribution.values()) >= n_sims - 1  # ≥ n_sims-1 (one expand sim)
+    # All three legal root moves should appear in the distribution.
+    assert set(result.visit_distribution.keys()) == {"A", "B", "C"}
+
+
+def test_vloss_batch_falls_back_to_sequential_without_server():
+    """When evaluator has no submit() method, vloss_batch>1 must still work
+    by falling back to per-sim evaluation (no crashes, valid result)."""
+    state = {"fen": FEN_W, "legalMoves": [_move("A"), _move("B")]}
+    table = {
+        (FEN_W, "A"): {"fen": FEN_B, "legalMoves": []},
+        (FEN_W, "B"): {"fen": FEN_B, "legalMoves": []},
+    }
+
+    class Client:
+        def new_game(self, fen=None):
+            return {"fen": fen, "legalMoves": []}
+        def make_move(self, fen, uci):
+            return table[(fen, uci)]
+
+    torch.manual_seed(0)
+    model = ChesskersScorer().eval()
+    # Pass model directly (no submit method) but request vloss_batch=4
+    result = run_mcts(state, Client(), model, n_sims=8, vloss_batch=4)
+    assert result.chosen is not None
+    assert set(result.visit_distribution.keys()) == {"A", "B"}

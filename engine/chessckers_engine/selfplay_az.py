@@ -161,6 +161,7 @@ def play_az_game(
     dirichlet_eps: float = 0.25,
     sink: WatchSink | None = None,
     sink_context: dict[str, Any] | None = None,
+    vloss_batch: int = 1,
 ) -> AZGame:
     """Play one self-play game using PUCT MCTS at each move.
 
@@ -191,6 +192,7 @@ def play_az_game(
             n_sims=n_sims, c_puct=c_puct,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_eps=dirichlet_eps,
+            vloss_batch=vloss_batch,
         )
         visits = _aligned_visits(result.visit_distribution, legal)
         records.append(

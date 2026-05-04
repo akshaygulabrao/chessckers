@@ -76,41 +76,49 @@ def _select_child(parent: PuctNode, c_puct: float) -> PuctNode:
     return max(parent.children.values(), key=lambda c: _puct_score(c, parent.visits, c_puct))
 
 
-def _evaluate_with_model(node: PuctNode, model: ChesskersScorer) -> float:
-    """Use the value head for non-terminal leaves; fixed scalars for terminals."""
-    if node.is_terminal:
-        if node.terminal_status == "stalemate":
-            return TERMINAL_DRAW_VALUE
-        return TERMINAL_LOSS_VALUE
-    pos = encode_position(node.fen).unsqueeze(0)
-    with torch.no_grad():
-        v = model.value(pos)
-    return float(v.item())
+def _terminal_value(node: PuctNode) -> float:
+    """Fixed value for terminal leaves; the side-to-move at a terminal node has
+    just lost (or stalemated)."""
+    if node.terminal_status == "stalemate":
+        return TERMINAL_DRAW_VALUE
+    return TERMINAL_LOSS_VALUE
 
 
-def _compute_priors(
-    model: ChesskersScorer, fen: str, legal_moves: list[LegalMove]
-) -> list[float]:
-    """Softmax over the policy head's logits at this position. Returns a list
-    of probabilities aligned with `legal_moves` (sums to 1, length = len(legal_moves))."""
+def _eval_and_priors(
+    evaluator, fen: str, legal_moves: list[LegalMove]
+) -> tuple[float, list[float]]:
+    """One leaf evaluation returning (value, priors). `evaluator` is either
+    a `ChesskersScorer` (direct in-thread forward pass) or an
+    `InferenceServer` (queued, batched across concurrent MCTS workers).
+    Distinguished by duck-typing on `submit`."""
+    if hasattr(evaluator, "submit"):
+        # Server path — submit and block. Server handles batching across
+        # concurrent worker threads.
+        return evaluator.submit(fen, legal_moves).result()
+    # Direct model path — one trunk pass, both heads.
+    model = evaluator
+    device = next(model.parameters()).device
+    pos = encode_position(fen).unsqueeze(0).to(device)
     if not legal_moves:
-        return []
-    pos = encode_position(fen).unsqueeze(0)
-    moves = torch.stack([encode_move(m) for m in legal_moves])
+        with torch.no_grad():
+            value = model.value(pos)
+        return float(value.item()), []
+    moves = torch.stack([encode_move(m) for m in legal_moves]).to(device)
     with torch.no_grad():
-        logits = model(pos, moves)
+        logits, value = model.policy_and_value(pos, moves)
         probs = torch.softmax(logits, dim=0)
-    return probs.tolist()
+    return float(value.item()), probs.tolist()
 
 
-def _expand(
+def _expand_with_priors(
     node: PuctNode,
     legal_moves: list[LegalMove],
+    priors: list[float],
     client: _Mover,
-    model: ChesskersScorer,
 ) -> None:
-    """Apply each legal move via the API; cache its post-state and prior on the child node."""
-    priors = _compute_priors(model, node.fen, legal_moves)
+    """Apply each legal move via the API; cache its post-state and the
+    pre-computed prior on the child node. Priors come from a single
+    `policy_and_value` call so the trunk runs once per leaf."""
     for move, prior in zip(legal_moves, priors):
         try:
             new_state = client.make_move(node.fen, move["uci"])
@@ -136,6 +144,37 @@ def _backup(path: list[PuctNode], leaf_value: float) -> None:
         sign = -sign
 
 
+def _select_to_leaf(root: PuctNode, c_puct: float) -> tuple[list[PuctNode], PuctNode]:
+    """Walk from root selecting PUCT-best children until we hit an unexpanded
+    or terminal node. Returns (path-from-root-inclusive, leaf)."""
+    path: list[PuctNode] = [root]
+    node = root
+    while node.expanded and not node.is_terminal and node.children:
+        node = _select_child(node, c_puct)
+        path.append(node)
+    return path, node
+
+
+# Virtual loss: when we select a leaf in a batched MCTS pass, we mark every
+# node on its path as if it had been visited with a losing outcome. This
+# discourages subsequent parallel selections in the same batch from picking
+# the same path, diversifying which leaves get expanded. After the real eval
+# returns we reverse the virtual loss before backing up the actual value.
+VIRTUAL_LOSS_COUNT = 1
+
+
+def _apply_virtual_loss(path: list[PuctNode], count: int = VIRTUAL_LOSS_COUNT) -> None:
+    for node in path:
+        node.visits += count
+        node.total_value -= float(count)
+
+
+def _remove_virtual_loss(path: list[PuctNode], count: int = VIRTUAL_LOSS_COUNT) -> None:
+    for node in path:
+        node.visits -= count
+        node.total_value += float(count)
+
+
 def _simulate(
     root: PuctNode,
     client: _Mover,
@@ -143,19 +182,71 @@ def _simulate(
     c_puct: float,
     get_legal_moves,
 ) -> None:
-    path: list[PuctNode] = [root]
-    node = root
-    while node.expanded and not node.is_terminal and node.children:
-        node = _select_child(node, c_puct)
-        path.append(node)
+    path, node = _select_to_leaf(root, c_puct)
 
-    if not node.is_terminal and not node.expanded:
+    if node.is_terminal:
+        value = _terminal_value(node)
+    elif not node.expanded:
         legal = get_legal_moves(node)
+        value, priors = _eval_and_priors(model, node.fen, legal)
         if legal:
-            _expand(node, legal, client, model)
+            _expand_with_priors(node, legal, priors, client)
+    else:
+        # Expanded but no children — shouldn't occur in normal play, but
+        # evaluate via the value head as a safe fallback.
+        value, _ = _eval_and_priors(model, node.fen, [])
 
-    value = _evaluate_with_model(node, model)
     _backup(path, value)
+
+
+def _simulate_batched(
+    root: PuctNode,
+    client: _Mover,
+    evaluator,
+    c_puct: float,
+    get_legal_moves,
+    batch_size: int,
+) -> None:
+    """Run `batch_size` simulations in a single batched pass, using virtual
+    loss to diversify selections. Requires `evaluator` to be an InferenceServer
+    (or anything with `submit(fen, legal) → Future`) so the B leaf evaluations
+    can run as one batched forward."""
+    if not hasattr(evaluator, "submit"):
+        # No server: fall back to sequential simulations.
+        for _ in range(batch_size):
+            _simulate(root, client, evaluator, c_puct, get_legal_moves)
+        return
+
+    # Selection phase: pick B leaves with virtual loss applied between picks.
+    selections: list[tuple[list[PuctNode], PuctNode, list[LegalMove] | None]] = []
+    for _ in range(batch_size):
+        path, leaf = _select_to_leaf(root, c_puct)
+        _apply_virtual_loss(path)
+        legal: list[LegalMove] | None = None
+        if not leaf.is_terminal:
+            legal = get_legal_moves(leaf)
+        selections.append((path, leaf, legal))
+
+    # Evaluation phase: submit B requests; the server batches them on the GPU.
+    futures: list = []
+    for _, leaf, legal in selections:
+        if leaf.is_terminal:
+            futures.append(None)
+        else:
+            futures.append(evaluator.submit(leaf.fen, legal or []))
+
+    # Backup phase: remove virtual loss, expand if needed (idempotent if a
+    # duplicate leaf appears twice in the batch — second expansion no-ops),
+    # then back up the real value.
+    for (path, leaf, legal), fut in zip(selections, futures):
+        _remove_virtual_loss(path)
+        if leaf.is_terminal:
+            value = _terminal_value(leaf)
+        else:
+            value, priors = fut.result()
+            if legal and not leaf.expanded:
+                _expand_with_priors(leaf, legal, priors, client)
+        _backup(path, value)
 
 
 @dataclass
@@ -210,6 +301,7 @@ def run_mcts(
     c_puct: float = 1.5,
     dirichlet_alpha: float | None = None,
     dirichlet_eps: float = 0.25,
+    vloss_batch: int = 1,
 ) -> MctsResult:
     """Run PUCT MCTS for `n_sims` iterations from `state`. Returns the chosen
     move (most-visited root child) along with the visit distribution that can
@@ -218,6 +310,12 @@ def run_mcts(
     `dirichlet_alpha`: if not None, mix Dirichlet(α) noise into the root's
     priors after the first simulation expands the root. Only the root is
     affected. Use during self-play; leave None during inference/eval.
+
+    `vloss_batch`: virtual-loss batch size. Default 1 = sequential. When >1,
+    select B paths with virtual loss applied between picks, evaluate all B
+    leaves in one batched forward (requires `model` to be an InferenceServer
+    so the eval can actually batch), then back up. Multiplies effective
+    inference batch size by ~B per game.
     """
     legal = state.get("legalMoves") or []
     if not legal:
@@ -239,7 +337,8 @@ def run_mcts(
         legal_cache[node.fen] = moves
         return moves
 
-    # First sim expands the root, populating children + their priors.
+    # First sim expands the root, populating children + their priors. Done
+    # sequentially so the Dirichlet noise that follows sees the priors.
     if n_sims > 0:
         _simulate(root, client, model, c_puct, get_legal)
 
@@ -247,8 +346,16 @@ def run_mcts(
     if dirichlet_alpha is not None:
         _apply_dirichlet_noise(root, dirichlet_alpha, dirichlet_eps)
 
-    for _ in range(max(0, n_sims - 1)):
-        _simulate(root, client, model, c_puct, get_legal)
+    remaining = max(0, n_sims - 1)
+    if vloss_batch <= 1:
+        for _ in range(remaining):
+            _simulate(root, client, model, c_puct, get_legal)
+    else:
+        sims_done = 0
+        while sims_done < remaining:
+            b = min(vloss_batch, remaining - sims_done)
+            _simulate_batched(root, client, model, c_puct, get_legal, b)
+            sims_done += b
 
     if not root.children:
         return MctsResult(chosen=legal[0], visit_distribution={legal[0]["uci"]: 0}, root=root)
@@ -264,6 +371,10 @@ def pick_puct(
     model: ChesskersScorer,
     n_sims: int = 100,
     c_puct: float = 1.5,
+    vloss_batch: int = 1,
 ) -> LegalMove | None:
     """Picker-shaped wrapper: returns just the chosen move."""
-    return run_mcts(state, client, model, n_sims=n_sims, c_puct=c_puct).chosen
+    return run_mcts(
+        state, client, model,
+        n_sims=n_sims, c_puct=c_puct, vloss_batch=vloss_batch,
+    ).chosen

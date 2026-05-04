@@ -130,6 +130,43 @@ class ChesskersScorer(nn.Module):
         emb = self._position_embedding(position)            # (1, d_hidden)
         return self.value_head(emb).reshape(())             # ()
 
+    def batch_eval(
+        self, positions: torch.Tensor, moves_list: list[torch.Tensor | None]
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Evaluate B positions and their (ragged) move lists in one batched
+        trunk pass. The trunk + value-head are batched (the expensive part);
+        the policy head runs per-position because each has a different N moves.
+
+        positions:  (B, C, 8, 8)
+        moves_list: list of B items; each is a (N_i, D) tensor or None/(0, D)
+                    for "no moves" (terminal-ish or value-only requests).
+        Returns:    (values: (B,), priors_list: list of B (N_i,) tensors).
+                    For positions with no moves, the corresponding priors entry
+                    is an empty tensor."""
+        if positions.dim() != 4:
+            raise ValueError(f"positions must be (B, C, 8, 8); got {tuple(positions.shape)}")
+        if positions.shape[0] != len(moves_list):
+            raise ValueError(
+                f"batch size mismatch: positions B={positions.shape[0]}, "
+                f"moves_list len={len(moves_list)}"
+            )
+        # One trunk pass for all positions.
+        pos_emb = self.position_trunk(positions)             # (B, d_hidden)
+        values = self.value_head(pos_emb).squeeze(-1)        # (B,)
+        # Policy head runs per-position because moves are ragged.
+        priors_list: list[torch.Tensor] = []
+        for i, moves in enumerate(moves_list):
+            if moves is None or moves.shape[0] == 0:
+                priors_list.append(torch.empty(0, device=positions.device))
+                continue
+            n = moves.shape[0]
+            pe = pos_emb[i:i + 1].expand(n, -1)              # (N_i, d_hidden)
+            me = self.move_encoder(moves)                    # (N_i, d_hidden)
+            combined = torch.cat([pe, me], dim=1)            # (N_i, 2*d_hidden)
+            logits = self.head(combined).squeeze(-1)         # (N_i,)
+            priors_list.append(torch.softmax(logits, dim=0))
+        return values, priors_list
+
     def policy_and_value(
         self, position: torch.Tensor, moves: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
