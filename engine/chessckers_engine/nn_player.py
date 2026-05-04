@@ -28,8 +28,13 @@ def pick_nn(state: GameState, model: ChesskersScorer) -> LegalMove | None:
     legal_moves = state.get("legalMoves") or []
     if not legal_moves:
         return None
-    pos = encode_position(state["fen"]).unsqueeze(0)
-    moves = torch.stack([encode_move(m) for m in legal_moves])
+    # Default to CPU when the model has no parameters (test stubs).
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+    pos = encode_position(state["fen"]).unsqueeze(0).to(device)
+    moves = torch.stack([encode_move(m) for m in legal_moves]).to(device)
     model.eval()
     with torch.no_grad():
         logits = model(pos, moves)

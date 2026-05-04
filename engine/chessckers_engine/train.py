@@ -95,6 +95,7 @@ def train(
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
 
+    device = next(model.parameters()).device
     epoch_losses: list[float] = []
     model.train()
     step = 0
@@ -103,8 +104,11 @@ def train(
         n_batches = 0
         for batch in loader:
             opt.zero_grad()
-            logits = _forward_batch(model, batch["positions"], batch["moves"])
-            loss = loss_fn(logits, batch["targets"])
+            positions = batch["positions"].to(device)
+            moves = batch["moves"].to(device)
+            targets = batch["targets"].to(device)
+            logits = _forward_batch(model, positions, moves)
+            loss = loss_fn(logits, targets)
             loss.backward()
             opt.step()
             running += loss.item()

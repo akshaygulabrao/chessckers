@@ -75,8 +75,9 @@ def sample_move(
     legal = state.get("legalMoves") or []
     if not legal:
         return None
-    pos = encode_position(state["fen"]).unsqueeze(0)
-    moves = torch.stack([encode_move(m) for m in legal])
+    device = next(model.parameters()).device
+    pos = encode_position(state["fen"]).unsqueeze(0).to(device)
+    moves = torch.stack([encode_move(m) for m in legal]).to(device)
     model.eval()
     with torch.no_grad():
         logits = model(pos, moves)

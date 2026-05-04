@@ -42,8 +42,11 @@ def default_checkpoint_path(weights_dir: Path | None = None) -> Path:
 
 def load_checkpoint(model: nn.Module, path: str | Path) -> tuple[list[str], list[str]]:
     """Load weights with strict=False so old checkpoints (without value_head)
-    load gracefully. Returns (missing_keys, unexpected_keys) and logs any."""
-    state_dict = torch.load(path, map_location="cpu", weights_only=True)
+    load gracefully. Returns (missing_keys, unexpected_keys) and logs any.
+    Loads onto the model's current device so it works regardless of where
+    the model lives (cpu/cuda/mps)."""
+    target_device = next(model.parameters()).device
+    state_dict = torch.load(path, map_location=target_device, weights_only=True)
     result = model.load_state_dict(state_dict, strict=False)
     missing = list(result.missing_keys)
     unexpected = list(result.unexpected_keys)
