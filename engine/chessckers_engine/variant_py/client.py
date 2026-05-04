@@ -45,14 +45,14 @@ def _detect_status(state: State) -> tuple[str | None, str | None]:
 
     Detection paths:
     - Black eliminated → variantEnd / winner=white.
-    - White's king is checkmated (standard FIDE; python-chess detects this
-      correctly even with multiple Black "kings" since the encoding maps
-      Stone/King → black pawn/king on the bitboard) → mate / winner=black.
-    - All other terminal paths (Black stalemate via no-legal-moves,
-      White stalemate without check) need full Black move-gen with chains
-      to reliably classify; they're not detected yet."""
+    - White's king is checkmated → mate / winner=black.
+    - White's king captured during a Black chain → variantEnd / winner=black.
+    - Black stalemate (no legal moves) is detected in _state_to_dict after
+      move-gen, since it needs the full move list."""
     if not state.stacks:
         return ("variantEnd", "white")
+    if state.board.king(chess.WHITE) is None:
+        return ("variantEnd", "black")
     if state.board.turn == chess.WHITE:
         try:
             if state.board.is_checkmate():
@@ -80,10 +80,6 @@ def _state_to_dict(state: State, fen_override: str | None = None) -> GameState:
     if state.board.turn == chess.WHITE:
         legal_moves = white_legal_moves(state)
     else:
-        # Black: phases 2A-2C/2E (quiet diagonals + deploys + sprint + charges)
-        # and a simplified 2D (single-hop diagonal captures only — no chains,
-        # no rim handling, no rank-1 promotion). Mandate filter (2F) is
-        # applied last to suppress non-capturing moves when active.
         all_moves = (
             black_diagonal_quiet_moves(state)
             + black_deploy_moves(state)
@@ -91,6 +87,10 @@ def _state_to_dict(state: State, fen_override: str | None = None) -> GameState:
             + black_diagonal_capture_moves(state)
         )
         legal_moves = filter_for_mandate(state, all_moves)
+        # Black stalemate: no legal moves and no other terminal condition.
+        # scalachess fires specialEnd → variantEnd/white in this case.
+        if not legal_moves and status is None:
+            status, winner = "variantEnd", "white"
     return {
         "fen": fen,
         "turn": turn,

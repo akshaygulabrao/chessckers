@@ -83,11 +83,37 @@ def parse_fen(fen: str) -> State:
     return State(board=board, stacks=stacks)
 
 
+def _castling_field(rights: int) -> str:
+    """Convert python-chess castling_rights bitmask to the FEN castling field.
+    python-chess's board.fen() suppresses castling rights when the king isn't
+    on its home square, which is wrong for Chessckers positions. We read the
+    raw bitmask directly so captured-king positions preserve the original flag."""
+    if not rights:
+        return "-"
+    s = ""
+    if rights & chess.BB_H1:
+        s += "K"
+    if rights & chess.BB_A1:
+        s += "Q"
+    if rights & chess.BB_H8:
+        s += "k"
+    if rights & chess.BB_A8:
+        s += "q"
+    return s or "-"
+
+
 def serialize_fen(state: State) -> str:
     """Inverse of parse_fen. Stacks are emitted in ascending square index
     order to match scalachess's canonical form."""
     chess_fen = state.board.fen()
-    board_part, _, rest = chess_fen.partition(" ")
+    parts = chess_fen.split(" ")
+    # parts: board turn castling ep halfmove fullmove
+    # Override the castling field — python-chess suppresses it when the king
+    # isn't on its home square, which happens legitimately in Chessckers.
+    if len(parts) >= 3:
+        parts[2] = _castling_field(state.board.castling_rights)
+    board_part = parts[0]
+    rest = " ".join(parts[1:])
     if state.stacks:
         overlay = ",".join(
             f"{chess.square_name(sq)}:{pieces}"

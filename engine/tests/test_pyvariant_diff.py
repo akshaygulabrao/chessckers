@@ -317,7 +317,6 @@ def test_diff_black_charge(scalachess, fen):
     assert_legal_moves_match(PyVariantClient(), scalachess, fen)
 
 
-@pytest.mark.skip(reason="King-top emits charges too — handled in 2E/2F")
 def test_diff_starting_position_black_moves(scalachess):
     py = PyVariantClient()
     BLACK_TO_MOVE = (
@@ -352,3 +351,65 @@ def test_diff_black_diagonal_single_hop(scalachess, fen):
     Positions chosen so the mandate fires (only captures legal), no chain
     continuation possible (just one White available), no rim, no rank-1 touch."""
     assert_legal_moves_match(PyVariantClient(), scalachess, fen)
+
+
+@pytest.mark.parametrize("fen", [
+    # Two-hop chain: first White at g5 (adjacent), cadence=1, continues from f4.
+    # f4→g5 T+bounce then second hop. Let py and scala agree.
+    "8/8/8/6P1/5p2/4P3/8/4K3[f4:ss] b - - 0 1",
+    # Stone-top height-3 with multi-hop opportunity: first enemy at f5 (distance 1),
+    # second White at d3 (distance 2 from e4). Both hops at cadence 1.
+    "8/8/8/5P2/4p3/3P4/8/4K3[e4:sss] b - - 0 1",
+    # Chain from real game with rim bounce and T-fallback.
+    "1ppp3p/k1kk4/pppppkkp/8/P7/1PPPPPPP/R7/1NBQKBNR[a6:s,b6:s,c6:skS,d6:skS,e6:skS,f6:sk,g6:sSk,h6:s,a7:k,c7:k,d7:k,b8:s,c8:s,d8:s,h8:s] b K - 0 1",
+    # Mandatory capture + chain (game #3 chain position).
+    "ppp1p1pp/k1kk1k2/kpppp1kp/8/7p/PPPPPPP1/R6P/1NBQKBNR[h4:skS,a6:sk,b6:s,c6:s,d6:skS,e6:s,g6:sk,h6:s,a7:k,c7:k,d7:k,f7:k,a8:s,b8:s,c8:s,e8:s,g8:s,h8:s] b K - 0 1",
+])
+def test_diff_black_chain_captures(scalachess, fen):
+    """Phase 2D full — multi-hop chain captures with cadence lock, direction
+    filter, rim/T landings, end-of-turn fallback, and mandate."""
+    assert_legal_moves_match(PyVariantClient(), scalachess, fen)
+
+
+@pytest.mark.parametrize("fen, uci", [
+    # Single-hop chain with T-fallback: h4→d0(T)→fallback e1.
+    (
+        "ppp1p1pp/k1kk1k2/kpppp1kp/8/7p/PPPPPPP1/R6P/1NBQKBNR[h4:skS,a6:sk,b6:s,c6:s,d6:skS,e6:s,g6:sk,h6:s,a7:k,c7:k,d7:k,f7:k,a8:s,b8:s,c8:s,e8:s,g8:s,h8:s] b K - 0 1",
+        "h4e1",
+    ),
+    # Multi-hop chain that ends at e1 via d0 T-fallback (2-hop, cadence=2).
+    (
+        "ppp1p1pp/k1kk1k2/kpppp1kp/8/7p/PPPPPPP1/R6P/1NBQKBNR[h4:skS,a6:sk,b6:s,c6:s,d6:skS,e6:s,g6:sk,h6:s,a7:k,c7:k,d7:k,f7:k,a8:s,b8:s,c8:s,e8:s,g8:s,h8:s] b K - 0 1",
+        "h4~g3~f2~e1~d0~e1",
+    ),
+    # Chain from real game with rim bounce.
+    (
+        "1ppp3p/k1kk4/pppppkkp/8/P7/1PPPPPPP/R7/1NBQKBNR[a6:s,b6:s,c6:skS,d6:skS,e6:skS,f6:sk,g6:sSk,h6:s,a7:k,c7:k,d7:k,b8:s,c8:s,d8:s,h8:s] b K - 0 1",
+        "c6~b5~a4~z3~a2~b1~c0~b1",
+    ),
+])
+def test_diff_make_move_chain(scalachess, fen, uci):
+    """Chain capture apply + resulting state parity against scalachess."""
+    assert_make_move_matches(PyVariantClient(), scalachess, fen, uci)
+
+
+@pytest.mark.parametrize("fen", [
+    # Single unmoved Stone trapped in rank-1 corner (h1): both forward diagonals
+    # go off-board, no sprint (not on rank 8), no captures, no deploy/charge.
+    "4K3/8/8/8/8/8/8/7p[h1:s] b - - 0 1",
+    # Same for g1 (one file in from corner).
+    "4K3/8/8/8/8/8/8/6p1[g1:s] b - - 0 1",
+    # Two Stones in opposite rank-1 corners: both stalemated simultaneously.
+    "4K3/8/8/8/8/8/8/p6p[a1:s,h1:s] b - - 0 1",
+])
+def test_diff_black_stalemate(scalachess, fen):
+    """Black has no legal moves → scalachess fires specialEnd (variantEnd/white).
+    Python must match: status='variantEnd', winner='white', legalMoves=[]."""
+    py = PyVariantClient()
+    py_state = py.new_game(fen)
+    sc_state = scalachess.new_game(fen)
+    assert py_state.get("status") == "variantEnd", f"py status wrong: {py_state}"
+    assert py_state.get("winner") == "white", f"py winner wrong: {py_state}"
+    assert py_state.get("legalMoves") == [], f"py legalMoves non-empty: {py_state}"
+    assert sc_state.get("status") == "variantEnd", f"scalachess status unexpected: {sc_state}"
+    assert sc_state.get("winner") == "white", f"scalachess winner unexpected: {sc_state}"

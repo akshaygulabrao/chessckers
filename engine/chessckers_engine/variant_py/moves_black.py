@@ -13,6 +13,7 @@ Phase status:
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any
 
@@ -29,6 +30,64 @@ _ALL_DIAGS = _FORWARD_DIAGS + _BACKWARD_DIAGS
 
 def _on_board(file: int, rank: int) -> bool:
     return 0 <= file <= 7 and 0 <= rank <= 7
+
+
+def _on_grid(file: int, rank: int) -> bool:
+    """The 10×10 grid (board + 1-square rim)."""
+    return -1 <= file <= 8 and -1 <= rank <= 8
+
+
+def _coord_to_key(file: int, rank: int) -> str:
+    """(file, rank) on the 10×10 grid → 2-char key. Rim coords use 'z'/'i'
+    for files -1/8 and '0'/'9' for ranks -1/8."""
+    if file == -1:
+        f = "z"
+    elif 0 <= file <= 7:
+        f = chr(ord("a") + file)
+    elif file == 8:
+        f = "i"
+    else:
+        f = "?"
+    return f"{f}{rank + 1}"
+
+
+def _parse_waypoint_key(s: str) -> tuple[int, int] | None:
+    if len(s) != 2:
+        return None
+    f_char, r_char = s[0], s[1]
+    if f_char == "z":
+        f = -1
+    elif "a" <= f_char <= "h":
+        f = ord(f_char) - ord("a")
+    elif f_char == "i":
+        f = 8
+    else:
+        return None
+    if "0" <= r_char <= "9":
+        r = int(r_char) - 1
+    else:
+        return None
+    return (f, r)
+
+
+@dataclass
+class CaptureHop:
+    """A single hop's trace + outcome. Mirrors scalachess's CaptureHop.
+
+    `landing_square` is None when the hop lands on the rim (T). `captures`
+    holds chess.Square ints of every White captured along the path (board
+    squares only — rim squares hold nothing). `waypoints` is the list of
+    every traced step's key (10×10 coords), excluding the start; for a
+    k-step hop, len(waypoints) == k. `direction` is the (df, dr) at the
+    landing step (post-bounce if any). `crossed_rank1` flips True if any
+    step in this hop's path is on rank 1 (idx 0)."""
+    direction: tuple[int, int]
+    landing_key: str
+    landing_square: int | None
+    captures: list[int] = field(default_factory=list)
+    waypoints: list[str] = field(default_factory=list)
+    is_suicide: bool = False
+    crossed_rank1: bool = False
 
 
 def _piece_name(top_char: str) -> str:
@@ -172,158 +231,446 @@ def black_deploy_moves(state: State) -> list[dict[str, Any]]:
 _ORTHO_DIRS = [(0, 1), (0, -1), (1, 0), (-1, 0)]
 
 
+def _find_capture_hops(
+    board: chess.Board,
+    f0: int,
+    r0: int,
+    df0: int,
+    dr0: int,
+    n: int,
+    stacks: dict[chess.Square, str],
+) -> list[CaptureHop]:
+    """Port of scalachess.Chessckers.findSlideCaptureOptionsFrom.
+
+    Walk along (df0, dr0) up to n+1 steps from (f0, r0). Emit a CaptureHop
+    for every legal landing (every k where the hop terminates: empty board
+    revisit-after-capture, White ram, empty board with prior captures, or
+    rim-T after captures). Handles single bounce off the 10×10 boundary
+    (one bounce per hop, must be at landing step, post-bounce on board).
+    Defers k=d (first-enemy) rams until the next step proves k=d+1
+    reachable per §3B step 5."""
+    options: list[CaptureHop] = []
+    captures_so_far: list[int] = []
+    captured_set: set[int] = set()
+    waypoints_so_far: list[str] = []
+
+    f, r = f0, r0
+    df, dr = df0, dr0
+    blocked = False
+    step = 1
+    crossed_rank1 = False
+    pending_ram: CaptureHop | None = None
+
+    while step <= n + 1 and not blocked:
+        nf = f + df
+        nr = r + dr
+        did_bounce = False
+        if nf < -1 or nf > 8:
+            df = -df
+            nf = f + df
+            did_bounce = True
+        if nr < -1 or nr > 8:
+            dr = -dr
+            nr = r + dr
+            did_bounce = True
+
+        if nf < -1 or nf > 8 or nr < -1 or nr > 8:
+            pending_ram = None
+            blocked = True
+            continue
+        if did_bounce and not _on_board(nf, nr):
+            # Bounce that lands on rim is invalid — hop ends without emit.
+            pending_ram = None
+            blocked = True
+            continue
+
+        f, r = nf, nr
+        waypoints_so_far.append(_coord_to_key(f, r))
+        if r == 0:
+            crossed_rank1 = True
+
+        if _on_board(f, r):
+            sq = chess.square(f, r)
+            if sq in captured_set:
+                # Revisit of an already-captured (now empty) square.
+                if pending_ram is not None:
+                    options.append(pending_ram)
+                    pending_ram = None
+                if captures_so_far:
+                    options.append(CaptureHop(
+                        direction=(df, dr),
+                        landing_key=_coord_to_key(f, r),
+                        landing_square=sq,
+                        captures=list(captures_so_far),
+                        waypoints=list(waypoints_so_far),
+                        crossed_rank1=crossed_rank1,
+                    ))
+            else:
+                piece = board.piece_at(sq)
+                if piece is None:
+                    if pending_ram is not None:
+                        options.append(pending_ram)
+                        pending_ram = None
+                    if captures_so_far:
+                        options.append(CaptureHop(
+                            direction=(df, dr),
+                            landing_key=_coord_to_key(f, r),
+                            landing_square=sq,
+                            captures=list(captures_so_far),
+                            waypoints=list(waypoints_so_far),
+                            crossed_rank1=crossed_rank1,
+                        ))
+                elif piece.color == chess.BLACK and sq in stacks:
+                    # Friendly tower at k=d+1 invalidates a pending k=d ram.
+                    pending_ram = None
+                    blocked = True
+                else:
+                    # White piece encountered. Commit any pending k=d ram.
+                    if pending_ram is not None:
+                        options.append(pending_ram)
+                        pending_ram = None
+                    # n+1 gating: A White only reachable at step n+1 with no
+                    # prior captures is not a valid first enemy.
+                    if step <= n or captures_so_far:
+                        ram_hop = CaptureHop(
+                            direction=(df, dr),
+                            landing_key=_coord_to_key(f, r),
+                            landing_square=sq,
+                            captures=list(captures_so_far),
+                            waypoints=list(waypoints_so_far),
+                            is_suicide=True,
+                            crossed_rank1=crossed_rank1,
+                        )
+                        if not captures_so_far:
+                            # k=d ram — defer until next step proves k=d+1 reachable.
+                            pending_ram = ram_hop
+                        else:
+                            options.append(ram_hop)
+                    captures_so_far.append(sq)
+                    captured_set.add(sq)
+        else:
+            # Rim square (T) — never friendly. Commit pending ram + emit T-landing if captures.
+            if pending_ram is not None:
+                options.append(pending_ram)
+                pending_ram = None
+            if captures_so_far:
+                options.append(CaptureHop(
+                    direction=(df, dr),
+                    landing_key=_coord_to_key(f, r),
+                    landing_square=None,
+                    captures=list(captures_so_far),
+                    waypoints=list(waypoints_so_far),
+                    crossed_rank1=crossed_rank1,
+                ))
+
+        step += 1
+        if did_bounce:
+            # Hop ends at the post-bounce step.
+            blocked = True
+
+    return options
+
+
+def _hop_promotes(hop: CaptureHop) -> bool:
+    """A hop promotes the moving stack if its path touched rank 1 — either
+    by crossing rank 1 mid-trace en route to T, or by landing on rank 1."""
+    if hop.crossed_rank1:
+        return True
+    if hop.landing_square is not None and chess.square_rank(hop.landing_square) == 0:
+        return True
+    return False
+
+
+def _promote_all_stones(stack: str) -> str:
+    """Every Stone (s/S) → King. Used on rank-1 promotion."""
+    return "".join("k" if c in ("s", "S") else c for c in stack)
+
+
+def _next_capture_options(
+    board: chess.Board,
+    stacks: dict[chess.Square, str],
+    cf: int,
+    cr: int,
+    cur_stack: str,
+    last_dir: tuple[int, int] | None,
+    n: int,
+    cadence: int | None,
+    include_suicide: bool = False,
+) -> list[CaptureHop]:
+    """Hops available from (cf, cr) for the moving stack. Filters by:
+    - direction != 180° reverse of last_dir,
+    - suicide hops removed unless include_suicide=True (default matches
+      scalachess's validMoves chain enumeration; first-hop suicides are
+      emitted separately by `_first_hop_suicides`),
+    - len(waypoints) == cadence when cadence is locked,
+    - dedup by (direction, landing_key, captures, is_suicide) since bounces
+      cause different starting directions to converge on identical hops."""
+    if not cur_stack:
+        return []
+    is_king_top = cur_stack[-1] == "k"
+    dirs = _ALL_DIAGS if is_king_top else _FORWARD_DIAGS
+    if last_dir is not None:
+        ldf, ldr = last_dir
+        dirs = [(df, dr) for df, dr in dirs if not (df == -ldf and dr == -ldr)]
+    options: list[CaptureHop] = []
+    for df, dr in dirs:
+        options.extend(_find_capture_hops(board, cf, cr, df, dr, n, stacks))
+    if not include_suicide:
+        options = [h for h in options if not h.is_suicide]
+    if cadence is not None:
+        options = [h for h in options if len(h.waypoints) == cadence]
+    seen: set[tuple[Any, ...]] = set()
+    deduped: list[CaptureHop] = []
+    for h in options:
+        key = (h.direction, h.landing_key, tuple(h.captures), h.is_suicide)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(h)
+    return deduped
+
+
+def _enumerate_chains(state: State, chain_start: chess.Square) -> list[dict[str, Any]]:
+    """DFS-enumerate every complete chain starting from `chain_start`. A
+    chain leaf is a state with no further legal hops; that leaf becomes one
+    move via `_build_final_move`. Single-hop captures are length-1 chains
+    (emitted with 4-char UCI). Multi-hop chains share a cadence (the first
+    hop's k) and forbid the 180°-reverse direction at each continuation."""
+    orig_stack = state.stacks.get(chain_start, "")
+    if not orig_stack:
+        return []
+    n = len(orig_stack)
+    results: list[dict[str, Any]] = []
+
+    def explore(
+        board: chess.Board,
+        stacks: dict[chess.Square, str],
+        cf: int,
+        cr: int,
+        cur_stack: str,
+        last_dir: tuple[int, int] | None,
+        hops_so_far: list[CaptureHop],
+        cadence: int | None,
+    ) -> None:
+        # If the white king has been captured the game ends; terminate the chain.
+        white_king_captured = board.king(chess.WHITE) is None
+        if white_king_captured:
+            options: list[CaptureHop] = []
+        else:
+            options = _next_capture_options(
+                board, stacks, cf, cr, cur_stack, last_dir, n, cadence
+            )
+        if not options:
+            if hops_so_far:
+                results.append(_build_final_move(state, chain_start, hops_so_far))
+            return
+        for hop in options:
+            new_board = board.copy(stack=False)
+            new_stacks = dict(stacks)
+            # Remove moving tower from current square if on B (mid-chain rim has none).
+            if _on_board(cf, cr):
+                cur_sq = chess.square(cf, cr)
+                new_board.remove_piece_at(cur_sq)
+                new_stacks.pop(cur_sq, None)
+            # Capture path Whites (board squares only).
+            for cap_sq in hop.captures:
+                new_board.remove_piece_at(cap_sq)
+            # Promote in-transit stack if path touched rank 1.
+            should_promote = _hop_promotes(hop)
+            land_stack = _promote_all_stones(cur_stack) if should_promote else cur_stack
+            # Place tower at landing (if on board). Suicide hops are filtered
+            # upstream in `_next_capture_options`, so we never see is_suicide
+            # here in the chain DFS — first-hop suicides go via `_first_hop_suicides`.
+            if hop.landing_square is not None:
+                new_board.remove_piece_at(hop.landing_square)
+                top = land_stack[-1]
+                if top == "k":
+                    new_board.set_piece_at(hop.landing_square, chess.Piece(chess.KING, chess.BLACK))
+                else:
+                    new_board.set_piece_at(hop.landing_square, chess.Piece(chess.PAWN, chess.BLACK))
+                new_stacks[hop.landing_square] = land_stack
+            # Compute next position (board or rim coords).
+            if hop.landing_square is not None:
+                nf = chess.square_file(hop.landing_square)
+                nr = chess.square_rank(hop.landing_square)
+            else:
+                parsed = _parse_waypoint_key(hop.landing_key)
+                nf, nr = parsed if parsed else (cf, cr)
+            next_cadence = cadence if cadence is not None else len(hop.waypoints)
+            explore(
+                new_board, new_stacks, nf, nr, land_stack,
+                hop.direction, hops_so_far + [hop], next_cadence,
+            )
+
+    cf0 = chess.square_file(chain_start)
+    cr0 = chess.square_rank(chain_start)
+    explore(state.board, dict(state.stacks), cf0, cr0, orig_stack, None, [], None)
+    return results
+
+
+def _build_final_move(
+    orig_state: State,
+    chain_start: chess.Square,
+    hops: list[CaptureHop],
+) -> dict[str, Any]:
+    """Construct the LegalMove dict for a complete chain. Computes:
+    - final landing square (rim → fall back to last on-board waypoint, else
+      chain_start; on-board → that square),
+    - resulting top piece (after promotions, or original top for suicides),
+    - capture field (first path capture; or final landing for suicide-with-no-path-captures),
+    - UCI: 4-char for single-hop, `orig~allWaypoints~dest` for multi-hop."""
+    orig_stack = orig_state.stacks[chain_start]
+    is_suicide_chain = bool(hops) and hops[-1].is_suicide
+    all_captures: list[int] = []
+    all_waypoints: list[str] = []
+    hop_keys: list[str] = []
+    for h in hops:
+        all_captures.extend(h.captures)
+        all_waypoints.extend(h.waypoints)
+        hop_keys.append(h.landing_key)
+
+    # Final landing.
+    last_landing = hops[-1].landing_square
+    if last_landing is not None:
+        final_landing: chess.Square = last_landing
+    else:
+        # End-of-turn fallback: walk waypoints backwards for last on-board key.
+        final_landing = chain_start
+        for wp in reversed(all_waypoints):
+            parsed = _parse_waypoint_key(wp)
+            if parsed is None:
+                continue
+            f, r = parsed
+            if _on_board(f, r):
+                final_landing = chess.square(f, r)
+                break
+
+    # Determine final top piece (post-promotion accumulated through chain).
+    if is_suicide_chain:
+        final_top = orig_stack[-1]
+    else:
+        stack_thru = orig_stack
+        for h in hops:
+            if _hop_promotes(h):
+                stack_thru = _promote_all_stones(stack_thru)
+        final_top = stack_thru[-1]
+
+    # capture field: first path-captured White, else final-landing for naked suicide.
+    if all_captures:
+        capture_field: str | None = chess.square_name(all_captures[0])
+    elif is_suicide_chain:
+        capture_field = chess.square_name(final_landing)
+    else:
+        capture_field = None
+
+    from_name = chess.square_name(chain_start)
+    dest_name = chess.square_name(final_landing)
+    if len(hops) > 1:
+        uci = f"{from_name}~{'~'.join(all_waypoints)}~{dest_name}"
+        waypoints_field: list[str] | None = list(all_waypoints)
+    else:
+        uci = f"{from_name}{dest_name}"
+        waypoints_field = None
+
+    # Internal fields used by _apply_chain_move; not exposed to callers.
+    all_cap_names = [chess.square_name(sq) for sq in all_captures]
+    # Promotion: did any hop's path touch rank 1?
+    chain_promotes = any(_hop_promotes(h) for h in hops)
+
+    return {
+        "uci": uci,
+        "from": from_name,
+        "to": dest_name,
+        "piece": "king" if final_top == "k" else "pawn",
+        "color": "black",
+        "capture": capture_field,
+        "waypoints": waypoints_field,
+        "chainHops": list(hop_keys),
+        "promotion": None,
+        "demotedKings": None,
+        "demotionsRequired": None,
+        "sourceKingPositions": None,
+        "deployCount": None,
+        "_chain_all_captures": all_cap_names,
+        "_is_suicide": is_suicide_chain,
+        "_chain_promotes": chain_promotes,
+    }
+
+
+def _first_hop_suicides(state: State, chain_start: chess.Square) -> list[dict[str, Any]]:
+    """Single-hop suicide (ram) captures from a tower's starting square.
+    scalachess's `genBlackSuicideJumps`: enumerate every directional ram
+    available immediately, regardless of whether the position has any
+    non-suicide chain available. Each emitted as a length-1 chain."""
+    pieces = state.stacks.get(chain_start, "")
+    if not pieces:
+        return []
+    n = len(pieces)
+    is_king_top = pieces[-1] == "k"
+    dirs = _ALL_DIAGS if is_king_top else _FORWARD_DIAGS
+    cf = chess.square_file(chain_start)
+    cr = chess.square_rank(chain_start)
+    moves: list[dict[str, Any]] = []
+    for df, dr in dirs:
+        for hop in _find_capture_hops(state.board, cf, cr, df, dr, n, state.stacks):
+            if hop.is_suicide:
+                moves.append(_build_final_move(state, chain_start, [hop]))
+    return moves
+
+
 def black_diagonal_capture_moves(state: State) -> list[dict[str, Any]]:
-    """Phase 2D (simplified) — single-hop diagonal captures.
+    """Phase 2D — diagonal captures (single hops + chains).
 
-    Limitations of this initial cut:
-    - Only single hops (no chains). A chain landing position with a follow-up
-      capture in another direction is not yet emitted as a multi-hop move.
-    - Only board landings. Rim landings and rim-bounces are not yet handled.
-    - No rank-1 promotion. Hops touching rank 1 don't promote yet.
-
-    Per §3B: walk up to n steps along a diagonal, find the first White at
-    distance d ∈ [1, n], pick a landing k ∈ [d, n+1]. Capture every
-    on-board White on path squares 1..k-1. Land at k:
-        empty board square → normal hop
-        White piece → ram (no landing capture; tower destroyed at landing)
-        friendly tower → that k is illegal
-    Ram-at-k=d additional reachability: k=d+1 must be on the 10x10 grid
-    and not a friendly Black tower."""
+    Combines:
+    - `_enumerate_chains`: non-suicide DFS-enumerated chains (single-hop
+      and multi-hop). Final landings are board squares, or rim-fallback to
+      the last on-board waypoint.
+    - `_first_hop_suicides`: single-hop ram captures (each tower, each
+      direction with a ram available)."""
     if state.board.turn != chess.BLACK:
         return []
     moves: list[dict[str, Any]] = []
-    for from_sq, pieces in state.stacks.items():
+    for from_sq, pieces in list(state.stacks.items()):
         if not pieces:
             continue
-        n = len(pieces)
-        top = pieces[-1]
-        directions = _ALL_DIAGS if top == "k" else _FORWARD_DIAGS
-        from_file = chess.square_file(from_sq)
-        from_rank = chess.square_rank(from_sq)
-        from_name = chess.square_name(from_sq)
-
-        for df, dr in directions:
-            # Find first enemy at d ∈ [1, n]. Friendly intervening tower
-            # blocks the scan and means no first enemy in this direction.
-            d = None
-            for step in range(1, n + 1):
-                pf = from_file + step * df
-                pr = from_rank + step * dr
-                if not _on_board(pf, pr):
-                    break
-                psq = chess.square(pf, pr)
-                p = state.board.piece_at(psq)
-                if p is None:
-                    continue
-                if p.color == chess.BLACK and _is_black_top_at(state, psq):
-                    break  # friendly blocks scan
-                d = step  # White piece — first enemy
-                break
-            if d is None:
-                continue
-
-            for k in range(d, n + 2):
-                tf = from_file + k * df
-                tr = from_rank + k * dr
-                if not _on_board(tf, tr):
-                    continue  # rim handling deferred
-                to_sq = chess.square(tf, tr)
-                to_name = chess.square_name(to_sq)
-                target = state.board.piece_at(to_sq)
-
-                # Path captures (steps 1..k-1, board squares only — rim
-                # squares capture nothing per spec, deferred).
-                path_captures: list[str] = []
-                path_off_board = False
-                for step in range(1, k):
-                    pf2 = from_file + step * df
-                    pr2 = from_rank + step * dr
-                    if not _on_board(pf2, pr2):
-                        path_off_board = True
-                        break
-                    psq2 = chess.square(pf2, pr2)
-                    p2 = state.board.piece_at(psq2)
-                    if p2 is not None and p2.color == chess.WHITE:
-                        path_captures.append(chess.square_name(psq2))
-                if path_off_board:
-                    continue  # rim path deferred
-
-                # Landing classification.
-                if target is None:
-                    is_ram = False
-                elif target.color == chess.WHITE:
-                    is_ram = True
-                else:
-                    # Friendly Black tower at landing → that k is illegal.
-                    continue
-
-                # Ram reachability (only applies when k == d).
-                if is_ram and k == d:
-                    next_f = from_file + (d + 1) * df
-                    next_r = from_rank + (d + 1) * dr
-                    # Off the 10×10 grid?
-                    if not (-1 <= next_f <= 8 and -1 <= next_r <= 8):
-                        continue
-                    # On 8×8: friendly tower disqualifies the ram.
-                    if _on_board(next_f, next_r):
-                        next_sq = chess.square(next_f, next_r)
-                        next_p = state.board.piece_at(next_sq)
-                        if (
-                            next_p is not None
-                            and next_p.color == chess.BLACK
-                            and _is_black_top_at(state, next_sq)
-                        ):
-                            continue
-
-                # `capture` field: closest path-captured White, or ram-destination.
-                if path_captures:
-                    capture_field: str | None = path_captures[0]
-                elif is_ram:
-                    capture_field = to_name
-                else:
-                    capture_field = None
-
-                moves.append({
-                    "uci": f"{from_name}{to_name}",
-                    "from": from_name,
-                    "to": to_name,
-                    "piece": _piece_name(top),
-                    "color": "black",
-                    "capture": capture_field,
-                    "waypoints": None,
-                    "chainHops": [to_name],
-                    "promotion": None,
-                    "demotedKings": None,
-                    "demotionsRequired": None,
-                    "sourceKingPositions": None,
-                    "deployCount": None,
-                })
+        moves.extend(_enumerate_chains(state, from_sq))
+        moves.extend(_first_hop_suicides(state, from_sq))
     return moves
 
 
 def black_mandatory_capture_active(state: State) -> bool:
-    """§4 mandate trigger — fires only when:
-      (a) a Black tower has a diagonally **adjacent** White (distance 1),
-      (b) at least one diagonal hop from that tower in that direction lands
-          on an empty board square (a normal landing — rams and rim-only
-          landings don't count).
+    """§4 mandate trigger. Mirrors scalachess hasMandatoryCapture exactly:
 
-    My earlier (broader) version flagged any first-enemy capture as
-    triggering, which incorrectly fired on Whites at distance 2+. That
-    over-suppressed quiet moves in real positions."""
-    for cap in black_diagonal_capture_moves(state):
-        from_sq = chess.parse_square(cap["from"])
-        capture_sq = chess.parse_square(cap["capture"]) if cap.get("capture") else None
-        if capture_sq is None:
+    For each Black tower, for each diagonal direction it can move:
+      - Check if the immediately adjacent square (Chebyshev distance 1)
+        in that direction contains a White piece.
+      - If yes, scan from that tower with _find_capture_hops. If any
+        resulting hop is non-suicide AND lands on a board square
+        (landingSquare is not None), mandate fires.
+
+    This directly uses the raw hop scan, NOT chain leaves, so it correctly
+    detects 'f2' as a triggering board landing even when f2 isn't a chain
+    leaf (because the DFS continues past it)."""
+    for from_sq, pieces in state.stacks.items():
+        if not pieces:
             continue
-        # First-enemy distance = Chebyshev distance from source to first captured square.
-        df = chess.square_file(capture_sq) - chess.square_file(from_sq)
-        dr = chess.square_rank(capture_sq) - chess.square_rank(from_sq)
-        if max(abs(df), abs(dr)) != 1:
-            continue  # first enemy not adjacent — doesn't fire mandate
-        to_sq = chess.parse_square(cap["to"])
-        if state.board.piece_at(to_sq) is None:
-            return True
+        n = len(pieces)
+        is_king_top = pieces[-1] == "k"
+        dirs = _ALL_DIAGS if is_king_top else _FORWARD_DIAGS
+        from_file = chess.square_file(from_sq)
+        from_rank = chess.square_rank(from_sq)
+        for df, dr in dirs:
+            adj_f, adj_r = from_file + df, from_rank + dr
+            if not _on_board(adj_f, adj_r):
+                continue
+            adj_sq = chess.square(adj_f, adj_r)
+            adj_piece = state.board.piece_at(adj_sq)
+            if adj_piece is None or adj_piece.color != chess.WHITE:
+                continue
+            # Adjacent White found. Check for a non-suicide hop that lands on board.
+            hops = _find_capture_hops(state.board, from_file, from_rank, df, dr, n, state.stacks)
+            if any(not h.is_suicide and h.landing_square is not None for h in hops):
+                return True
     return False
 
 
@@ -471,38 +818,88 @@ def _apply_diagonal_capture(state: State, move: dict[str, Any]) -> None:
     _move_full_tower(state, from_sq, to_sq)
 
 
+def _apply_chain_move(state: State, move: dict[str, Any]) -> None:
+    """Apply a diagonal capture chain (single-hop or multi-hop).
+
+    Uses the `_chain_all_captures`, `_is_suicide`, and `_chain_promotes`
+    internal fields stored by `_build_final_move`. Effect:
+      1. Remove all path-captured Whites from board.
+      2. Remove the tower from origin.
+      3. Promote the moving stack if chain crossed rank 1.
+      4. Suicide: tower destroyed, done.
+      5. Normal: place final stack at dest."""
+    from_sq = chess.parse_square(move["from"])
+    to_sq = chess.parse_square(move["to"])
+    orig_stack = state.stacks[from_sq]
+
+    # Remove path captures.
+    for cap_name in move.get("_chain_all_captures", []):
+        sq = chess.parse_square(cap_name)
+        state.board.remove_piece_at(sq)
+
+    # Remove tower from origin.
+    state.stacks.pop(from_sq, None)
+    state.board.remove_piece_at(from_sq)
+
+    if move.get("_is_suicide"):
+        # Tower destroyed at the ram landing — done.
+        return
+
+    final_stack = _promote_all_stones(orig_stack) if move.get("_chain_promotes") else orig_stack
+    state.stacks[to_sq] = final_stack
+    top = final_stack[-1]
+    if top == "k":
+        state.board.set_piece_at(to_sq, chess.Piece(chess.KING, chess.BLACK))
+    else:
+        state.board.set_piece_at(to_sq, chess.Piece(chess.PAWN, chess.BLACK))
+
+
 def apply_black_move(state: State, uci: str) -> State:
     """Parse and apply a Black move. Looks up the UCI in the current legal
-    move list and dispatches based on the move's shape. Raises ValueError
-    if the UCI doesn't match a legal move.
+    move list (with mandate applied) and dispatches based on move type.
 
-    Limitations of this initial cut:
-    - Chain captures (`uci` containing `~`) and rim/promotion are not yet
-      handled — calling apply_black_move on those raises NotImplementedError.
-    """
-    if "~" in uci:
-        raise NotImplementedError(
-            "apply_black_move: chain captures (UCI with '~') not yet ported"
-        )
+    Chain UCIs (containing `~`) are matched against chain moves. Plain
+    UCIs that match a chain leaf (e.g. single-hop T-fallback like `h4e1`)
+    are also handled. Raises ValueError if no match found."""
     legal = _all_black_legal(state)
+
+    # Resolve UCI: exact match first; for chain-form UCIs that don't appear
+    # verbatim, try matching by orig+dest, then by orig+chainHops-contains-dest
+    # (handles rim-dest UCIs like 'h4~d0' where d0 is a rim key stored in
+    # chainHops, not in "to" which holds the final board fallback).
     matches = [m for m in legal if m["uci"] == uci]
+    if not matches and "~" in uci:
+        parts = uci.split("~")
+        orig_key, dest_key = parts[0], parts[-1]
+        matches = [m for m in legal if m["from"] == orig_key and m["to"] == dest_key]
+        if not matches:
+            # dest_key may be a rim coordinate (like 'd0') stored in chainHops.
+            matches = [
+                m for m in legal
+                if m["from"] == orig_key and m.get("chainHops") and dest_key in m["chainHops"]
+            ]
+
     if not matches:
         raise ValueError(f"illegal or unrecognized Black move: {uci!r}")
     move = matches[0]
     new_state = state.copy()
+    saved_castling = state.board.castling_rights
 
     if move.get("deployCount") is not None:
         _apply_deploy(new_state, move)
     elif _is_orthogonal_move(move):
         _apply_charge(new_state, move)
+    elif move.get("chainHops") is not None:
+        _apply_chain_move(new_state, move)
     elif move.get("capture") is not None:
         _apply_diagonal_capture(new_state, move)
     else:
         _apply_quiet_or_sprint(new_state, move)
 
-    # scalachess Chessckers doesn't auto-bump halfmove/fullmove the way
-    # python-chess does in standard chess; preserve them from the input
-    # state and let scalachess parity dictate per-position behavior.
+    # scalachess Chessckers doesn't update castling rights during Black's turn
+    # (they're a White-only concept in this variant). python-chess strips them
+    # when pieces are removed, so restore the original rights explicitly.
+    new_state.board.castling_rights = saved_castling
     new_state.board.turn = chess.WHITE
     return new_state
 
