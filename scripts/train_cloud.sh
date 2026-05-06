@@ -50,23 +50,32 @@ CHESS_VERSION="${CHESS_VERSION:-1.11.2}"
 
 # === run config (override via env) ===
 RUN_NAME="${RUN_NAME:-cloud-run-001}"
-ITERATIONS="${ITERATIONS:-20}"
-GAMES_PER_ITER="${GAMES_PER_ITER:-50}"
-SIMS="${SIMS:-100}"
+ITERATIONS="${ITERATIONS:-100}"
+GAMES_PER_ITER="${GAMES_PER_ITER:-80}"
+# sims=400 (vs AZ-chess's 800): 4× deeper search than the default-100 run.
+# Spends more compute on each self-play move so MCTS finds longer-horizon
+# tactical sequences — the lever for breaking out of the White-favoring basin.
+SIMS="${SIMS:-400}"
 EVAL_GAMES="${EVAL_GAMES:-10}"
 EVAL_SIMS="${EVAL_SIMS:-200}"
-WORKERS="${WORKERS:-8}"
+WORKERS="${WORKERS:-16}"
 VLOSS_BATCH="${VLOSS_BATCH:-8}"
 # Without --mcts-batch-size>1 the InferenceServer is bypassed and every leaf
 # is evaluated singleton — GPU sits at ~1% util. Default to WORKERS*VLOSS_BATCH
 # so the server's max batch matches the theoretical ceiling.
 MCTS_BATCH_SIZE="${MCTS_BATCH_SIZE:-$((WORKERS * VLOSS_BATCH))}"
-BUFFER_ITERS="${BUFFER_ITERS:-20}"
+BUFFER_ITERS="${BUFFER_ITERS:-30}"
 EPOCHS="${EPOCHS:-5}"
 TRAIN_BATCH="${TRAIN_BATCH:-64}"
 TEMP="${TEMP:-1.0}"
-TEMP_FINAL="${TEMP_FINAL:-0.2}"
-# AZ-chess scale defaults: 20 blocks × 256 filters × 384 hidden = ~46M params.
+# Higher final temperature (was 0.2) keeps move sampling stochastic late
+# in the game so we explore more diverse endgame positions.
+TEMP_FINAL="${TEMP_FINAL:-0.5}"
+# Bumped Dirichlet noise (was alpha=0.3 eps=0.25). Wider opening prior
+# perturbation so MCTS root sometimes commits to moves the policy underweights.
+DIRICHLET_ALPHA="${DIRICHLET_ALPHA:-0.5}"
+DIRICHLET_EPS="${DIRICHLET_EPS:-0.40}"
+# AZ-chess scale defaults: 20 blocks × 256 filters × 384 hidden = ~30M params.
 # Chessckers may be more complex than chess, so this is a floor not a ceiling.
 MODEL_BLOCKS="${MODEL_BLOCKS:-20}"
 MODEL_FILTERS="${MODEL_FILTERS:-256}"
@@ -100,6 +109,7 @@ Spot/interruptible recovery:
 Tunables (env overrides; defaults shown):
   RUN_NAME=$RUN_NAME ITERATIONS=$ITERATIONS GAMES_PER_ITER=$GAMES_PER_ITER SIMS=$SIMS
   EVAL_GAMES=$EVAL_GAMES EVAL_SIMS=$EVAL_SIMS WORKERS=$WORKERS VLOSS_BATCH=$VLOSS_BATCH MCTS_BATCH_SIZE=$MCTS_BATCH_SIZE
+  DIRICHLET_ALPHA=$DIRICHLET_ALPHA DIRICHLET_EPS=$DIRICHLET_EPS
   BUFFER_ITERS=$BUFFER_ITERS EPOCHS=$EPOCHS TRAIN_BATCH=$TRAIN_BATCH
   TEMP=$TEMP TEMP_FINAL=$TEMP_FINAL
   MODEL_BLOCKS=$MODEL_BLOCKS MODEL_FILTERS=$MODEL_FILTERS MODEL_HIDDEN=$MODEL_HIDDEN
@@ -161,7 +171,7 @@ EOF
     "${SSH[@]}" "cat > $META_DIR/run.sh" <<EOF
 #!/usr/bin/env bash
 cd $REMOTE_ENGINE
-python3 -m chessckers_engine.selfplay_az_loop --use-pyvariant --device cuda --iterations $ITERATIONS --games-per-iter $GAMES_PER_ITER --sims $SIMS --workers $WORKERS --vloss-batch $VLOSS_BATCH --mcts-batch-size $MCTS_BATCH_SIZE --buffer-iters $BUFFER_ITERS --epochs $EPOCHS --train-batch-size $TRAIN_BATCH --temperature $TEMP --temperature-final $TEMP_FINAL --eval-games $EVAL_GAMES --eval-sims $EVAL_SIMS --keep-best --keep-best-threshold $KEEP_BEST_THRESHOLD --keep-best-games $KEEP_BEST_GAMES --model-blocks $MODEL_BLOCKS --model-filters $MODEL_FILTERS --model-hidden $MODEL_HIDDEN --weights-dir $REMOTE_ENGINE/weights/$RUN_NAME --seed $SEED $RESUME_FLAG
+python3 -m chessckers_engine.selfplay_az_loop --use-pyvariant --device cuda --iterations $ITERATIONS --games-per-iter $GAMES_PER_ITER --sims $SIMS --workers $WORKERS --vloss-batch $VLOSS_BATCH --mcts-batch-size $MCTS_BATCH_SIZE --buffer-iters $BUFFER_ITERS --epochs $EPOCHS --train-batch-size $TRAIN_BATCH --temperature $TEMP --temperature-final $TEMP_FINAL --dirichlet-alpha $DIRICHLET_ALPHA --dirichlet-eps $DIRICHLET_EPS --eval-games $EVAL_GAMES --eval-sims $EVAL_SIMS --keep-best --keep-best-threshold $KEEP_BEST_THRESHOLD --keep-best-games $KEEP_BEST_GAMES --model-blocks $MODEL_BLOCKS --model-filters $MODEL_FILTERS --model-hidden $MODEL_HIDDEN --weights-dir $REMOTE_ENGINE/weights/$RUN_NAME --seed $SEED $RESUME_FLAG
 echo \$? > $META_DIR/exit_code
 EOF
     # -n closes stdin so SSH doesn't read from us; </dev/null on the nohup detaches the
