@@ -51,7 +51,7 @@ CHESS_VERSION="${CHESS_VERSION:-1.11.2}"
 # === run config (override via env) ===
 RUN_NAME="${RUN_NAME:-cloud-run-001}"
 ITERATIONS="${ITERATIONS:-100}"
-GAMES_PER_ITER="${GAMES_PER_ITER:-80}"
+GAMES_PER_ITER="${GAMES_PER_ITER:-200}"
 # sims=400 (vs AZ-chess's 800): 4× deeper search than the default-100 run.
 # Spends more compute on each self-play move so MCTS finds longer-horizon
 # tactical sequences — the lever for breaking out of the White-favoring basin.
@@ -80,7 +80,7 @@ DIRICHLET_EPS="${DIRICHLET_EPS:-0.40}"
 MODEL_BLOCKS="${MODEL_BLOCKS:-20}"
 MODEL_FILTERS="${MODEL_FILTERS:-256}"
 MODEL_HIDDEN="${MODEL_HIDDEN:-384}"
-KEEP_BEST_THRESHOLD="${KEEP_BEST_THRESHOLD:-0.55}"
+KEEP_BEST_THRESHOLD="${KEEP_BEST_THRESHOLD:-0.45}"
 KEEP_BEST_GAMES="${KEEP_BEST_GAMES:-20}"
 SEED="${SEED:-1}"
 
@@ -170,6 +170,10 @@ EOF
     # Local vars expand; \$? stays literal so it evaluates on remote.
     "${SSH[@]}" "cat > $META_DIR/run.sh" <<EOF
 #!/usr/bin/env bash
+# Some vast.ai hosts ship a CUDA forward-compat libcuda that breaks consumer
+# GPUs ("Error 804: forward compatibility was attempted on non supported HW").
+# Drop it from LD_LIBRARY_PATH so torch falls back to the host driver's libcuda.
+export LD_LIBRARY_PATH="\$(echo \$LD_LIBRARY_PATH | tr ':' '\n' | grep -v '/cuda/compat' | paste -sd: -)"
 cd $REMOTE_ENGINE
 python3 -m chessckers_engine.selfplay_az_loop --use-pyvariant --device cuda --iterations $ITERATIONS --games-per-iter $GAMES_PER_ITER --sims $SIMS --workers $WORKERS --vloss-batch $VLOSS_BATCH --mcts-batch-size $MCTS_BATCH_SIZE --buffer-iters $BUFFER_ITERS --epochs $EPOCHS --train-batch-size $TRAIN_BATCH --temperature $TEMP --temperature-final $TEMP_FINAL --dirichlet-alpha $DIRICHLET_ALPHA --dirichlet-eps $DIRICHLET_EPS --eval-games $EVAL_GAMES --eval-sims $EVAL_SIMS --keep-best --keep-best-threshold $KEEP_BEST_THRESHOLD --keep-best-games $KEEP_BEST_GAMES --model-blocks $MODEL_BLOCKS --model-filters $MODEL_FILTERS --model-hidden $MODEL_HIDDEN --weights-dir $REMOTE_ENGINE/weights/$RUN_NAME --seed $SEED $RESUME_FLAG
 echo \$? > $META_DIR/exit_code
