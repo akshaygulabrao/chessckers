@@ -24,3 +24,6 @@ packages = ["chessckers_engine"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: end-to-end tests that spawn subprocesses; opt in with -m slow",
+]
