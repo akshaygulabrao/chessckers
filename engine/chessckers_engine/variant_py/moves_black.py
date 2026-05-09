@@ -881,7 +881,18 @@ def apply_black_move(state: State, uci: str) -> State:
 
     if not matches:
         raise ValueError(f"illegal or unrecognized Black move: {uci!r}")
-    move = matches[0]
+    return apply_black_move_known(state, matches[0])
+
+
+def apply_black_move_known(state: State, move: dict[str, Any]) -> State:
+    """Apply a Black move dict that the caller already validated as legal in
+    `state` — skips the `_all_black_legal` re-derivation that the UCI-string
+    `apply_black_move` does to look the move up.
+
+    Used by the MCTS hot path: each expansion already has the parent's full
+    legal-move list (it just used those dicts to seed children), so re-running
+    move-gen inside the apply step is pure waste. Roughly half of MCTS CPU
+    cost was that redundancy."""
     new_state = state.copy()
     saved_castling = state.board.castling_rights
 

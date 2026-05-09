@@ -105,6 +105,45 @@ def test_server_batches_concurrent_requests(tmp_path: Path):
         server.shutdown()
 
 
+def test_submit_is_async_and_enables_within_worker_batching(tmp_path: Path):
+    """A single client submitting B requests rapid-fire (without intervening
+    .result()) should land in the server queue concurrently, so the server
+    sees a batch > 1 from this single worker — the property MCTS virtual-loss
+    relies on."""
+    model = ChesskersScorer(**TINY_ARCH).eval()
+    ctx = mp.get_context("spawn")
+    request_q, response_qs = _make_qs(ctx, n_workers=1)
+    server = CrossInferenceServer(
+        model, request_q, response_qs,
+        max_batch_size=8, timeout_ms=50.0,
+    )
+    server.start()
+    try:
+        client = CrossInferenceClient(0, request_q, response_qs[0])
+        # Fire all submits synchronously (single thread) — they must NOT block.
+        # Without async submit, this loop would serialize and the server would
+        # only ever see batch size 1 from this worker.
+        t0 = time.perf_counter()
+        futures = [client.submit(START_FEN, START_MOVES) for _ in range(8)]
+        submit_elapsed = time.perf_counter() - t0
+        # Submits should be near-instant — encode + queue.put. Definitely under
+        # the 50ms server timeout that any single inference would take.
+        assert submit_elapsed < 0.5, (
+            f"submit() blocked: 8 submits took {submit_elapsed:.3f}s — "
+            "drain thread not async?"
+        )
+        results = [f.result(timeout=10) for f in futures]
+        assert len(results) == 8
+        for v, p in results:
+            assert -1.0 <= v <= 1.0
+            assert len(p) == len(START_MOVES)
+        stats = server.stats()
+        # The batch the server collected should include several of these 8.
+        assert stats["max_batch_size_seen"] >= 2, stats
+    finally:
+        server.shutdown()
+
+
 def test_request_id_ordering_per_worker(tmp_path: Path):
     """A single client submitting multiple times in sequence should get back
     responses in submit-order (per-worker FIFO is the contract)."""

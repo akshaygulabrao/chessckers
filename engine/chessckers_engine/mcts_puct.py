@@ -51,6 +51,10 @@ class _Mover(Protocol):
 
 @dataclass
 class PuctNode:
+    # `fen` may be the empty string when the fast path defers serialization
+    # until a leaf actually needs it (most expanded children are never picked,
+    # so serializing all of them is pure waste). Use `_node_fen(node, client)`
+    # rather than reading `node.fen` directly.
     fen: str
     move_to_here: LegalMove | None
     prior: float = 0.0  # P(this move | parent state)
@@ -60,10 +64,25 @@ class PuctNode:
     is_terminal: bool = False
     terminal_status: str | None = None
     expanded: bool = False
+    # Fast-path caches: parent State (so children can be built without
+    # re-parsing the FEN) and the legal moves at this node (so MCTS doesn't
+    # re-enumerate them in get_legal). Both are populated lazily by the
+    # variant_py fast path; for the legacy ServerClient path they stay None.
+    state: Any | None = None
+    legal_moves: list[LegalMove] | None = None
 
     @property
     def q(self) -> float:
         return self.total_value / self.visits if self.visits > 0 else 0.0
+
+
+def _node_fen(node: PuctNode, client: Any) -> str:
+    """Resolve a node's FEN, materializing it from the cached State on first
+    access. Lets the fast-path expansion skip ~3000 string serializations per
+    100 sims (only the ~100 leaves actually need a FEN for network input)."""
+    if not node.fen and node.state is not None and hasattr(client, "state_to_fen"):
+        node.fen = client.state_to_fen(node.state)
+    return node.fen
 
 
 def _puct_score(child: PuctNode, parent_visits: int, c_puct: float) -> float:
@@ -118,7 +137,47 @@ def _expand_with_priors(
 ) -> None:
     """Apply each legal move via the API; cache its post-state and the
     pre-computed prior on the child node. Priors come from a single
-    `policy_and_value` call so the trunk runs once per leaf."""
+    `policy_and_value` call so the trunk runs once per leaf.
+
+    Fast path (PyVariantClient): if the client exposes `parse` /
+    `apply_known` / `status_and_legal`, use them — parse the parent FEN once,
+    apply each child move to a copy of that State, detect terminal status
+    via the cheap-first ladder, and cache the resulting State + legal moves
+    on the child node. This skips ~50% of MCTS CPU vs the dict round-trip
+    path (`make_move(fen, uci)` re-parses, re-validates, re-serializes, and
+    re-runs full Black move-gen for the legalMoves field nobody reads).
+    """
+    fast = (
+        hasattr(client, "apply_known")
+        and hasattr(client, "status_and_legal")
+        and hasattr(client, "parse")
+        and hasattr(client, "state_to_fen")
+    )
+    if fast:
+        parent_state = node.state if node.state is not None else client.parse(node.fen)
+        node.state = parent_state
+        for move, prior in zip(legal_moves, priors):
+            try:
+                child_state = client.apply_known(parent_state, move)
+            except Exception as e:  # noqa: BLE001
+                log.debug("expand: skipping uci=%s: %s", move["uci"], e)
+                continue
+            status, _winner, child_legal = client.status_and_legal(child_state)
+            # Defer fen serialization — only ~3% of expanded children get
+            # picked as leaves. `_node_fen` materializes on demand.
+            child = PuctNode(
+                fen="",
+                move_to_here=move,
+                prior=float(prior),
+                is_terminal=bool(status),
+                terminal_status=status,
+                state=child_state,
+                legal_moves=child_legal,
+            )
+            node.children[move["uci"]] = child
+        node.expanded = True
+        return
+
     for move, prior in zip(legal_moves, priors):
         try:
             new_state = client.make_move(node.fen, move["uci"])
@@ -188,13 +247,13 @@ def _simulate(
         value = _terminal_value(node)
     elif not node.expanded:
         legal = get_legal_moves(node)
-        value, priors = _eval_and_priors(model, node.fen, legal)
+        value, priors = _eval_and_priors(model, _node_fen(node, client), legal)
         if legal:
             _expand_with_priors(node, legal, priors, client)
     else:
         # Expanded but no children — shouldn't occur in normal play, but
         # evaluate via the value head as a safe fallback.
-        value, _ = _eval_and_priors(model, node.fen, [])
+        value, _ = _eval_and_priors(model, _node_fen(node, client), [])
 
     _backup(path, value)
 
@@ -233,7 +292,7 @@ def _simulate_batched(
         if leaf.is_terminal:
             futures.append(None)
         else:
-            futures.append(evaluator.submit(leaf.fen, legal or []))
+            futures.append(evaluator.submit(_node_fen(leaf, client), legal or []))
 
     # Backup phase: remove virtual loss, expand if needed (idempotent if a
     # duplicate leaf appears twice in the batch — second expansion no-ops),
@@ -321,12 +380,24 @@ def run_mcts(
     if not legal:
         return MctsResult(chosen=None, visit_distribution={}, root=PuctNode(fen=state["fen"], move_to_here=None))
 
-    root = PuctNode(fen=state["fen"], move_to_here=None)
+    root = PuctNode(fen=state["fen"], move_to_here=None, legal_moves=legal)
+    # Eagerly cache the root's parsed State for the fast path so the first
+    # expansion doesn't have to re-parse the same FEN we just got.
+    if hasattr(client, "parse"):
+        try:
+            root.state = client.parse(state["fen"])
+        except Exception:  # noqa: BLE001
+            pass
     legal_cache: dict[str, list[LegalMove]] = {state["fen"]: legal}
 
     def get_legal(node: PuctNode) -> list[LegalMove]:
+        # Node-local cache (populated by the fast-path expansion) wins —
+        # it's the same list that detected the node's terminal status.
+        if node.legal_moves is not None:
+            return node.legal_moves
         cached = legal_cache.get(node.fen)
         if cached is not None:
+            node.legal_moves = cached
             return cached
         try:
             s = client.new_game(node.fen)  # type: ignore[attr-defined]
@@ -335,6 +406,7 @@ def run_mcts(
             return []
         moves = s.get("legalMoves") or []
         legal_cache[node.fen] = moves
+        node.legal_moves = moves
         return moves
 
     # First sim expands the root, populating children + their priors. Done

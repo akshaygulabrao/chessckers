@@ -23,6 +23,7 @@ import chess
 
 from chessckers_engine.variant_py.moves_black import (
     apply_black_move,
+    apply_black_move_known,
     black_charge_moves,
     black_deploy_moves,
     black_diagonal_capture_moves,
@@ -160,3 +161,69 @@ class PyVariantClient:
         self, fen: str, chain_start: str, hops_so_far: list[HopDTO]
     ) -> GameState:
         raise NotImplementedError("PyVariantClient.chain_end: not yet ported")
+
+    # ----- Fast-path API for the MCTS hot loop -----
+    #
+    # The dict-based API above forces parse/serialize round-trips on every
+    # call: `make_move(fen, uci)` parses the FEN, applies the move, then
+    # serializes the result and ALSO runs a full Black move-gen pass to fill
+    # `legalMoves` in the returned dict — even though MCTS never reads that
+    # field (it has its own legal-move cache). The methods below let MCTS
+    # parse a position once, then apply known-legal moves to the in-memory
+    # State directly. Profiling showed this path is ~50% of pre-fix MCTS time.
+
+    def parse(self, fen: str) -> State:
+        """Parse a FEN once; return the in-memory State for downstream
+        `apply_known` calls. Cheaper than going through `new_game(fen)` since
+        it skips status detection + legal-move enumeration."""
+        return parse_fen(fen)
+
+    def state_to_fen(self, state: State) -> str:
+        return serialize_fen(state)
+
+    def apply_known(self, state: State, move: dict[str, Any]) -> State:
+        """Apply a move dict that the caller knows is legal in `state`. Skips
+        the redundant move-gen-for-validation pass that `make_move(fen, uci)`
+        runs inside `apply_black_move` to look up the UCI."""
+        if state.board.turn == chess.WHITE:
+            return apply_white_move(state, move["uci"])
+        return apply_black_move_known(state, move)
+
+    def status_and_legal(
+        self, state: State
+    ) -> tuple[str | None, str | None, list[dict[str, Any]] | None]:
+        """Detect status; if non-terminal-by-cheap-checks, also return the
+        legal-move list (which the caller should cache for future MCTS lookups
+        on this state). When `status` is set via a cheap check (no stacks,
+        no king, white checkmate), `legal_moves` is None — those positions
+        are terminal and never need expansion."""
+        if not state.stacks:
+            return ("variantEnd", "white", None)
+        if state.board.king(chess.WHITE) is None:
+            return ("variantEnd", "black", None)
+        if state.board.turn == chess.WHITE:
+            try:
+                if state.board.is_checkmate():
+                    return ("mate", "black", None)
+            except Exception:  # noqa: BLE001
+                pass
+            moves = white_legal_moves(state)
+            return (None, None, moves)
+        # Black to move.
+        all_moves = (
+            black_diagonal_quiet_moves(state)
+            + black_deploy_moves(state)
+            + black_charge_moves(state)
+            + black_diagonal_capture_moves(state)
+        )
+        legal_moves = filter_for_mandate(state, all_moves)
+        if not legal_moves:
+            # Black stalemate → variantEnd / white wins (matches scalachess).
+            return ("variantEnd", "white", legal_moves)
+        return (None, None, legal_moves)
+
+    def state_check(self, state: State) -> bool:
+        try:
+            return bool(state.board.is_check())
+        except Exception:  # noqa: BLE001
+            return False

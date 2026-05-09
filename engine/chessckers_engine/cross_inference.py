@@ -174,12 +174,19 @@ class CrossInferenceServer:
 
 
 class CrossInferenceClient:
-    """Worker-side client: encodes locally, ships to server, blocks for response.
+    """Worker-side client: encodes locally, ships to server, returns a Future.
 
-    Returns Futures for API parity with `InferenceServer.submit`. Within a
-    worker, MCTS submits one leaf at a time and immediately calls .result(),
-    so submit() blocks synchronously on the response queue. (Per-worker
-    response queue is single-consumer, so order is preserved.)
+    `submit()` is fully async — puts the request on the queue and returns
+    immediately with an unresolved Future. A background drain thread reads
+    responses off the per-worker response queue and resolves the matching
+    Future by request id. This lets a single MCTS pass submit B requests
+    rapid-fire (virtual-loss batched MCTS) so the coordinator's
+    cross-inference server packs all B into one GPU batch instead of B
+    sequential round-trips.
+
+    Without the drain thread, `.result()` would block per-submit and the
+    effective per-worker batch size is 1 — defeating the point of
+    `vloss_batch > 1` on the MCTS side.
     """
 
     def __init__(
@@ -192,6 +199,39 @@ class CrossInferenceClient:
         self.request_q = request_q
         self.response_q = response_q
         self._next_id = 0
+        self._next_id_lock = threading.Lock()
+        self._pending: dict[int, Future] = {}
+        self._pending_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._drain_thread = threading.Thread(
+            target=self._drain, daemon=True,
+            name=f"CrossInferenceClient-{worker_id}-drain",
+        )
+        self._drain_thread.start()
+
+    def _drain(self) -> None:
+        while not self._stop.is_set():
+            try:
+                msg = self.response_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            except (OSError, EOFError, ValueError):
+                return
+            try:
+                rid, value, priors = msg
+            except (TypeError, ValueError):
+                log.warning("cross-inference client got malformed response: %r", msg)
+                continue
+            with self._pending_lock:
+                fut = self._pending.pop(rid, None)
+            if fut is None:
+                log.warning(
+                    "cross-inference client got response for unknown rid=%d "
+                    "(worker_id=%d) — dropping", rid, self.worker_id,
+                )
+                continue
+            if not fut.done():
+                fut.set_result((value, priors))
 
     def submit(
         self, fen: str, legal_moves: list[LegalMove]
@@ -201,20 +241,21 @@ class CrossInferenceClient:
             torch.stack([encode_move(m) for m in legal_moves])
             if legal_moves else None
         )
-        rid = self._next_id
-        self._next_id += 1
-        self.request_q.put((self.worker_id, rid, pos, moves))
-        # Per-worker response queue is FIFO single-consumer → next message is ours.
-        response_rid, value, priors = self.response_q.get()
-        if response_rid != rid:
-            raise RuntimeError(
-                f"cross-inference response order violated: "
-                f"expected rid={rid}, got rid={response_rid}"
-            )
+        with self._next_id_lock:
+            rid = self._next_id
+            self._next_id += 1
         future: Future = Future()
-        future.set_result((value, priors))
+        with self._pending_lock:
+            self._pending[rid] = future
+        self.request_q.put((self.worker_id, rid, pos, moves))
         return future
 
     def shutdown(self) -> None:
-        # Queues are owned by the coordinator; nothing for the worker to clean up.
-        return None
+        self._stop.set()
+        with self._pending_lock:
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(
+                        RuntimeError("CrossInferenceClient shutdown")
+                    )
+            self._pending.clear()
