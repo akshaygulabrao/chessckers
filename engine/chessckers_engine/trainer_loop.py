@@ -47,6 +47,7 @@ class TrainerLoop:
         wait_poll_seconds: float = 2.0,
         max_steps: Optional[int] = None,
         stop_event: Optional[mp.Event] = None,
+        resume_from: Optional[str | os.PathLike] = None,
     ):
         self.model = model.to(device)
         self.buffer = buffer
@@ -66,7 +67,10 @@ class TrainerLoop:
         self.wait_poll_seconds = wait_poll_seconds
         self.max_steps = max_steps
         self.stop_event = stop_event
+        self.resume_from = Path(resume_from) if resume_from else None
         self.step = 0
+        # Set lazily in run() so we can rehydrate optimizer state too.
+        self._opt: Optional[torch.optim.Optimizer] = None
 
     def _stopped(self) -> bool:
         return bool(self.stop_event and self.stop_event.is_set())
@@ -79,10 +83,49 @@ class TrainerLoop:
         os.replace(tmp, self.weights_path)
 
     def save_checkpoint(self, suffix: str = "") -> Path:
+        """Durable checkpoint with model + optimizer + step. Resumable.
+
+        Atomic write so a kill mid-save can't leave a half-written file at the
+        target path. The bare-`state_dict()` form is preserved as the contents
+        of `weights.pt`; this richer dict lives only in `checkpoint_dir`.
+        """
         name = f"step_{self.step:08d}{('_' + suffix) if suffix else ''}.pt"
         path = self.checkpoint_dir / name
-        torch.save(self.model.state_dict(), path)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        payload = {
+            "model": self.model.state_dict(),
+            "step": self.step,
+        }
+        if self._opt is not None:
+            payload["optimizer"] = self._opt.state_dict()
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
         return path
+
+    def _restore_from(self, path: Path) -> None:
+        """Restore model + optimizer + step from a richer checkpoint.
+
+        Tolerates the legacy bare-state_dict format: that case loads model
+        weights only and starts the optimizer + step fresh. Logs which path
+        was taken so silent half-resumes don't go unnoticed."""
+        target_device = next(self.model.parameters()).device
+        obj = torch.load(path, map_location=target_device, weights_only=True)
+        if isinstance(obj, dict) and "model" in obj:
+            self.model.load_state_dict(obj["model"], strict=False)
+            if "step" in obj:
+                self.step = int(obj["step"])
+            if "optimizer" in obj and self._opt is not None:
+                self._opt.load_state_dict(obj["optimizer"])
+                log.info("resumed trainer from %s: step=%d (with optimizer state)",
+                         path, self.step)
+            else:
+                log.info("resumed trainer from %s: step=%d (model only — no optimizer)",
+                         path, self.step)
+        else:
+            # Legacy: file is a raw state_dict. Model weights only.
+            self.model.load_state_dict(obj, strict=False)
+            log.info("resumed trainer from %s: model only (legacy bare-state_dict format)",
+                     path)
 
     def _wait_for_buffer(self) -> bool:
         """Block until buffer has min_buffer_games. Returns False if stopped."""
@@ -97,7 +140,10 @@ class TrainerLoop:
         if not self._wait_for_buffer():
             return self.step
 
-        opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        self._opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        # Restore optimizer + step from a previous checkpoint if requested.
+        if self.resume_from is not None and self.resume_from.exists():
+            self._restore_from(self.resume_from)
         value_loss_fn = nn.MSELoss()
         self.model.train()
         # Broadcast initial weights so workers can start with the trainer's
@@ -112,14 +158,20 @@ class TrainerLoop:
             if not batch:
                 time.sleep(self.wait_poll_seconds)
                 continue
-            opt.zero_grad()
+            self._opt.zero_grad()
             p_loss, v_loss = _batch_loss(self.model, batch, value_loss_fn)
             total = p_loss + self.value_loss_weight * v_loss
             total.backward()
             if self.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-            opt.step()
+            self._opt.step()
             self.step += 1
+            # Yield the GIL so a co-resident inference-server thread (in the
+            # shared-inference architecture) gets fair scheduling. On CPU
+            # with a tiny model, the trainer can sustain 100+ steps/s of
+            # Python-side work between GIL releases, starving the server
+            # and causing workers to block forever on response queues.
+            time.sleep(0)
 
             if self.step % self.weight_save_every == 0:
                 self.save_weights_atomic()

@@ -1,9 +1,17 @@
 """Async self-play worker: runs games forever, appends to ReplayBuffer.
 
-Spawned as a subprocess by the coordinator (`selfplay_az_async`). Each
-worker holds its own model copy, plays games end-to-end, and writes each
-finished game to the shared file-backed buffer. Between games it
-mtime-polls the trainer's weights file and hot-reloads when it changes.
+Spawned as a subprocess by the coordinator (`selfplay_az_async`). Two
+inference modes, picked by the payload:
+
+  * **Shared** (`request_q`+`response_q` present): pure-CPU worker. All
+    leaf evals go to the coordinator's `CrossInferenceServer`, which
+    batches across all workers and shares the trainer's live model.
+    No GPU model in the worker, no weights file polling.
+
+  * **Per-worker** (no queues in payload, falls back to weights-file mode):
+    each worker holds its own model copy on `device` and mtime-polls
+    `weights_path` to hot-reload after trainer broadcasts. Kept for
+    fallback / when the trainer's GPU is preferred to stay solo.
 
 Stop signal: presence of `stop_path` (a sentinel file). Coordinator
 creates this file to ask all workers to wind down cleanly after their
@@ -22,23 +30,71 @@ def _stop_requested(stop_path: Path | None) -> bool:
     return stop_path is not None and stop_path.exists()
 
 
+def play_forever_subprocess(payload: dict) -> None:
+    """Subprocess entry point: wraps `play_forever` and forces `os._exit`.
+
+    A bare `play_forever` returns cleanly, but the multiprocessing.Queue's
+    `QueueFeederThread` is a (technically daemon) background thread that
+    holds the process open until its buffered items are flushed to the
+    underlying pipe. In our shutdown sequence the parent has already stopped
+    reading by then, so the feeder blocks → process never exits → parent's
+    `p.join()` waits the full 300s timeout. `os._exit(0)` skips Python's
+    normal interpreter shutdown (which is what waits on those threads),
+    sidestepping the deadlock entirely.
+    """
+    import os as _os
+    import sys as _sys
+    rc = 0
+    try:
+        play_forever(payload)
+    except SystemExit as e:
+        rc = int(e.code or 0)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        rc = 1
+    finally:
+        try:
+            _sys.stdout.flush()
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        _os._exit(rc)
+
+
+def _pin_to_cpu(cpu_id: int) -> None:
+    """Pin the current process to a specific CPU core (Linux only).
+
+    Without pinning, the kernel scheduler bounces processes between cores —
+    each migration invalidates L1/L2 caches and hurts MCTS branch prediction.
+    On macOS `sched_setaffinity` doesn't exist; this is a silent no-op there.
+    """
+    import os as _os
+    if hasattr(_os, "sched_setaffinity"):
+        try:
+            _os.sched_setaffinity(0, {cpu_id})
+        except OSError as e:
+            log.debug("sched_setaffinity(cpu=%d) failed: %s", cpu_id, e)
+
+
 def play_forever(payload: dict) -> int:
     """Run self-play games until stop file appears (or max_games hit).
 
     Returns the number of games played. Top-level so it pickles for
     spawn-context multiprocessing.
 
-    payload keys:
-      worker_id, device, model_arch, weights_path, buffer_root,
-      n_sims, c_puct, temperature, dirichlet_alpha, dirichlet_eps,
-      mcts_batch_size, vloss_batch, max_plies, seed, stop_path,
-      max_games (None = forever), weights_poll_seconds.
+    payload keys (common):
+      worker_id, buffer_root, n_sims, c_puct, temperature,
+      dirichlet_alpha, dirichlet_eps, vloss_batch, max_plies, seed,
+      stop_path, max_games (None = forever).
+    payload keys (shared-inference mode):
+      request_q, response_q.
+    payload keys (per-worker mode):
+      device, model_arch, weights_path, mcts_batch_size,
+      weights_poll_seconds.
     """
     import torch as _torch
 
-    from chessckers_engine.checkpoints import load_checkpoint
-    from chessckers_engine.inference_server import InferenceServer as _IS
-    from chessckers_engine.model import ChesskersScorer as _Scorer
     from chessckers_engine.replay_buffer import ReplayBuffer
     from chessckers_engine.selfplay_az import (
         az_game_to_examples,
@@ -47,27 +103,47 @@ def play_forever(payload: dict) -> int:
     from chessckers_engine.variant_py import PyVariantClient as _PVC
 
     worker_id = int(payload["worker_id"])
-    weights_path = Path(payload["weights_path"])
+    if "pin_cpu" in payload and payload["pin_cpu"] is not None:
+        _pin_to_cpu(int(payload["pin_cpu"]))
     stop_path = Path(payload["stop_path"]) if payload.get("stop_path") else None
     buffer = ReplayBuffer(payload["buffer_root"])
-    poll_s = float(payload.get("weights_poll_seconds", 2.0))
     max_games = payload.get("max_games")
     max_plies = int(payload.get("max_plies", 400))
 
-    device = _torch.device(payload["device"])
-    model = _Scorer(**payload["model_arch"]).to(device).eval()
+    use_shared = "request_q" in payload and "response_q" in payload
 
-    # Wait for initial weights to land before starting any games — otherwise
-    # this worker's randomly-init'd net would generate worthless first games.
-    while not weights_path.exists():
-        if _stop_requested(stop_path):
-            return 0
-        time.sleep(poll_s)
-    last_mtime = -1.0
+    # ---- Inference setup ----
+    server = None
+    if use_shared:
+        from chessckers_engine.cross_inference import CrossInferenceClient
+        evaluator = CrossInferenceClient(
+            worker_id=worker_id,
+            request_q=payload["request_q"],
+            response_q=payload["response_q"],
+        )
+        last_mtime = None  # unused
+        weights_path = None
+    else:
+        from chessckers_engine.checkpoints import load_checkpoint
+        from chessckers_engine.inference_server import InferenceServer as _IS
+        from chessckers_engine.model import ChesskersScorer as _Scorer
 
-    use_server = int(payload["mcts_batch_size"]) > 1
-    server = _IS(model, max_batch_size=int(payload["mcts_batch_size"])) if use_server else None
-    evaluator = server if server is not None else model
+        weights_path = Path(payload["weights_path"])
+        poll_s = float(payload.get("weights_poll_seconds", 2.0))
+        device = _torch.device(payload["device"])
+        model = _Scorer(**payload["model_arch"]).to(device).eval()
+        # Wait for initial weights to land — otherwise we'd self-play with random init.
+        while not weights_path.exists():
+            if _stop_requested(stop_path):
+                return 0
+            time.sleep(poll_s)
+        last_mtime = -1.0
+        use_in_proc_server = int(payload["mcts_batch_size"]) > 1
+        if use_in_proc_server:
+            server = _IS(model, max_batch_size=int(payload["mcts_batch_size"]))
+            evaluator = server
+        else:
+            evaluator = model
 
     client = _PVC()
     rng = _torch.Generator().manual_seed(int(payload["seed"]))
@@ -77,21 +153,23 @@ def play_forever(payload: dict) -> int:
         while not _stop_requested(stop_path):
             if max_games is not None and games_played >= int(max_games):
                 break
-            try:
-                cur_mtime = weights_path.stat().st_mtime
-            except FileNotFoundError:
-                time.sleep(poll_s)
-                continue
-            if cur_mtime > last_mtime:
+
+            # Per-worker mode: refresh local model from weights file when newer.
+            if not use_shared:
                 try:
-                    load_checkpoint(model, weights_path)
-                    model.eval()
-                    last_mtime = cur_mtime
-                except (EOFError, RuntimeError, OSError) as e:
-                    # Trainer may be mid-write; skip and try next iteration.
-                    log.debug("worker %d weight reload failed: %s", worker_id, e)
-                    time.sleep(poll_s)
+                    cur_mtime = weights_path.stat().st_mtime
+                except FileNotFoundError:
+                    time.sleep(float(payload.get("weights_poll_seconds", 2.0)))
                     continue
+                if cur_mtime > last_mtime:
+                    try:
+                        load_checkpoint(model, weights_path)
+                        model.eval()
+                        last_mtime = cur_mtime
+                    except (EOFError, RuntimeError, OSError) as e:
+                        log.debug("worker %d weight reload failed: %s", worker_id, e)
+                        time.sleep(float(payload.get("weights_poll_seconds", 2.0)))
+                        continue
 
             game = play_az_game(
                 evaluator, client,
@@ -113,4 +191,18 @@ def play_forever(payload: dict) -> int:
         client.close()
         if server is not None:
             server.shutdown()
+        # Multiprocessing-Queue cleanup: by default each producer process
+        # has a feeder thread that blocks the process from terminating until
+        # buffered items are flushed to the underlying pipe. Tell the queue
+        # NOT to join its feeder thread — any in-flight final put may be
+        # lost, which is fine since we're shutting down. Combined with the
+        # `os._exit` in `play_forever_subprocess`, this lets the worker
+        # process die promptly so the coordinator's `is_alive()` poll can
+        # detect it.
+        if use_shared:
+            try:
+                payload["request_q"].cancel_join_thread()
+                payload["response_q"].cancel_join_thread()
+            except Exception:
+                pass
     return games_played

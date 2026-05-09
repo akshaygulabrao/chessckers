@@ -135,6 +135,47 @@ def test_worker_hot_reloads_weights_on_mtime_change(tmp_path: Path):
     assert buffer.count_games() == 3
 
 
+def test_worker_shared_inference_mode_plays_games(tmp_path: Path):
+    """Worker in shared-inference mode (request_q + response_q in payload)
+    skips local model loading and routes leaf evals through CrossInferenceClient
+    talking to a CrossInferenceServer in this test process."""
+    import multiprocessing as mp
+
+    from chessckers_engine.cross_inference import CrossInferenceServer
+
+    torch.manual_seed(0)
+    model = ChesskersScorer(**TINY_ARCH).eval()
+    ctx = mp.get_context("spawn")
+    request_q = ctx.Queue()
+    response_q = ctx.Queue()
+    server = CrossInferenceServer(model, request_q, [response_q],
+                                   max_batch_size=4, timeout_ms=5.0)
+    server.start()
+
+    buffer_root = tmp_path / "buf"
+    payload = _payload(buffer_root, weights_path=tmp_path / "unused.pt", max_games=2)
+    # Replace per-worker keys with shared-mode keys.
+    payload.pop("weights_path", None)
+    payload.pop("device", None)
+    payload.pop("model_arch", None)
+    payload.pop("mcts_batch_size", None)
+    payload["request_q"] = request_q
+    payload["response_q"] = response_q
+
+    try:
+        n_played = play_forever(payload)
+    finally:
+        server.shutdown()
+
+    assert n_played == 2
+    buffer = ReplayBuffer(buffer_root)
+    assert buffer.count_games() == 2
+    assert buffer.count_examples() > 0
+    # Server should have processed >= one batch.
+    stats = server.stats()
+    assert stats["n_requests"] > 0
+
+
 def test_worker_honors_stop_file_between_games(tmp_path: Path):
     torch.manual_seed(0)
     model = ChesskersScorer(**TINY_ARCH)

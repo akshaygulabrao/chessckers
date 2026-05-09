@@ -80,6 +80,17 @@ EVAL_SIMS="${EVAL_SIMS:-50}"
 EVAL_WORKERS="${EVAL_WORKERS:-2}"
 RUN_SECONDS="${RUN_SECONDS:-86400}"   # 24h
 SEED="${SEED:-0}"
+# Shared cross-worker inference server: one model on GPU, all workers send
+# leaves via mp.Queue. Defaults on for cloud runs — much higher GPU util on
+# shared GPU than per-worker InferenceServers (each worker formerly owned a
+# model copy + its own batching loop).
+SHARED_INFERENCE="${SHARED_INFERENCE:-1}"
+SHARED_MAX_BATCH_SIZE="${SHARED_MAX_BATCH_SIZE:-64}"
+SHARED_TIMEOUT_MS="${SHARED_TIMEOUT_MS:-5}"
+# CPU pinning: each worker stuck to a single core (Linux only). Cuts L1/L2
+# invalidation from scheduler migrations. Defaults on for cloud runs since
+# vast.ai boxes are Linux.
+PIN_CPUS="${PIN_CPUS:-1}"
 
 case "$STEP" in
   help|"")
@@ -106,6 +117,7 @@ Tunables:
   CHECKPOINT_EVERY=$CHECKPOINT_EVERY MIN_BUFFER_GAMES=$MIN_BUFFER_GAMES
   BUFFER_MAX_GAMES=$BUFFER_MAX_GAMES SEED=$SEED
   EVAL_EVERY_SECONDS=$EVAL_EVERY_SECONDS EVAL_GAMES=$EVAL_GAMES EVAL_SIMS=$EVAL_SIMS EVAL_WORKERS=$EVAL_WORKERS
+  SHARED_INFERENCE=$SHARED_INFERENCE SHARED_MAX_BATCH_SIZE=$SHARED_MAX_BATCH_SIZE SHARED_TIMEOUT_MS=$SHARED_TIMEOUT_MS PIN_CPUS=$PIN_CPUS
   TORCH_VERSION=$TORCH_VERSION CHESS_VERSION=$CHESS_VERSION
 EOF
     ;;
@@ -171,6 +183,8 @@ python3 -m chessckers_engine.selfplay_az_async \\
   --min-buffer-games $MIN_BUFFER_GAMES --buffer-max-games $BUFFER_MAX_GAMES \\
   --eval-every-seconds $EVAL_EVERY_SECONDS --eval-games $EVAL_GAMES \\
   --eval-sims $EVAL_SIMS --eval-workers $EVAL_WORKERS \\
+  $([ "$SHARED_INFERENCE" = "1" ] && echo "--shared-inference --shared-max-batch-size $SHARED_MAX_BATCH_SIZE --shared-timeout-ms $SHARED_TIMEOUT_MS") \\
+  $([ "$PIN_CPUS" = "1" ] && echo "--pin-cpus") \\
   --run-seconds $RUN_SECONDS --seed $SEED $RESUME_FLAG
 echo \$? > $META_DIR/exit_code
 EOF

@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import multiprocessing as mp
 import os
 import signal
 import threading
@@ -32,43 +31,64 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+# torch.multiprocessing is a drop-in replacement for multiprocessing that adds
+# zero-copy shared-memory pickling for tensors. mp.Queue with torch tensors
+# would otherwise serialize the bytes through a Unix socket per request.
+import torch.multiprocessing as mp
 
 from chessckers_engine.checkpoints import DEFAULT_WEIGHTS_DIR
+from chessckers_engine.cross_inference import CrossInferenceServer
 from chessckers_engine.device import pick_device
 from chessckers_engine.model import ChesskersScorer
 from chessckers_engine.replay_buffer import ReplayBuffer
 from chessckers_engine.selfplay_az_loop import _run_eval_parallel
-from chessckers_engine.selfplay_worker_async import play_forever
+from chessckers_engine.selfplay_worker_async import play_forever, play_forever_subprocess
 from chessckers_engine.trainer_loop import TrainerLoop
 
 log = logging.getLogger("chessckers_engine.selfplay_az_async")
 
 
-def _build_worker_payload(worker_id: int, *, weights_path: Path, buffer_root: Path,
-                          stop_path: Path, model_arch: dict, device: str,
-                          n_sims: int, c_puct: float, temperature: float,
-                          dirichlet_alpha: float, dirichlet_eps: float,
-                          mcts_batch_size: int, vloss_batch: int,
-                          max_plies: int, seed: int) -> dict:
-    return {
+def _build_worker_payload(worker_id: int, *, buffer_root: Path,
+                          stop_path: Path, n_sims: int, c_puct: float,
+                          temperature: float, dirichlet_alpha: float,
+                          dirichlet_eps: float, vloss_batch: int,
+                          max_plies: int, seed: int,
+                          # Per-worker mode args (omit/None when shared):
+                          weights_path: Optional[Path] = None,
+                          model_arch: Optional[dict] = None,
+                          device: Optional[str] = None,
+                          mcts_batch_size: int = 1,
+                          # Shared-inference mode args (set both or neither):
+                          request_q=None, response_q=None,
+                          # Linux-only CPU pin:
+                          pin_cpu: Optional[int] = None) -> dict:
+    payload: dict = {
         "worker_id": worker_id,
-        "device": device,
-        "model_arch": model_arch,
-        "weights_path": str(weights_path),
         "buffer_root": str(buffer_root),
         "n_sims": n_sims,
         "c_puct": c_puct,
         "temperature": temperature,
         "dirichlet_alpha": dirichlet_alpha if dirichlet_alpha > 0 else None,
         "dirichlet_eps": dirichlet_eps,
-        "mcts_batch_size": mcts_batch_size,
         "vloss_batch": vloss_batch,
         "max_plies": max_plies,
         "seed": seed + worker_id,
         "stop_path": str(stop_path),
         "max_games": None,
-        "weights_poll_seconds": 5.0,
+        "pin_cpu": pin_cpu,
     }
+    if request_q is not None and response_q is not None:
+        payload["request_q"] = request_q
+        payload["response_q"] = response_q
+    else:
+        # Per-worker mode requires its own GPU model + weights mtime poll.
+        assert weights_path is not None and model_arch is not None and device is not None
+        payload["weights_path"] = str(weights_path)
+        payload["model_arch"] = model_arch
+        payload["device"] = device
+        payload["mcts_batch_size"] = mcts_batch_size
+        payload["weights_poll_seconds"] = 5.0
+    return payload
 
 
 def _eval_snapshot_and_log(*, weights_path: Path, snapshot_path: Path,
@@ -137,7 +157,12 @@ def run_async_training(
     run_seconds: float = 24 * 3600,
     seed: int = 0,
     base_weights: Optional[Path] = None,
+    resume_from: Optional[Path] = None,
     main_loop_poll_seconds: float = 5.0,
+    shared_inference: bool = False,
+    shared_max_batch_size: int = 64,
+    shared_timeout_ms: float = 5.0,
+    pin_cpus: bool = False,
 ) -> dict:
     """Run async training for `run_seconds`, then shut down cleanly.
 
@@ -179,22 +204,58 @@ def run_async_training(
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    # Spawn workers (subprocesses with own MPS/CUDA context).
     ctx = mp.get_context("spawn")
+
+    # Optional shared-inference path: one server thread on the trainer's GPU,
+    # batching leaves from all workers. Workers become CPU-only (no model copy).
+    cross_server: Optional[CrossInferenceServer] = None
+    request_q = None
+    response_qs: list = []
+    if shared_inference:
+        request_q = ctx.Queue()
+        response_qs = [ctx.Queue() for _ in range(n_workers)]
+        cross_server = CrossInferenceServer(
+            model=model, request_q=request_q, response_qs=response_qs,
+            max_batch_size=shared_max_batch_size, timeout_ms=shared_timeout_ms,
+            log_every=50,
+        )
+        cross_server.start()
+        log.info("shared inference server started (max_batch=%d, timeout=%.1fms)",
+                 shared_max_batch_size, shared_timeout_ms)
+
+    # Pin workers to specific cores when requested. We reserve core 0 for
+    # the coordinator (trainer thread + inference server thread + main loop)
+    # and walk workers across cores 1..N. On macOS (no sched_setaffinity)
+    # this is a silent no-op inside the worker.
+    n_cpus = (os.cpu_count() or 0) if hasattr(os, "sched_setaffinity") else 0
+    cpu_assignments: list[Optional[int]]
+    if pin_cpus and n_cpus >= 2:
+        cpu_assignments = [1 + (w % (n_cpus - 1)) for w in range(n_workers)]
+        log.info("pinning %d workers across cores 1..%d", n_workers, n_cpus - 1)
+    else:
+        cpu_assignments = [None] * n_workers
+
+    # Spawn workers (subprocesses).
     workers: list[mp.Process] = []
     for w in range(n_workers):
         payload = _build_worker_payload(
-            w, weights_path=weights_path, buffer_root=buffer_root,
-            stop_path=stop_path, model_arch=model_arch, device=device,
+            w, buffer_root=buffer_root, stop_path=stop_path,
             n_sims=n_sims, c_puct=c_puct, temperature=temperature,
             dirichlet_alpha=dirichlet_alpha, dirichlet_eps=dirichlet_eps,
-            mcts_batch_size=mcts_batch_size, vloss_batch=vloss_batch,
-            max_plies=max_plies, seed=seed,
+            vloss_batch=vloss_batch, max_plies=max_plies, seed=seed,
+            weights_path=(None if shared_inference else weights_path),
+            model_arch=(None if shared_inference else model_arch),
+            device=(None if shared_inference else device),
+            mcts_batch_size=mcts_batch_size,
+            request_q=(request_q if shared_inference else None),
+            response_q=(response_qs[w] if shared_inference else None),
+            pin_cpu=cpu_assignments[w],
         )
-        p = ctx.Process(target=play_forever, args=(payload,), name=f"worker-{w}")
+        p = ctx.Process(target=play_forever_subprocess, args=(payload,), name=f"worker-{w}")
         p.start()
         workers.append(p)
-    log.info("spawned %d self-play workers", n_workers)
+    mode = "shared-inference" if shared_inference else "per-worker"
+    log.info("spawned %d self-play workers (%s mode)", n_workers, mode)
 
     # Trainer in a thread (shares the model object; eval uses the snapshot).
     buffer = ReplayBuffer(buffer_root, max_games=buffer_max_games)
@@ -206,6 +267,7 @@ def run_async_training(
         weight_save_every=weight_save_every, checkpoint_every=checkpoint_every,
         min_buffer_games=min_buffer_games, value_loss_weight=value_loss_weight,
         grad_clip=grad_clip, log_every=50, stop_event=trainer_stop,
+        resume_from=resume_from,
     )
     trainer_thread = threading.Thread(target=trainer.run, name="trainer")
     trainer_thread.start()
@@ -231,12 +293,33 @@ def run_async_training(
         if not stop_path.exists():
             stop_path.touch()
         log.info("shutting down — waiting for workers to finish their games")
+        # Don't use Process.join() — when workers use mp.Queue and exit via
+        # os._exit, join() can hang indefinitely on macOS waiting for state
+        # that never arrives. Poll is_alive() instead, with deadline +
+        # escalation to terminate/kill.
+        deadline = time.time() + 300.0
         for p in workers:
-            p.join(timeout=300)
+            while p.is_alive() and time.time() < deadline:
+                time.sleep(0.1)
             if p.is_alive():
-                log.warning("worker %s did not exit; terminating", p.name)
+                log.warning("worker %s still alive after deadline; terminating", p.name)
                 p.terminate()
-                p.join(timeout=10)
+                grace_until = time.time() + 5.0
+                while p.is_alive() and time.time() < grace_until:
+                    time.sleep(0.1)
+                if p.is_alive():
+                    log.warning("worker %s still alive after terminate; killing", p.name)
+                    p.kill()
+        # Workers are gone — no more requests can land. Safe to stop the
+        # shared inference server (otherwise blocked clients would wedge).
+        if cross_server is not None:
+            stats = cross_server.stats()
+            log.info(
+                "x-inference summary: batches=%d reqs=%d avg_bs=%.2f max_bs=%d gpu_secs=%.2f",
+                stats["n_batches"], stats["n_requests"], stats["avg_batch_size"],
+                stats["max_batch_size_seen"], stats["inference_secs"],
+            )
+            cross_server.shutdown()
         trainer_stop.set()
         trainer_thread.join(timeout=120)
 
@@ -282,10 +365,25 @@ def main() -> int:
     p.add_argument("--run-seconds", type=float, default=24 * 3600)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--base", type=Path, default=None,
-                   help="Optional starting weights to load before training.")
+                   help="Optional starting weights to load before training (model only).")
+    p.add_argument("--resume-from", type=Path, default=None,
+                   help="Resume from a durable checkpoint dict (model + optimizer + step). "
+                        "Use over --base when continuing a preempted run, so Adam moments "
+                        "and step counter survive.")
     p.add_argument("--d-hidden", type=int, default=256)
     p.add_argument("--c-filters", type=int, default=128)
     p.add_argument("--n-blocks", type=int, default=6)
+    p.add_argument("--shared-inference", action="store_true",
+                   help="Single coordinator-side server batches leaves from ALL workers. "
+                        "Workers run pure-CPU (no GPU model). Higher GPU util on shared GPU.")
+    p.add_argument("--shared-max-batch-size", type=int, default=64,
+                   help="Max batch size for the shared inference server.")
+    p.add_argument("--shared-timeout-ms", type=float, default=5.0,
+                   help="Max wait (ms) for additional requests to coalesce into a batch.")
+    p.add_argument("--pin-cpus", action="store_true",
+                   help="Pin each worker to a dedicated CPU core (Linux only). "
+                        "Coordinator stays on core 0; workers walk cores 1..N. "
+                        "Reduces L1/L2 cache invalidation from kernel scheduler migrations.")
     args = p.parse_args()
 
     model_arch = {"d_hidden": args.d_hidden, "c_filters": args.c_filters, "n_blocks": args.n_blocks}
@@ -302,6 +400,11 @@ def main() -> int:
         eval_every_seconds=args.eval_every_seconds, eval_games=args.eval_games,
         eval_sims=args.eval_sims, eval_workers=args.eval_workers,
         run_seconds=args.run_seconds, seed=args.seed, base_weights=args.base,
+        resume_from=args.resume_from,
+        shared_inference=args.shared_inference,
+        shared_max_batch_size=args.shared_max_batch_size,
+        shared_timeout_ms=args.shared_timeout_ms,
+        pin_cpus=args.pin_cpus,
     )
     return 0
 

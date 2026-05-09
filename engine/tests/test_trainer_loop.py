@@ -161,6 +161,106 @@ def test_trainer_stop_event_halts_loop(tmp_path: Path):
     assert loop.step > 0
 
 
+def test_trainer_checkpoint_includes_optimizer_state(tmp_path: Path):
+    """Durable checkpoints should be a dict with model + optimizer + step,
+    not the bare state_dict format. Critical for spot-preemption resume:
+    Adam moments take time to build up and starting fresh costs LR adaptation."""
+    torch.manual_seed(0)
+    model = ChesskersScorer(**TINY_ARCH)
+    buffer = ReplayBuffer(tmp_path / "buf")
+    _seed_buffer(buffer, n_games=2)
+
+    ckpt_dir = tmp_path / "ckpt"
+    loop = TrainerLoop(
+        model=model,
+        buffer=buffer,
+        weights_path=tmp_path / "weights.pt",
+        checkpoint_dir=ckpt_dir,
+        batch_size=2,
+        min_buffer_games=1,
+        weight_save_every=100,
+        checkpoint_every=3,
+        max_steps=4,
+        log_every=0,
+    )
+    loop.run()
+
+    # Find the durable checkpoint at step 3.
+    [ckpt] = list(ckpt_dir.glob("step_00000003.pt"))
+    payload = torch.load(ckpt, map_location="cpu", weights_only=True)
+    assert isinstance(payload, dict), f"checkpoint should be a dict, got {type(payload)}"
+    assert "model" in payload
+    assert "optimizer" in payload
+    assert "step" in payload
+    assert payload["step"] == 3
+    # Adam optimizer state has per-parameter "exp_avg" / "exp_avg_sq" tensors.
+    opt_state = payload["optimizer"]
+    assert "state" in opt_state
+    # At least one parameter has accumulated moments.
+    assert any("exp_avg" in v for v in opt_state["state"].values()), opt_state
+
+
+def test_trainer_resumes_optimizer_step_from_checkpoint(tmp_path: Path):
+    """After saving a checkpoint, a fresh TrainerLoop pointing resume_from at
+    that file should pick up at the saved step number (not 0)."""
+    torch.manual_seed(0)
+    model = ChesskersScorer(**TINY_ARCH)
+    buffer = ReplayBuffer(tmp_path / "buf")
+    _seed_buffer(buffer, n_games=2)
+
+    ckpt_dir = tmp_path / "ckpt"
+    weights_path = tmp_path / "weights.pt"
+
+    # Phase 1: train for 6 steps, write a checkpoint at step 3.
+    loop1 = TrainerLoop(
+        model=model, buffer=buffer,
+        weights_path=weights_path, checkpoint_dir=ckpt_dir,
+        batch_size=2, min_buffer_games=1, weight_save_every=100,
+        checkpoint_every=3, max_steps=6, log_every=0,
+    )
+    loop1.run()
+    [ckpt] = list(ckpt_dir.glob("step_00000003.pt"))
+
+    # Phase 2: fresh trainer, fresh model, resume from step-3 checkpoint.
+    # max_steps is *absolute* (matches "total steps reached"), so capping at 8
+    # means 5 additional steps after resuming at step=3.
+    fresh_model = ChesskersScorer(**TINY_ARCH)
+    loop2 = TrainerLoop(
+        model=fresh_model, buffer=buffer,
+        weights_path=tmp_path / "weights2.pt",
+        checkpoint_dir=tmp_path / "ckpt2",
+        batch_size=2, min_buffer_games=1, weight_save_every=100,
+        checkpoint_every=100, max_steps=8, log_every=0,
+        resume_from=ckpt,
+    )
+    loop2.run()
+    assert loop2.step == 8, f"resumed trainer should reach step 8, got {loop2.step}"
+
+
+def test_trainer_resume_from_legacy_state_dict_is_tolerated(tmp_path: Path):
+    """An old-format checkpoint (raw state_dict, no optimizer) should load
+    without crashing — model weights apply, optimizer + step start fresh."""
+    torch.manual_seed(0)
+    model = ChesskersScorer(**TINY_ARCH)
+    buffer = ReplayBuffer(tmp_path / "buf")
+    _seed_buffer(buffer, n_games=2)
+    legacy = tmp_path / "legacy.pt"
+    torch.save(model.state_dict(), legacy)
+
+    fresh = ChesskersScorer(**TINY_ARCH)
+    loop = TrainerLoop(
+        model=fresh, buffer=buffer,
+        weights_path=tmp_path / "weights.pt",
+        checkpoint_dir=tmp_path / "ckpt",
+        batch_size=2, min_buffer_games=1, weight_save_every=100,
+        checkpoint_every=100, max_steps=3, log_every=0,
+        resume_from=legacy,
+    )
+    loop.run()
+    # 3 fresh steps starting from step=0 (legacy doesn't carry step).
+    assert loop.step == 3
+
+
 def test_trainer_loss_is_finite(tmp_path: Path):
     """Sanity: training a few steps on synthetic data should yield finite losses
     (not NaN/inf), which would indicate gradient or encoding bugs."""
