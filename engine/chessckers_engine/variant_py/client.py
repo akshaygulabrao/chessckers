@@ -34,6 +34,11 @@ from chessckers_engine.variant_py.moves_white import (
     apply_white_move,
     white_legal_moves,
 )
+
+try:
+    import chessckers_movegen as _rs_movegen  # type: ignore[import-not-found]
+except ImportError:
+    _rs_movegen = None
 from chessckers_engine.variant_py.state import STARTING_FEN, State, parse_fen, serialize_fen
 
 GameState = dict[str, Any]
@@ -216,13 +221,23 @@ class PyVariantClient:
             moves = white_legal_moves(state)
             return (None, None, moves)
         # Black to move.
-        all_moves = (
-            black_diagonal_quiet_moves(state)
-            + black_deploy_moves(state)
-            + black_charge_moves(state)
-            + black_diagonal_capture_moves(state)
-        )
-        legal_moves = filter_for_mandate(state, all_moves)
+        if _rs_movegen is not None:
+            # Native fast path: one Rust call returns the post-mandate-filter
+            # legal-move list. ~75% of the pre-Rust `status_and_legal` cost
+            # collapses into this single call.
+            legal_moves = _rs_movegen.all_black_legal_moves(
+                state.board.occupied,
+                state.board.occupied_co[chess.WHITE],
+                state.stacks,
+            )
+        else:
+            all_moves = (
+                black_diagonal_quiet_moves(state)
+                + black_deploy_moves(state)
+                + black_charge_moves(state)
+                + black_diagonal_capture_moves(state)
+            )
+            legal_moves = filter_for_mandate(state, all_moves)
         if not legal_moves:
             # Black stalemate → variantEnd / white wins (matches scalachess).
             return ("variantEnd", "white", legal_moves)

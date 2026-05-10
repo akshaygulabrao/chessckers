@@ -714,6 +714,24 @@ def _first_hop_suicides(state: State, chain_start: chess.Square) -> list[dict[st
     return moves
 
 
+try:
+    import chessckers_movegen as _rs_movegen  # type: ignore[import-not-found]
+except ImportError:
+    _rs_movegen = None
+
+
+def _black_diagonal_capture_moves_py(state: State) -> list[dict[str, Any]]:
+    """Pure-Python implementation. Kept around as a correctness reference and
+    as a fallback when the Rust extension isn't installed."""
+    moves: list[dict[str, Any]] = []
+    for from_sq, pieces in list(state.stacks.items()):
+        if not pieces:
+            continue
+        moves.extend(_enumerate_chains(state, from_sq))
+        moves.extend(_first_hop_suicides(state, from_sq))
+    return moves
+
+
 def black_diagonal_capture_moves(state: State) -> list[dict[str, Any]]:
     """Phase 2D — diagonal captures (single hops + chains).
 
@@ -722,16 +740,22 @@ def black_diagonal_capture_moves(state: State) -> list[dict[str, Any]]:
       and multi-hop). Final landings are board squares, or rim-fallback to
       the last on-board waypoint.
     - `_first_hop_suicides`: single-hop ram captures (each tower, each
-      direction with a ram available)."""
+      direction with a ram available).
+
+    Routes through the native Rust extension (`chessckers_movegen`) when
+    installed — this is ~75% of MCTS time in pure Python, so the native
+    path is a major throughput win. Falls back to the Python implementation
+    otherwise; both are byte-for-byte equivalent and tested against
+    scalachess in `tests/test_pyvariant_diff.py`."""
     if state.board.turn != chess.BLACK:
         return []
-    moves: list[dict[str, Any]] = []
-    for from_sq, pieces in list(state.stacks.items()):
-        if not pieces:
-            continue
-        moves.extend(_enumerate_chains(state, from_sq))
-        moves.extend(_first_hop_suicides(state, from_sq))
-    return moves
+    if _rs_movegen is not None:
+        return _rs_movegen.black_diagonal_capture_moves(
+            state.board.occupied,
+            state.board.occupied_co[chess.WHITE],
+            state.stacks,
+        )
+    return _black_diagonal_capture_moves_py(state)
 
 
 def black_mandatory_capture_active(state: State) -> bool:

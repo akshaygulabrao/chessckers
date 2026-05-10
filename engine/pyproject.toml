@@ -27,3 +27,8 @@ testpaths = ["tests"]
 markers = [
     "slow: end-to-end tests that spawn subprocesses; opt in with -m slow",
 ]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.13.1",
+]

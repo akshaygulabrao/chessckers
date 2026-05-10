@@ -7,3 +7,8 @@
 /.claude/
 
 .DS_Store
+
+# Rust build artifacts
+engine/rust/*/target/
+engine/rust/*/.venv/
+engine/rust/*/uv.lock
