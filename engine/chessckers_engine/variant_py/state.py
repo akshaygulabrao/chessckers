@@ -43,7 +43,7 @@ STARTING_FEN = (
 _FEN_HEAD_RE = re.compile(r"^([^\s\[]+)(?:\[([^\]]*)\])?(\s.*)?$")
 
 
-@dataclass
+@dataclass(slots=True)
 class State:
     board: chess.Board
     stacks: dict[chess.Square, str] = field(default_factory=dict)

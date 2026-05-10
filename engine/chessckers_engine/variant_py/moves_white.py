@@ -33,6 +33,10 @@ _PROMOTION_NAMES = {
     chess.KNIGHT: "knight",
 }
 
+# Precomputed square-name table — replaces 5 `chess.square_name(sq)` calls in
+# the white-move emit path.
+_SQ_NAME: tuple[str, ...] = tuple(chess.square_name(i) for i in range(64))
+
 
 def white_legal_moves(state: State) -> list[dict[str, Any]]:
     """All legal White chess moves at the current position, in scalachess's
@@ -57,8 +61,8 @@ def _castling_alt_form(board: chess.Board, move: chess.Move) -> dict[str, Any]:
     rank = chess.square_rank(move.from_square)
     rook_file = 7 if board.is_kingside_castling(move) else 0
     rook_sq = chess.square(rook_file, rank)
-    from_name = chess.square_name(move.from_square)
-    rook_name = chess.square_name(rook_sq)
+    from_name = _SQ_NAME[move.from_square]
+    rook_name = _SQ_NAME[rook_sq]
     return {
         "uci": f"{from_name}{rook_name}",
         "from": from_name,
@@ -122,8 +126,8 @@ def apply_white_move(state: State, uci: str) -> State:
 
 
 def _to_scala_move(board: chess.Board, move: chess.Move) -> dict[str, Any]:
-    from_sq = chess.square_name(move.from_square)
-    to_sq = chess.square_name(move.to_square)
+    from_sq = _SQ_NAME[move.from_square]
+    to_sq = _SQ_NAME[move.to_square]
 
     piece = board.piece_at(move.from_square)
     piece_name = _PIECE_NAMES.get(piece.piece_type, "unknown") if piece else "unknown"
@@ -133,7 +137,7 @@ def _to_scala_move(board: chess.Board, move: chess.Move) -> dict[str, Any]:
         if board.is_en_passant(move):
             ep_file = chess.square_file(move.to_square)
             ep_rank = chess.square_rank(move.from_square)
-            capture_sq = chess.square_name(chess.square(ep_file, ep_rank))
+            capture_sq = _SQ_NAME[chess.square(ep_file, ep_rank)]
         else:
             capture_sq = to_sq
 

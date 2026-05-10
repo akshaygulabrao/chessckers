@@ -196,7 +196,13 @@ class PyVariantClient:
         legal-move list (which the caller should cache for future MCTS lookups
         on this state). When `status` is set via a cheap check (no stacks,
         no king, white checkmate), `legal_moves` is None — those positions
-        are terminal and never need expansion."""
+        are terminal and never need expansion.
+
+        (No transposition cache here: an instrumented run showed only ~0.6%
+        hit rate, since MCTS already caches the legal-moves list on each
+        PuctNode — true cross-subtree transpositions are rare at our depth
+        and branching factor, so a per-call cache costs more in key-building
+        than it saves.)"""
         if not state.stacks:
             return ("variantEnd", "white", None)
         if state.board.king(chess.WHITE) is None:

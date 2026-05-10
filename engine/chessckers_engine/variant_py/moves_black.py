@@ -27,6 +27,12 @@ _FORWARD_DIAGS = [(-1, -1), (1, -1)]
 _BACKWARD_DIAGS = [(-1, 1), (1, 1)]
 _ALL_DIAGS = _FORWARD_DIAGS + _BACKWARD_DIAGS
 
+# Precomputed string tables — module-load is the only place these are built.
+# `chess.square_name` was the second-most-called function in the MCTS profile
+# (557k calls per 100 sims) and `_coord_to_key` was building 573k strings via
+# f-format. Both reduce to constant-time list/dict lookups now.
+_SQ_NAME: tuple[str, ...] = tuple(chess.square_name(i) for i in range(64))
+
 
 def _on_board(file: int, rank: int) -> bool:
     return 0 <= file <= 7 and 0 <= rank <= 7
@@ -37,18 +43,94 @@ def _on_grid(file: int, rank: int) -> bool:
     return -1 <= file <= 8 and -1 <= rank <= 8
 
 
+def _build_coord_key_table() -> dict[tuple[int, int], str]:
+    """Materialize the (file, rank) → 2-char key map for the entire 10×10
+    grid. Files -1/8 use 'z'/'i'; ranks -1/8 use '0'/'9'."""
+    table: dict[tuple[int, int], str] = {}
+    for f in range(-1, 9):
+        for r in range(-1, 9):
+            if f == -1:
+                fc = "z"
+            elif 0 <= f <= 7:
+                fc = chr(ord("a") + f)
+            elif f == 8:
+                fc = "i"
+            else:
+                fc = "?"
+            table[(f, r)] = f"{fc}{r + 1}"
+    return table
+
+
+_COORD_KEY: dict[tuple[int, int], str] = _build_coord_key_table()
+
+
+# Maximum trace length for any capture-walk. The largest tower on the board
+# has 24 pieces; n+1 ≤ 25. We cap at 26 to keep all paths in-table without
+# overflow safety checks.
+_MAX_HOP_STEPS = 26
+
+
+def _build_capture_paths() -> dict[tuple[int, int, int, int], list[tuple]]:
+    """Precompute every bouncer trajectory the capture-hop walker can take.
+    Keyed by (start_file, start_rank, df, dr); value is a list of step records:
+        (f, r, sq_or_minus1, key, df_after, dr_after, did_bounce)
+    The walk is purely geometric (no board state), so the path is invariant
+    across positions. Consumer iterates this list step-by-step and applies
+    board-state checks per step. Eliminates per-call bounce arithmetic and
+    coordinate validity checks (~205k calls in a typical 100-sim MCTS).
+    """
+    paths: dict[tuple[int, int, int, int], list[tuple]] = {}
+    coord_key = _COORD_KEY
+    # Include rim starts (-1, 8) too — chain exploration can begin from a
+    # previous hop's rim landing key, not just from board squares.
+    for f0 in range(-1, 9):
+        for r0 in range(-1, 9):
+            for df0 in (-1, 1):
+                for dr0 in (-1, 1):
+                    steps: list[tuple] = []
+                    f, r = f0, r0
+                    df, dr = df0, dr0
+                    for _ in range(_MAX_HOP_STEPS):
+                        nf = f + df
+                        nr = r + dr
+                        did_bounce = False
+                        if nf < -1 or nf > 8:
+                            df = -df
+                            nf = f + df
+                            did_bounce = True
+                        if nr < -1 or nr > 8:
+                            dr = -dr
+                            nr = r + dr
+                            did_bounce = True
+                        if nf < -1 or nf > 8 or nr < -1 or nr > 8:
+                            break
+                        on_board_now = 0 <= nf <= 7 and 0 <= nr <= 7
+                        if did_bounce and not on_board_now:
+                            # Bounce that lands on rim is invalid; path ends.
+                            break
+                        f, r = nf, nr
+                        sq = ((r << 3) | f) if on_board_now else -1
+                        steps.append(
+                            (f, r, sq, coord_key.get((f, r), "??"), df, dr, did_bounce)
+                        )
+                        if did_bounce:
+                            # Hop ends post-bounce; subsequent steps would exit anyway.
+                            break
+                    paths[(f0, r0, df0, dr0)] = steps
+    return paths
+
+
+_CAPTURE_PATHS: dict[tuple[int, int, int, int], list[tuple]] = _build_capture_paths()
+
+
 def _coord_to_key(file: int, rank: int) -> str:
     """(file, rank) on the 10×10 grid → 2-char key. Rim coords use 'z'/'i'
     for files -1/8 and '0'/'9' for ranks -1/8."""
-    if file == -1:
-        f = "z"
-    elif 0 <= file <= 7:
-        f = chr(ord("a") + file)
-    elif file == 8:
-        f = "i"
-    else:
-        f = "?"
-    return f"{f}{rank + 1}"
+    cached = _COORD_KEY.get((file, rank))
+    if cached is not None:
+        return cached
+    # Fallback for out-of-grid coords (shouldn't occur in normal play).
+    return f"?{rank + 1}"
 
 
 def _parse_waypoint_key(s: str) -> tuple[int, int] | None:
@@ -100,6 +182,25 @@ def _is_black_top_at(state: State, sq: chess.Square) -> bool:
     return sq in state.stacks
 
 
+# Owner-of-square codes for the bitboard fast path. board.piece_at() builds a
+# Piece object every call (~500ns); this returns a small int, ~50ns.
+SQ_EMPTY = 0
+SQ_WHITE = 1
+SQ_BLACK = 2
+
+
+def _owner(board: chess.Board, sq: int) -> int:
+    """Return SQ_EMPTY/SQ_WHITE/SQ_BLACK by reading the bitboards directly.
+    Avoids `board.piece_at(sq)`'s `Piece(...)` allocation, which dominated
+    the move-gen inner loops at ~544k calls per 100 sims."""
+    mask = chess.BB_SQUARES[sq]
+    if not (board.occupied & mask):
+        return SQ_EMPTY
+    if board.occupied_co[chess.WHITE] & mask:
+        return SQ_WHITE
+    return SQ_BLACK
+
+
 def black_diagonal_quiet_moves(state: State) -> list[dict[str, Any]]:
     """Phase 2A — full-tower diagonal moves with no captures and no deploys.
 
@@ -122,8 +223,10 @@ def black_diagonal_quiet_moves(state: State) -> list[dict[str, Any]]:
         directions = _ALL_DIAGS if top == "k" else _FORWARD_DIAGS
         from_file = chess.square_file(from_sq)
         from_rank = chess.square_rank(from_sq)
-        from_name = chess.square_name(from_sq)
+        from_name = _SQ_NAME[from_sq]
 
+        board = state.board
+        stacks = state.stacks
         for df, dr in directions:
             for k in range(1, height + 1):
                 tf = from_file + k * df
@@ -131,12 +234,12 @@ def black_diagonal_quiet_moves(state: State) -> list[dict[str, Any]]:
                 if not _on_board(tf, tr):
                     break
                 to_sq = chess.square(tf, tr)
-                target = state.board.piece_at(to_sq)
-                if target is None:
+                owner = _owner(board, to_sq)
+                if owner == SQ_EMPTY:
                     moves.append(_quiet_move(from_name, to_sq, top))
                     continue  # empty square — keep scanning further along this diagonal
                 # Non-empty square: classify and stop.
-                if target.color == chess.BLACK and _is_black_top_at(state, to_sq):
+                if owner == SQ_BLACK and to_sq in stacks:
                     # Friendly Black tower → merge is legal here, but blocks further walk.
                     moves.append(_quiet_move(from_name, to_sq, top))
                 # White piece (or any non-friendly): stop, no emit (captures handled separately).
@@ -152,24 +255,24 @@ def black_diagonal_quiet_moves(state: State) -> list[dict[str, Any]]:
                 if not _on_board(int_f, int_r):
                     continue
                 int_sq = chess.square(int_f, int_r)
-                if state.board.piece_at(int_sq) is not None:
+                if _owner(board, int_sq) != SQ_EMPTY:
                     continue  # path blocked at the intervening square
                 tf = from_file + 2 * df
                 tr = from_rank + 2 * dr
                 if not _on_board(tf, tr):
                     continue
                 to_sq = chess.square(tf, tr)
-                target = state.board.piece_at(to_sq)
-                if target is None:
+                owner = _owner(board, to_sq)
+                if owner == SQ_EMPTY:
                     moves.append(_quiet_move(from_name, to_sq, top))
-                elif target.color == chess.BLACK and _is_black_top_at(state, to_sq):
+                elif owner == SQ_BLACK and to_sq in stacks:
                     moves.append(_quiet_move(from_name, to_sq, top))
 
     return moves
 
 
 def _quiet_move(from_name: str, to_sq: chess.Square, top: str) -> dict[str, Any]:
-    to_name = chess.square_name(to_sq)
+    to_name = _SQ_NAME[to_sq]
     return {
         "uci": f"{from_name}{to_name}",
         "from": from_name,
@@ -208,8 +311,10 @@ def black_deploy_moves(state: State) -> list[dict[str, Any]]:
         directions = _ALL_DIAGS if top == "k" else _FORWARD_DIAGS
         from_file = chess.square_file(from_sq)
         from_rank = chess.square_rank(from_sq)
-        from_name = chess.square_name(from_sq)
+        from_name = _SQ_NAME[from_sq]
 
+        board = state.board
+        stacks = state.stacks
         for s in range(1, n):  # 1..n-1
             for df, dr in directions:
                 for k in range(1, s + 1):
@@ -218,11 +323,11 @@ def black_deploy_moves(state: State) -> list[dict[str, Any]]:
                     if not _on_board(tf, tr):
                         break
                     to_sq = chess.square(tf, tr)
-                    target = state.board.piece_at(to_sq)
-                    if target is None:
+                    owner = _owner(board, to_sq)
+                    if owner == SQ_EMPTY:
                         moves.append(_deploy_move(from_name, to_sq, top, s))
                         continue
-                    if target.color == chess.BLACK and _is_black_top_at(state, to_sq):
+                    if owner == SQ_BLACK and to_sq in stacks:
                         moves.append(_deploy_move(from_name, to_sq, top, s))
                     break
     return moves
@@ -242,55 +347,40 @@ def _find_capture_hops(
 ) -> list[CaptureHop]:
     """Port of scalachess.Chessckers.findSlideCaptureOptionsFrom.
 
-    Walk along (df0, dr0) up to n+1 steps from (f0, r0). Emit a CaptureHop
-    for every legal landing (every k where the hop terminates: empty board
-    revisit-after-capture, White ram, empty board with prior captures, or
-    rim-T after captures). Handles single bounce off the 10×10 boundary
-    (one bounce per hop, must be at landing step, post-bounce on board).
-    Defers k=d (first-enemy) rams until the next step proves k=d+1
-    reachable per §3B step 5."""
+    Walk along (df0, dr0) up to n+1 steps from (f0, r0) using a precomputed
+    bouncer path (`_CAPTURE_PATHS`). Emit a CaptureHop for every legal
+    landing (every k where the hop terminates: empty board revisit-after-
+    capture, White ram, empty board with prior captures, or rim-T after
+    captures). Defers k=d (first-enemy) rams until the next step proves
+    k=d+1 reachable per §3B step 5."""
     options: list[CaptureHop] = []
     captures_so_far: list[int] = []
     captured_set: set[int] = set()
     waypoints_so_far: list[str] = []
 
-    f, r = f0, r0
-    df, dr = df0, dr0
-    blocked = False
-    step = 1
+    # Hoist hot bitboard attrs to locals — Python LOAD_FAST is ~3× faster than
+    # the LOAD_ATTR that `board.occupied` would do every loop iteration.
+    BB_SQUARES = chess.BB_SQUARES
+    occupied = board.occupied
+    occupied_white = board.occupied_co[chess.WHITE]
+
     crossed_rank1 = False
     pending_ram: CaptureHop | None = None
 
-    while step <= n + 1 and not blocked:
-        nf = f + df
-        nr = r + dr
-        did_bounce = False
-        if nf < -1 or nf > 8:
-            df = -df
-            nf = f + df
-            did_bounce = True
-        if nr < -1 or nr > 8:
-            dr = -dr
-            nr = r + dr
-            did_bounce = True
-
-        if nf < -1 or nf > 8 or nr < -1 or nr > 8:
-            pending_ram = None
-            blocked = True
-            continue
-        if did_bounce and not _on_board(nf, nr):
-            # Bounce that lands on rim is invalid — hop ends without emit.
-            pending_ram = None
-            blocked = True
-            continue
-
-        f, r = nf, nr
-        waypoints_so_far.append(_coord_to_key(f, r))
+    path = _CAPTURE_PATHS[(f0, r0, df0, dr0)]
+    # Walk only the steps we actually need: max n+1 steps; precomputed path
+    # may end earlier when it would have left the grid.
+    max_step = n + 1
+    for step_idx, step_data in enumerate(path):
+        if step_idx >= max_step:
+            break
+        f, r, sq, cur_key, df, dr, did_bounce = step_data
+        waypoints_so_far.append(cur_key)
         if r == 0:
             crossed_rank1 = True
+        step = step_idx + 1  # 1-based step number, matching the original loop
 
-        if _on_board(f, r):
-            sq = chess.square(f, r)
+        if sq != -1:
             if sq in captured_set:
                 # Revisit of an already-captured (now empty) square.
                 if pending_ram is not None:
@@ -299,33 +389,41 @@ def _find_capture_hops(
                 if captures_so_far:
                     options.append(CaptureHop(
                         direction=(df, dr),
-                        landing_key=_coord_to_key(f, r),
+                        landing_key=cur_key,
                         landing_square=sq,
                         captures=list(captures_so_far),
                         waypoints=list(waypoints_so_far),
                         crossed_rank1=crossed_rank1,
                     ))
             else:
-                piece = board.piece_at(sq)
-                if piece is None:
+                # Bitboard fast path — board.piece_at would allocate a Piece
+                # object per call (this loop runs ~205k times per 100 sims).
+                mask = BB_SQUARES[sq]
+                if not (occupied & mask):
+                    owner = SQ_EMPTY
+                elif occupied_white & mask:
+                    owner = SQ_WHITE
+                else:
+                    owner = SQ_BLACK
+                if owner == SQ_EMPTY:
                     if pending_ram is not None:
                         options.append(pending_ram)
                         pending_ram = None
                     if captures_so_far:
                         options.append(CaptureHop(
                             direction=(df, dr),
-                            landing_key=_coord_to_key(f, r),
+                            landing_key=cur_key,
                             landing_square=sq,
                             captures=list(captures_so_far),
                             waypoints=list(waypoints_so_far),
                             crossed_rank1=crossed_rank1,
                         ))
-                elif piece.color == chess.BLACK and sq in stacks:
+                elif owner == SQ_BLACK and sq in stacks:
                     # Friendly tower at k=d+1 invalidates a pending k=d ram.
                     pending_ram = None
-                    blocked = True
+                    break
                 else:
-                    # White piece encountered. Commit any pending k=d ram.
+                    # White piece (or Black-piece-without-stack, defensive).
                     if pending_ram is not None:
                         options.append(pending_ram)
                         pending_ram = None
@@ -334,7 +432,7 @@ def _find_capture_hops(
                     if step <= n or captures_so_far:
                         ram_hop = CaptureHop(
                             direction=(df, dr),
-                            landing_key=_coord_to_key(f, r),
+                            landing_key=cur_key,
                             landing_square=sq,
                             captures=list(captures_so_far),
                             waypoints=list(waypoints_so_far),
@@ -356,17 +454,15 @@ def _find_capture_hops(
             if captures_so_far:
                 options.append(CaptureHop(
                     direction=(df, dr),
-                    landing_key=_coord_to_key(f, r),
+                    landing_key=cur_key,
                     landing_square=None,
                     captures=list(captures_so_far),
                     waypoints=list(waypoints_so_far),
                     crossed_rank1=crossed_rank1,
                 ))
 
-        step += 1
-        if did_bounce:
-            # Hop ends at the post-bounce step.
-            blocked = True
+        # The precomputed path already terminates after a bounce step, so we
+        # don't need to break here — the for loop just exhausts naturally.
 
     return options
 
@@ -557,14 +653,14 @@ def _build_final_move(
 
     # capture field: first path-captured White, else final-landing for naked suicide.
     if all_captures:
-        capture_field: str | None = chess.square_name(all_captures[0])
+        capture_field: str | None = _SQ_NAME[all_captures[0]]
     elif is_suicide_chain:
-        capture_field = chess.square_name(final_landing)
+        capture_field = _SQ_NAME[final_landing]
     else:
         capture_field = None
 
-    from_name = chess.square_name(chain_start)
-    dest_name = chess.square_name(final_landing)
+    from_name = _SQ_NAME[chain_start]
+    dest_name = _SQ_NAME[final_landing]
     if len(hops) > 1:
         uci = f"{from_name}~{'~'.join(all_waypoints)}~{dest_name}"
         waypoints_field: list[str] | None = list(all_waypoints)
@@ -573,7 +669,7 @@ def _build_final_move(
         waypoints_field = None
 
     # Internal fields used by _apply_chain_move; not exposed to callers.
-    all_cap_names = [chess.square_name(sq) for sq in all_captures]
+    all_cap_names = [_SQ_NAME[sq] for sq in all_captures]
     # Promotion: did any hop's path touch rank 1?
     chain_promotes = any(_hop_promotes(h) for h in hops)
 
@@ -664,8 +760,7 @@ def black_mandatory_capture_active(state: State) -> bool:
             if not _on_board(adj_f, adj_r):
                 continue
             adj_sq = chess.square(adj_f, adj_r)
-            adj_piece = state.board.piece_at(adj_sq)
-            if adj_piece is None or adj_piece.color != chess.WHITE:
+            if _owner(state.board, adj_sq) != SQ_WHITE:
                 continue
             # Adjacent White found. Check for a non-suicide hop that lands on board.
             hops = _find_capture_hops(state.board, from_file, from_rank, df, dr, n, state.stacks)
@@ -767,12 +862,10 @@ def _apply_charge(state: State, move: dict[str, Any]) -> None:
         f = chess.square_file(from_sq) + k * df_sign
         r = chess.square_rank(from_sq) + k * dr_sign
         sq = chess.square(f, r)
-        p = state.board.piece_at(sq)
-        if p is not None and p.color == chess.WHITE:
+        if _owner(state.board, sq) == SQ_WHITE:
             state.board.remove_piece_at(sq)
 
-    target = state.board.piece_at(to_sq)
-    is_ram = target is not None and target.color == chess.WHITE
+    is_ram = _owner(state.board, to_sq) == SQ_WHITE
     if is_ram:
         # Tower destroyed at landing; landing White stays.
         state.stacks.pop(from_sq, None)
@@ -804,12 +897,10 @@ def _apply_diagonal_capture(state: State, move: dict[str, Any]) -> None:
         f = chess.square_file(from_sq) + k * df_sign
         r = chess.square_rank(from_sq) + k * dr_sign
         sq = chess.square(f, r)
-        p = state.board.piece_at(sq)
-        if p is not None and p.color == chess.WHITE:
+        if _owner(state.board, sq) == SQ_WHITE:
             state.board.remove_piece_at(sq)
 
-    target = state.board.piece_at(to_sq)
-    is_ram = target is not None and target.color == chess.WHITE
+    is_ram = _owner(state.board, to_sq) == SQ_WHITE
     if is_ram:
         state.stacks.pop(from_sq, None)
         state.board.remove_piece_at(from_sq)
@@ -956,7 +1047,7 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
             continue
         from_file = chess.square_file(from_sq)
         from_rank = chess.square_rank(from_sq)
-        from_name = chess.square_name(from_sq)
+        from_name = _SQ_NAME[from_sq]
         king_positions = [i + 1 for i, p in enumerate(pieces) if p == "k"]
 
         for df, dr in _ORTHO_DIRS:
@@ -971,13 +1062,13 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
                     pf = from_file + k * df
                     pr = from_rank + k * dr
                     psq = chess.square(pf, pr)
-                    p = state.board.piece_at(psq)
-                    if p is not None:
-                        if p.color == chess.BLACK and _is_black_top_at(state, psq):
+                    powner = _owner(state.board, psq)
+                    if powner != SQ_EMPTY:
+                        if powner == SQ_BLACK and psq in state.stacks:
                             blocked = True
                             break
-                        if p.color == chess.WHITE:
-                            path_captures.append(chess.square_name(psq))
+                        if powner == SQ_WHITE:
+                            path_captures.append(_SQ_NAME[psq])
                 if blocked:
                     break
                 tf = from_file + d * df
@@ -985,13 +1076,11 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
                 if not _on_board(tf, tr):
                     break
                 to_sq = chess.square(tf, tr)
-                to_name = chess.square_name(to_sq)
-                target = state.board.piece_at(to_sq)
-                is_ram = target is not None and target.color == chess.WHITE
+                to_name = _SQ_NAME[to_sq]
+                towner = _owner(state.board, to_sq)
+                is_ram = towner == SQ_WHITE
                 is_friendly_merge = (
-                    target is not None
-                    and target.color == chess.BLACK
-                    and _is_black_top_at(state, to_sq)
+                    towner == SQ_BLACK and to_sq in state.stacks
                 )
 
                 # Capture-field convention (scalachess parity).
@@ -1079,7 +1168,7 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
 
 
 def _deploy_move(from_name: str, to_sq: chess.Square, top: str, s: int) -> dict[str, Any]:
-    to_name = chess.square_name(to_sq)
+    to_name = _SQ_NAME[to_sq]
     return {
         "uci": f"{from_name}{to_name}[{s}]",
         "from": from_name,

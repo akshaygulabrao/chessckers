@@ -23,6 +23,7 @@ that's the AlphaZero policy improvement signal.
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
 from dataclasses import dataclass, field
@@ -30,7 +31,7 @@ from typing import Any, Protocol
 
 import torch
 
-from chessckers_engine.encoding import encode_move, encode_position
+from chessckers_engine.encoding import encode_move, encode_position, encode_position_state
 from chessckers_engine.model import ChesskersScorer
 
 log = logging.getLogger("chessckers_engine.mcts_puct")
@@ -49,7 +50,7 @@ class _Mover(Protocol):
     def make_move(self, fen: str, uci: str) -> GameState: ...
 
 
-@dataclass
+@dataclass(slots=True)
 class PuctNode:
     # `fen` may be the empty string when the fast path defers serialization
     # until a leaf actually needs it (most expanded children are never picked,
@@ -104,20 +105,28 @@ def _terminal_value(node: PuctNode) -> float:
 
 
 def _eval_and_priors(
-    evaluator, fen: str, legal_moves: list[LegalMove]
+    evaluator, fen: str, legal_moves: list[LegalMove],
+    state: Any = None,
 ) -> tuple[float, list[float]]:
     """One leaf evaluation returning (value, priors). `evaluator` is either
     a `ChesskersScorer` (direct in-thread forward pass) or an
     `InferenceServer` (queued, batched across concurrent MCTS workers).
-    Distinguished by duck-typing on `submit`."""
+    Distinguished by duck-typing on `submit`.
+
+    If `state` is supplied (the variant_py fast path always has it cached on
+    the PuctNode), encode the position directly from the in-memory State
+    instead of re-parsing the FEN string."""
     if hasattr(evaluator, "submit"):
         # Server path — submit and block. Server handles batching across
-        # concurrent worker threads.
+        # concurrent worker threads. The submit API is FEN-keyed, so we
+        # still pass the FEN here; cross-process IPC needs a string anyway.
         return evaluator.submit(fen, legal_moves).result()
     # Direct model path — one trunk pass, both heads.
     model = evaluator
     device = next(model.parameters()).device
-    pos = encode_position(fen).unsqueeze(0).to(device)
+    pos = (
+        encode_position_state(state) if state is not None else encode_position(fen)
+    ).unsqueeze(0).to(device)
     if not legal_moves:
         with torch.no_grad():
             value = model.value(pos)
@@ -247,13 +256,17 @@ def _simulate(
         value = _terminal_value(node)
     elif not node.expanded:
         legal = get_legal_moves(node)
-        value, priors = _eval_and_priors(model, _node_fen(node, client), legal)
+        value, priors = _eval_and_priors(
+            model, _node_fen(node, client), legal, state=node.state,
+        )
         if legal:
             _expand_with_priors(node, legal, priors, client)
     else:
         # Expanded but no children — shouldn't occur in normal play, but
         # evaluate via the value head as a safe fallback.
-        value, _ = _eval_and_priors(model, _node_fen(node, client), [])
+        value, _ = _eval_and_priors(
+            model, _node_fen(node, client), [], state=node.state,
+        )
 
     _backup(path, value)
 
@@ -380,6 +393,16 @@ def run_mcts(
     if not legal:
         return MctsResult(chosen=None, visit_distribution={}, root=PuctNode(fen=state["fen"], move_to_here=None))
 
+    # Disable cyclic-GC for the duration of the search. MCTS allocates ~3400
+    # PuctNodes / move dicts / CaptureHops per 100 sims and none of them form
+    # reference cycles (PuctNode children are owned top-down; no parent-back
+    # pointers; State/dict/list contents are leaves), so the cycle collector
+    # has no work to do. Skipping it saves ~13% wall time at typical sim
+    # counts. Refcount-based dealloc still runs as normal — no leak risk.
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+
     root = PuctNode(fen=state["fen"], move_to_here=None, legal_moves=legal)
     # Eagerly cache the root's parsed State for the fast path so the first
     # expansion doesn't have to re-parse the same FEN we just got.
@@ -419,15 +442,19 @@ def run_mcts(
         _apply_dirichlet_noise(root, dirichlet_alpha, dirichlet_eps)
 
     remaining = max(0, n_sims - 1)
-    if vloss_batch <= 1:
-        for _ in range(remaining):
-            _simulate(root, client, model, c_puct, get_legal)
-    else:
-        sims_done = 0
-        while sims_done < remaining:
-            b = min(vloss_batch, remaining - sims_done)
-            _simulate_batched(root, client, model, c_puct, get_legal, b)
-            sims_done += b
+    try:
+        if vloss_batch <= 1:
+            for _ in range(remaining):
+                _simulate(root, client, model, c_puct, get_legal)
+        else:
+            sims_done = 0
+            while sims_done < remaining:
+                b = min(vloss_batch, remaining - sims_done)
+                _simulate_batched(root, client, model, c_puct, get_legal, b)
+                sims_done += b
+    finally:
+        if gc_was_enabled:
+            gc.enable()
 
     if not root.children:
         return MctsResult(chosen=legal[0], visit_distribution={legal[0]["uci"]: 0}, root=root)
