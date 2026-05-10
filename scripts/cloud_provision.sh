@@ -5,6 +5,9 @@
 # Template bakes in:
 #   - pytorch/pytorch:2.5.0-cuda12.1-cudnn9-runtime image
 #   - onstart that pre-installs chess==1.11.2 numpy>=1.26 httpx
+#     (runs during loading phase, BEFORE the billing meter starts —
+#     vast.ai only charges from actual_status=running, so any setup
+#     in onstart is on vast.ai's dime)
 #   - 20GB disk
 #   - search filter: cpu_cores_effective>=16, cpu_ram>=8GB, net>=200Mbps,
 #     reliability>0.95, gpu_ram>=4GB, compute_cap<1200 (excludes Blackwell)
