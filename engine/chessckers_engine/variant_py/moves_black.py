@@ -853,6 +853,12 @@ def _apply_quiet_or_sprint(state: State, move: dict[str, Any]) -> None:
     )
     pieces_override = "S" if is_sprint else None
     _move_full_tower(state, from_sq, to_sq, pieces_override=pieces_override)
+    # Per spec §5, quiet diagonals + sprints promote when the destination is on
+    # rank 1. Promote AFTER the merge so existing stones at dest also promote.
+    if chess.square_rank(to_sq) == 0:
+        promoted = _promote_all_stones(state.stacks[to_sq])
+        state.stacks[to_sq] = promoted
+        _set_top_piece_on_board(state, to_sq, promoted[-1])
 
 
 def _apply_deploy(state: State, move: dict[str, Any]) -> None:
@@ -866,6 +872,9 @@ def _apply_deploy(state: State, move: dict[str, Any]) -> None:
     _set_top_piece_on_board(state, from_sq, remainder[-1])
     existing = state.stacks.get(to_sq, "")
     new_stack = existing + sub
+    # Per spec §5, deploys promote when the destination is on rank 1.
+    if chess.square_rank(to_sq) == 0:
+        new_stack = _promote_all_stones(new_stack)
     state.stacks[to_sq] = new_stack
     _set_top_piece_on_board(state, to_sq, new_stack[-1])
 
