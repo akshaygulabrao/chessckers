@@ -194,8 +194,16 @@ class CrossInferenceClient:
         worker_id: int,
         request_q: mp_queues.Queue,
         response_q: mp_queues.Queue,
+        q_index: int | None = None,
     ) -> None:
+        # `worker_id` is the absolute identifier (used in logs + buffer
+        # filenames; can be 200..213 on cloud boxes via --worker-id-base).
+        # `q_index` is the local index into the server's `response_qs`
+        # list (always 0..N-1). When --worker-id-base is non-zero these
+        # diverge — without splitting them, the server crashes with
+        # IndexError trying to look up response_qs[207].
         self.worker_id = worker_id
+        self.q_index = q_index if q_index is not None else worker_id
         self.request_q = request_q
         self.response_q = response_q
         self._next_id = 0
@@ -247,7 +255,9 @@ class CrossInferenceClient:
         future: Future = Future()
         with self._pending_lock:
             self._pending[rid] = future
-        self.request_q.put((self.worker_id, rid, pos, moves))
+        # Send q_index (local 0..N-1) so the server can index response_qs.
+        # See __init__: q_index != worker_id when --worker-id-base != 0.
+        self.request_q.put((self.q_index, rid, pos, moves))
         return future
 
     def shutdown(self) -> None:

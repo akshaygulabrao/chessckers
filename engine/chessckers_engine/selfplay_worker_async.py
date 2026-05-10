@@ -120,6 +120,7 @@ def play_forever(payload: dict) -> int:
             worker_id=worker_id,
             request_q=payload["request_q"],
             response_q=payload["response_q"],
+            q_index=payload.get("q_index", worker_id),
         )
         last_mtime = None  # unused
         weights_path = None

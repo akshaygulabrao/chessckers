@@ -80,6 +80,11 @@ def _build_worker_payload(worker_id: int, *, buffer_root: Path,
     if request_q is not None and response_q is not None:
         payload["request_q"] = request_q
         payload["response_q"] = response_q
+        # In selfplay_az_async we use worker_id == local index w (no
+        # --worker-id-base offset), so q_index defaults to worker_id and
+        # this is harmless. Set it explicitly for documentation parity
+        # with selfplay_workers_only.py.
+        payload["q_index"] = worker_id
     else:
         # Per-worker mode requires its own GPU model + weights mtime poll.
         assert weights_path is not None and model_arch is not None and device is not None
@@ -190,6 +195,15 @@ def run_async_training(
     if base_weights is not None:
         from chessckers_engine.checkpoints import load_checkpoint
         load_checkpoint(model, base_weights)
+    elif resume_from is not None and Path(resume_from).exists():
+        # Resume implies workers should also play with the resumed model, not
+        # random weights. Otherwise self-play games for the first ~weight_save_every
+        # steps are random — and any cloud sync sidecar will rsync those random
+        # weights up to remote workers immediately.
+        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        sd = ckpt.get("model", ckpt)
+        model.load_state_dict(sd)
+        log.info("seeded worker weights from resume checkpoint %s", resume_from)
     torch.save(model.state_dict(), weights_path)
     log.info("seeded weights at %s on device=%s", weights_path, device)
 
