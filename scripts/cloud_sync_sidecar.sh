@@ -8,6 +8,8 @@ set -uo pipefail
 
 CLOUD_HOST="${CLOUD_HOST:-ssh2.vast.ai}"
 CLOUD_PORT="${CLOUD_PORT:-15564}"
+CLOUD_USER="${CLOUD_USER:-root}"
+REMOTE_RUN="${REMOTE_RUN:-/root/run}"
 LOCAL_RUN="${LOCAL_RUN:-/Users/ox/AAworkspace/chessckers/engine/runs/local-004}"
 SYNC_DOWN="${SYNC_DOWN:-60}"
 
@@ -18,7 +20,7 @@ while true; do
   # 1. Pull new games (incremental rsync)
   before=$(ls "$LOCAL_RUN/buffer" 2>/dev/null | wc -l | tr -d ' ')
   rsync -az --ignore-existing -e "$RSYNC_SSH" \
-    "root@$CLOUD_HOST:/root/run/buffer/" "$LOCAL_RUN/buffer/" 2>/dev/null || \
+    "$CLOUD_USER@$CLOUD_HOST:$REMOTE_RUN/buffer/" "$LOCAL_RUN/buffer/" 2>/dev/null || \
     echo "[sync] rsync down failed at $(date +%H:%M:%S)"
   after=$(ls "$LOCAL_RUN/buffer" 2>/dev/null | wc -l | tr -d ' ')
   delta=$((after - before))
@@ -28,9 +30,9 @@ while true; do
   pushed=""
   if [ "$cur_mtime" -gt "$last_w_mtime" ]; then
     if rsync -az -e "$RSYNC_SSH" \
-        "$LOCAL_RUN/weights.pt" "root@$CLOUD_HOST:/root/run/weights.pt" 2>/dev/null; then
+        "$LOCAL_RUN/weights.pt" "$CLOUD_USER@$CLOUD_HOST:$REMOTE_RUN/weights.pt" 2>/dev/null; then
       last_w_mtime=$cur_mtime
-      pushed="  weights→cloud"
+      pushed="  weights→remote"
     fi
   fi
 

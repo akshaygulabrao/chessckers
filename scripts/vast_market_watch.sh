@@ -2,7 +2,9 @@
 # Periodic vast.ai marketplace scan.
 # Emits a stdout line ONLY when a deal appears that is BOTH:
 #   - bid < $0.10/hr (absolute budget cap)
-#   - >=10% cheaper per effective-core than what we're currently paying
+#   - >=25% cheaper per effective-core than what we're currently paying
+#     (raised from 10% on 2026-05-10: vast.ai search `min_bid` is the host
+#      floor, not the live auction price. Sub-25% deals can't usually be won.)
 # No minimum core floor — small cheap boxes are fair game.
 set -uo pipefail
 
@@ -10,7 +12,7 @@ CUR_BID="${CUR_BID:-0.10}"           # current hourly bid
 CUR_EFF="${CUR_EFF:-24}"             # current effective cores
 INTERVAL="${INTERVAL:-600}"          # seconds between scans
 MAX_BID="${MAX_BID:-0.10}"           # absolute hourly budget cap
-KEY="$(grep '^export VAST_AI_API_KEY=' ~/.zshrc | sed 's/^export VAST_AI_API_KEY=//' | tr -d '"')"
+KEY="${VAST_AI_API_KEY:-$(grep '^export VAST_AI_API_KEY=' ~/.zshrc | sed 's/^export VAST_AI_API_KEY=//' | tr -d '"')}"
 
 while true; do
   python3 - <<PY 2>/dev/null
@@ -36,8 +38,8 @@ for o in nonbw:
     # Hard cap: absolute bid below \$$MAX_BID
     if bid > $MAX_BID: continue
     p = bid / eff
-    # Must be >=10% cheaper per core
-    if p > cur_p_per_core * 0.90: continue
+    # Must be >=25% cheaper per core
+    if p > cur_p_per_core * 0.75: continue
     if best is None or p < best['p']:
         best = {'p': p, 'o': o}
 
