@@ -84,11 +84,15 @@ fn parse_waypoint_key(s: &str) -> Option<(i8, i8)> {
     Some((f, rd))
 }
 
-// -------- Bouncer-path table --------
+// -------- Capture-path table --------
 //
-// Precomputed per-(start_f, start_r, df0, dr0) trajectory. Same as the Python
-// `_CAPTURE_PATHS` table — pure geometry, no board state. Each step records
-// (f, r, sq_or_-1, key, df_after, dr_after, did_bounce).
+// Precomputed per-(start_f, start_r, df0, dr0) straight-diagonal trajectory.
+// Same as the Python `_CAPTURE_PATHS` table — pure geometry, no board state.
+// Per spec §3B step 3 (no-bounce rule), the path is a straight diagonal; if
+// a step would go off the 10×10 grid the trace just terminates. The
+// `df`/`dr` fields always match the original direction; `did_bounce` is
+// always false (kept on PathStep for ABI shape parity with consumers that
+// destructure the step tuple).
 
 #[derive(Clone, Debug)]
 struct PathStep {
@@ -107,7 +111,6 @@ fn capture_paths() -> &'static HashMap<(i8, i8, i8, i8), Vec<PathStep>> {
     static PATHS: OnceLock<HashMap<(i8, i8, i8, i8), Vec<PathStep>>> = OnceLock::new();
     PATHS.get_or_init(|| {
         let mut paths = HashMap::new();
-        // Include rim starts so chain continuations from rim landings work.
         for f0 in -1..=8 {
             for r0 in -1..=8 {
                 for &df0 in &[-1i8, 1] {
@@ -115,44 +118,25 @@ fn capture_paths() -> &'static HashMap<(i8, i8, i8, i8), Vec<PathStep>> {
                         let mut steps = Vec::with_capacity(MAX_HOP_STEPS);
                         let mut f = f0;
                         let mut r = r0;
-                        let mut df = df0;
-                        let mut dr = dr0;
                         for _ in 0..MAX_HOP_STEPS {
-                            let mut nf = f + df;
-                            let mut nr = r + dr;
-                            let mut did_bounce = false;
-                            if nf < -1 || nf > 8 {
-                                df = -df;
-                                nf = f + df;
-                                did_bounce = true;
-                            }
-                            if nr < -1 || nr > 8 {
-                                dr = -dr;
-                                nr = r + dr;
-                                did_bounce = true;
-                            }
+                            let nf = f + df0;
+                            let nr = r + dr0;
                             if nf < -1 || nf > 8 || nr < -1 || nr > 8 {
-                                break;
-                            }
-                            let on_now = on_board(nf, nr);
-                            if did_bounce && !on_now {
                                 break;
                             }
                             f = nf;
                             r = nr;
+                            let on_now = on_board(f, r);
                             let sq: i16 = if on_now { sq_idx(f, r) as i16 } else { -1 };
                             steps.push(PathStep {
                                 f,
                                 r,
                                 sq,
                                 key: coord_key(f, r),
-                                df,
-                                dr,
-                                did_bounce,
+                                df: df0,
+                                dr: dr0,
+                                did_bounce: false,
                             });
-                            if did_bounce {
-                                break;
-                            }
                         }
                         paths.insert((f0, r0, df0, dr0), steps);
                     }
@@ -316,7 +300,6 @@ fn find_capture_hops(
                 });
             }
         }
-        // Path-table already terminates after a bounce step; loop exits naturally.
     }
     options
 }

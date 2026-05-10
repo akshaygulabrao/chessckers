@@ -71,51 +71,34 @@ _MAX_HOP_STEPS = 26
 
 
 def _build_capture_paths() -> dict[tuple[int, int, int, int], list[tuple]]:
-    """Precompute every bouncer trajectory the capture-hop walker can take.
-    Keyed by (start_file, start_rank, df, dr); value is a list of step records:
+    """Precompute every straight-diagonal trajectory the capture-hop walker
+    can take. Keyed by (start_file, start_rank, df, dr); value is a list of
+    step records:
         (f, r, sq_or_minus1, key, df_after, dr_after, did_bounce)
-    The walk is purely geometric (no board state), so the path is invariant
-    across positions. Consumer iterates this list step-by-step and applies
-    board-state checks per step. Eliminates per-call bounce arithmetic and
-    coordinate validity checks (~205k calls in a typical 100-sim MCTS).
-    """
+    Per spec §3B step 3 (no-bounce rule), the path is a pure straight diagonal
+    walk. If a step would go off the 10×10 grid the trace just terminates —
+    no reflection, no salvaging the landing. `df_after`/`dr_after` always
+    equal the original direction; `did_bounce` is always False (kept in the
+    tuple for shape compatibility with the consumer)."""
     paths: dict[tuple[int, int, int, int], list[tuple]] = {}
     coord_key = _COORD_KEY
-    # Include rim starts (-1, 8) too — chain exploration can begin from a
-    # previous hop's rim landing key, not just from board squares.
     for f0 in range(-1, 9):
         for r0 in range(-1, 9):
             for df0 in (-1, 1):
                 for dr0 in (-1, 1):
                     steps: list[tuple] = []
                     f, r = f0, r0
-                    df, dr = df0, dr0
                     for _ in range(_MAX_HOP_STEPS):
-                        nf = f + df
-                        nr = r + dr
-                        did_bounce = False
-                        if nf < -1 or nf > 8:
-                            df = -df
-                            nf = f + df
-                            did_bounce = True
-                        if nr < -1 or nr > 8:
-                            dr = -dr
-                            nr = r + dr
-                            did_bounce = True
+                        nf = f + df0
+                        nr = r + dr0
                         if nf < -1 or nf > 8 or nr < -1 or nr > 8:
                             break
-                        on_board_now = 0 <= nf <= 7 and 0 <= nr <= 7
-                        if did_bounce and not on_board_now:
-                            # Bounce that lands on rim is invalid; path ends.
-                            break
                         f, r = nf, nr
+                        on_board_now = 0 <= nf <= 7 and 0 <= nr <= 7
                         sq = ((r << 3) | f) if on_board_now else -1
                         steps.append(
-                            (f, r, sq, coord_key.get((f, r), "??"), df, dr, did_bounce)
+                            (f, r, sq, coord_key.get((f, r), "??"), df0, dr0, False)
                         )
-                        if did_bounce:
-                            # Hop ends post-bounce; subsequent steps would exit anyway.
-                            break
                     paths[(f0, r0, df0, dr0)] = steps
     return paths
 
@@ -347,12 +330,14 @@ def _find_capture_hops(
 ) -> list[CaptureHop]:
     """Port of scalachess.Chessckers.findSlideCaptureOptionsFrom.
 
-    Walk along (df0, dr0) up to n+1 steps from (f0, r0) using a precomputed
-    bouncer path (`_CAPTURE_PATHS`). Emit a CaptureHop for every legal
-    landing (every k where the hop terminates: empty board revisit-after-
-    capture, White ram, empty board with prior captures, or rim-T after
-    captures). Defers k=d (first-enemy) rams until the next step proves
-    k=d+1 reachable per §3B step 5."""
+    Walk along (df0, dr0) up to n+1 steps from (f0, r0) using the
+    precomputed straight-diagonal path (`_CAPTURE_PATHS`). Emit a CaptureHop
+    for every legal landing (every k where the hop terminates: empty board
+    revisit-after-capture, White ram, empty board with prior captures, or
+    rim-T after captures). Defers k=d (first-enemy) rams until the next
+    step proves k=d+1 reachable per §3B step 5. Per spec §3B step 3 there
+    is no bouncing — if the precomputed path runs out before reaching
+    cadence, that direction is unavailable."""
     options: list[CaptureHop] = []
     captures_so_far: list[int] = []
     captured_set: set[int] = set()
@@ -461,9 +446,6 @@ def _find_capture_hops(
                     crossed_rank1=crossed_rank1,
                 ))
 
-        # The precomputed path already terminates after a bounce step, so we
-        # don't need to break here — the for loop just exhausts naturally.
-
     return options
 
 
@@ -499,8 +481,7 @@ def _next_capture_options(
       scalachess's validMoves chain enumeration; first-hop suicides are
       emitted separately by `_first_hop_suicides`),
     - len(waypoints) == cadence when cadence is locked,
-    - dedup by (direction, landing_key, captures, is_suicide) since bounces
-      cause different starting directions to converge on identical hops."""
+    - dedup by (direction, landing_key, captures, is_suicide)."""
     if not cur_stack:
         return []
     is_king_top = cur_stack[-1] == "k"
