@@ -213,12 +213,23 @@ class PyVariantClient:
         if state.board.king(chess.WHITE) is None:
             return ("variantEnd", "black", None)
         if state.board.turn == chess.WHITE:
-            try:
-                if state.board.is_checkmate():
-                    return ("mate", "black", None)
-            except Exception:  # noqa: BLE001
-                pass
+            # Don't use python-chess's `is_checkmate` — it treats Black-King
+            # bitboard entries (= Chessckers king-top stacks) as standard
+            # 8-direction chess kings, which over-reports check and can
+            # turn a non-mate into a false-mate (see
+            # tests/test_screenshot_false_mate.py). Instead: compute white
+            # legal moves under Chessckers attack rules; mate iff zero legal
+            # moves AND king is in Chessckers-check.
+            from chessckers_engine.variant_py.moves_white import (
+                _is_white_in_chessckers_check,
+            )
             moves = white_legal_moves(state)
+            if not moves:
+                if _is_white_in_chessckers_check(state):
+                    return ("mate", "black", None)
+                # No legal moves and not in check → stalemate (chess rule;
+                # scalachess returns "stalemate" / draw).
+                return ("stalemate", None, None)
             return (None, None, moves)
         # Black to move.
         if _rs_movegen is not None:

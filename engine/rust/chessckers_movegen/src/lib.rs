@@ -1180,6 +1180,86 @@ fn all_black_legal_moves_native(
     out
 }
 
+/// True iff some Black stack can capture a White piece at `target_sq` next
+/// turn under Chessckers attack rules. Mirrors moves_white.py's
+/// `_square_attacked_by_black_chessckers_py` (walk-based, doesn't model
+/// rim-bounce diagonals — those rare cases would require enumerating the
+/// bouncer-path here too).
+fn square_attacked_by_black_chessckers_native(
+    occupied: u64,
+    occupied_white: u64,
+    stacks: &HashMap<u8, Vec<u8>>,
+    target_sq: u8,
+) -> bool {
+    for (&from_sq, pieces) in stacks {
+        if pieces.is_empty() {
+            continue;
+        }
+        let n = pieces.len();
+        let top = *pieces.last().unwrap();
+        let is_king_top = top == b'k';
+        let n_kings: usize = if is_king_top {
+            pieces.iter().filter(|&&p| p == b'k').count()
+        } else {
+            0
+        };
+        let sf = (from_sq & 7) as i8;
+        let sr = (from_sq >> 3) as i8;
+
+        // Diagonal walk: target reachable in 1..n diagonal squares without a
+        // friendly Black tower blocking. White pieces in path are free
+        // path-captures and don't block.
+        let diag_dirs: &[(i8, i8)] = if is_king_top { &ALL_DIAGS } else { &FORWARD_DIAGS };
+        for &(df, dr) in diag_dirs {
+            for k in 1..=(n as i8) {
+                let nf = sf + k * df;
+                let nr = sr + k * dr;
+                if !on_board(nf, nr) {
+                    break;
+                }
+                let nsq = sq_idx(nf, nr);
+                if nsq == target_sq {
+                    return true;
+                }
+                let o = owner(occupied, occupied_white, nsq);
+                if o == SQ_BLACK && stacks.contains_key(&nsq) {
+                    break;
+                }
+            }
+        }
+
+        // Orthogonal charge (king-top only, n_kings ≥ 2 to have any path
+        // square — charge of length 1 to white is a ram = no capture).
+        if is_king_top && n_kings >= 2 {
+            for &(df, dr) in &ORTHO_DIRS {
+                for k in 1..(n_kings as i8) {
+                    let nf = sf + k * df;
+                    let nr = sr + k * dr;
+                    if !on_board(nf, nr) {
+                        break;
+                    }
+                    let nsq = sq_idx(nf, nr);
+                    if nsq == target_sq {
+                        // Charge to k+1 must land on-board to be a legal
+                        // charge target.
+                        let nf2 = sf + (k + 1) * df;
+                        let nr2 = sr + (k + 1) * dr;
+                        if on_board(nf2, nr2) {
+                            return true;
+                        }
+                        break;
+                    }
+                    let o = owner(occupied, occupied_white, nsq);
+                    if o == SQ_BLACK && stacks.contains_key(&nsq) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn black_mandatory_capture_active_native(
     occupied: u64,
     occupied_white: u64,
@@ -1302,11 +1382,28 @@ fn all_black_legal_moves<'py>(
     Ok(out)
 }
 
+#[pyfunction]
+fn square_attacked_by_black_chessckers(
+    occupied: u64,
+    occupied_white: u64,
+    stacks: &Bound<'_, PyDict>,
+    target_sq: u8,
+) -> PyResult<bool> {
+    let stacks_rs = parse_stacks(stacks)?;
+    Ok(square_attacked_by_black_chessckers_native(
+        occupied,
+        occupied_white,
+        &stacks_rs,
+        target_sq,
+    ))
+}
+
 #[pymodule]
 fn chessckers_movegen(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ping, m)?)?;
     m.add_function(wrap_pyfunction!(black_diagonal_capture_moves, m)?)?;
     m.add_function(wrap_pyfunction!(black_mandatory_capture_active, m)?)?;
     m.add_function(wrap_pyfunction!(all_black_legal_moves, m)?)?;
+    m.add_function(wrap_pyfunction!(square_attacked_by_black_chessckers, m)?)?;
     Ok(())
 }
