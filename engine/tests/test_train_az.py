@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 
+from chessckers_engine.encoding import MOVE_D
 from chessckers_engine.model import ChesskersScorer
 from chessckers_engine.selfplay_az import AZExample
 from chessckers_engine.train_az import _batch_loss, _example_loss, save_checkpoint, train_az
@@ -113,7 +114,7 @@ def test_checkpoint_save_and_load_roundtrip(tmp_path):
     fresh = ChesskersScorer()
     fresh.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     pos = torch.zeros(1, 14, 8, 8)
-    mv = torch.zeros(1, 140)
+    mv = torch.zeros(1, MOVE_D)
     with torch.no_grad():
         a_logits, a_value = model.policy_and_value(pos, mv)
         b_logits, b_value = fresh.policy_and_value(pos, mv)

@@ -20,6 +20,7 @@ from chessckers_engine.encoding import (
     MV_DEPLOY_COUNT,
     MV_ORTHO,
     MV_PROMO_BASE,
+    MV_WAYPOINT_BASE,
     POS_C,
     encode_move,
     encode_position,
@@ -191,6 +192,30 @@ def test_move_chain_sets_chain_flag_and_length():
     v = encode_move(_bare_move(waypoints=["g5", "h4"], capture="g5"))
     assert v[MV_CHAIN].item() == 1.0
     assert abs(v[MV_CHAIN_LEN].item() - 2 / 8) < 1e-6
+
+
+def test_chain_waypoint_mask_distinguishes_paths_with_same_endpoints():
+    """Two chains a8→a4 that share endpoints but visit different squares
+    must encode to different vectors. Without the waypoint mask the policy
+    head can't tell them apart and trains on contradictory targets."""
+    m1 = {"from": "a8", "to": "a4", "uci": "a8a4", "waypoints": ["b7", "c6", "b5"]}
+    m2 = {"from": "a8", "to": "a4", "uci": "a8a4", "waypoints": ["b7", "a6", "b5"]}
+    via_diag = encode_move(m1)
+    via_other = encode_move(m2)
+    diff = (via_diag != via_other).nonzero().flatten().tolist()
+    # m1 has c6 set but not a6, m2 has a6 set but not c6 → exactly 2 differing bits.
+    assert len(diff) == 2
+    assert all(MV_WAYPOINT_BASE <= b < MV_WAYPOINT_BASE + 100 for b in diff)
+
+
+def test_chain_waypoint_mask_includes_rim_squares():
+    """A chain that hops over a rim square (e.g. 'z6') sets a bit in the
+    waypoint mask. Rim landings are legal post-no-bounce, and they're
+    often the distinguishing feature between two chain paths."""
+    m = {"from": "b8", "to": "b6", "uci": "b8b6", "waypoints": ["a7", "z6", "a5"]}
+    v = encode_move(m)
+    # 'z6' → file10=0, rank10=6 → offset 60 of the 100-bit region.
+    assert v[MV_WAYPOINT_BASE + 60].item() == 1.0
 
 
 def test_move_deploy_sets_deploy_flag_and_count():

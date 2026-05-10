@@ -20,17 +20,24 @@ Squares use (file, rank) → tensor index (rank, file). Internal y axis runs
 0 (rank 1) to 7 (rank 8); FEN ranks are read top-to-bottom, so FEN's first
 rank string corresponds to y = 7.
 
-Move feature vector: shape (140,), dtype float32:
-   bits  0..63   from_square one-hot
-   bits 64..127  to_square one-hot
-   bit  128      is_capture
-   bit  129      is_chain         (waypoints non-empty)
-   bit  130      is_deploy        (deployCount set)
-   bit  131      is_ortho         (demotionsRequired set)
-   bit  132      chain_length / 8
-   bit  133      deploy_count / 24
-   bit  134      demotions_required / 8
-   bits 135..139 promotion one-hot over (none, q, r, b, n)
+Move feature vector: shape (240,), dtype float32:
+   bits   0..63   from_square one-hot
+   bits  64..127  to_square one-hot
+   bit  128       is_capture
+   bit  129       is_chain         (waypoints non-empty)
+   bit  130       is_deploy        (deployCount set)
+   bit  131       is_ortho         (demotionsRequired set)
+   bit  132       chain_length / 8
+   bit  133       deploy_count / 24
+   bit  134       demotions_required / 8
+   bits 135..139  promotion one-hot over (none, q, r, b, n)
+   bits 140..239  waypoint mask over the 10×10 grid (board + 1-square rim).
+                  Index = rank10 * 10 + file10, where file10 maps
+                  'z'→0, 'a'→1 ... 'h'→8, 'i'→9 and rank10 maps
+                  '0'→0, '1'→1 ... '9'→9. Lets the policy distinguish two
+                  chains with identical from→to but different intermediate
+                  landings (including rim-square hops, which are common
+                  diagonal-capture waypoints).
 """
 
 from __future__ import annotations
@@ -41,7 +48,7 @@ from typing import Any
 import torch
 
 POS_C = 14
-MOVE_D = 140
+MOVE_D = 240
 
 # Position channel indices
 CH_W_PAWN, CH_W_KNIGHT, CH_W_BISHOP, CH_W_ROOK, CH_W_QUEEN, CH_W_KING = range(6)
@@ -69,7 +76,14 @@ MV_CHAIN_LEN = 132
 MV_DEPLOY_COUNT = 133
 MV_DEMOTIONS_REQ = 134
 MV_PROMO_BASE = 135  # 5 entries: none, q, r, b, n
+MV_WAYPOINT_BASE = 140  # 100 bits over the 10×10 grid (board + rim)
 _PROMO_INDEX = {None: 0, "q": 1, "r": 2, "b": 3, "n": 4}
+
+# 10×10 grid char → 0..9 maps. Files: 'z' (rim) = 0, 'a'..'h' = 1..8, 'i' (rim) = 9.
+# Ranks: '0' (rim) = 0, '1'..'8' = 1..8, '9' (rim) = 9. See moves_black.py
+# `_coord_to_key` for the producing convention.
+_FILE10 = {"z": 0, "a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7, "h": 8, "i": 9}
+_RANK10 = {str(i): i for i in range(10)}
 
 _FEN_HEAD = re.compile(r"^([^\s\[]+)(?:\[([^\]]*)\])?\s+([wb])\b")
 
@@ -208,7 +222,7 @@ def encode_position_state(state: Any) -> torch.Tensor:
 
 
 def encode_move(move: dict[str, Any]) -> torch.Tensor:
-    """Encode a LegalMove dict (as returned by the API) as a (140,) float32 vector."""
+    """Encode a LegalMove dict (as returned by the API) as a (MOVE_D,) float32 vector."""
     out = torch.zeros(MOVE_D, dtype=torch.float32)
     out[square_index(move["from"])] = 1.0
     out[64 + square_index(move["to"])] = 1.0
@@ -229,4 +243,17 @@ def encode_move(move: dict[str, Any]) -> torch.Tensor:
 
     promo = move.get("promotion")
     out[MV_PROMO_BASE + _PROMO_INDEX.get(promo, 0)] = 1.0
+
+    # Waypoint mask over the 10×10 grid. Two distinct chain paths from the
+    # same from→to pair have different waypoint sets (whether on-board or
+    # rim), so they encode to different vectors — without this, the policy
+    # head can't tell them apart and gets contradictory training labels.
+    for w in waypoints:
+        if len(w) != 2:
+            continue
+        f10 = _FILE10.get(w[0])
+        r10 = _RANK10.get(w[1])
+        if f10 is None or r10 is None:
+            continue
+        out[MV_WAYPOINT_BASE + r10 * 10 + f10] = 1.0
     return out
