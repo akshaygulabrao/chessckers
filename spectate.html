@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Chessckers — game viewer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #1a1a2e; color: #eee; min-height: 100vh; padding: 20px;
+    display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 20px;
+    max-width: 1100px; margin: 0 auto;
+  }
+  h1 { font-size: 1.4em; margin-bottom: 4px; }
+  .subtitle { color: #888; font-size: 0.85em; margin-bottom: 14px; }
+  #board { width: min(70vw, 640px); aspect-ratio: 1; }
+  rect.light { fill: #efdfb6; }
+  rect.dark { fill: #b1855e; }
+  rect.last-move { stroke: #ffeb3b; stroke-width: 2.5; }
+  .file-label, .rank-label {
+    font-size: 9px; fill: #5a4a3a; pointer-events: none;
+    font-family: -apple-system, sans-serif;
+  }
+  .stack-badge {
+    font-family: -apple-system, sans-serif; font-weight: bold;
+    fill: #e63946; stroke: #000; stroke-width: 0.6;
+  }
+  #controls { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button { padding: 7px 14px; border: 1px solid #2a3358; border-radius: 5px;
+           background: #16213e; color: #eee; cursor: pointer; font-size: 0.9em; }
+  button:hover { background: #1f2d54; }
+  button.primary { background: #2a6f4a; border-color: #2a6f4a; }
+  button.primary:hover { background: #348a5a; }
+  input[type="range"] { flex: 1; min-width: 200px; }
+  .panel { background: #16213e; border: 1px solid #2a3358; border-radius: 6px;
+           padding: 12px; margin-bottom: 12px; }
+  .panel h2 { font-size: 0.95em; margin-bottom: 8px; color: #aaa; }
+  .row { display: flex; justify-content: space-between; padding: 3px 0;
+         font-size: 0.85em; border-bottom: 1px solid #1f2d54; }
+  .row:last-child { border: none; }
+  .k { color: #888; } .v { color: #eee; font-weight: 500; }
+  .v.white { color: #fce4a8; } .v.black { color: #ff6b6b; } .v.draw { color: #aaa; }
+  select { width: 100%; padding: 6px; background: #0f1626; color: #eee;
+           border: 1px solid #2a3358; border-radius: 4px; font-size: 0.85em; }
+  code { background: #0f1626; padding: 1px 6px; border-radius: 3px; font-size: 0.85em; }
+</style>
+</head>
+<body>
+  <div>
+    <h1>Chessckers — game viewer</h1>
+    <div class="subtitle">4 game(s) — weights=runs/local-001/weights.pt, sims=200, temp=0.5</div>
+    <svg id="board" viewBox="0 0 800 800"></svg>
+    <div id="controls">
+      <button id="prev-game">← prev game</button>
+      <button id="next-game">next game →</button>
+      <button id="restart">⟲</button>
+      <button id="prev-ply">◀</button>
+      <button id="play-pause" class="primary">▶ play</button>
+      <button id="next-ply">▶</button>
+      <input id="ply-slider" type="range" min="0" max="0" value="0" />
+    </div>
+  </div>
+  <aside>
+    <div class="panel">
+      <h2>game</h2>
+      <select id="game-select"></select>
+      <div class="row" style="margin-top:8px"><span class="k">outcome</span><span class="v" id="outcome">—</span></div>
+      <div class="row"><span class="k">ply</span><span class="v" id="ply">0 / 0</span></div>
+      <div class="row"><span class="k">turn</span><span class="v" id="turn">—</span></div>
+      <div class="row"><span class="k">last move</span><span class="v"><code id="last-uci">—</code></span></div>
+    </div>
+    <div class="panel">
+      <h2>about</h2>
+      <div class="row"><span class="k">white pieces</span><span class="v">PNBRQK glyphs</span></div>
+      <div class="row"><span class="k">black stones</span><span class="v" style="color:#e63946">⬤ disk</span></div>
+      <div class="row"><span class="k">black kings</span><span class="v" style="color:#e63946">♛</span></div>
+      <div class="row"><span class="k">stack height</span><span class="v">red badge bottom-right</span></div>
+    </div>
+  </aside>
+<script>
+  const GAMES = [{"history": [{"fen": "pppppppp/kkkkkkkk/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQkq - 0 1", "uci": "f2f3"}, {"fen": "pppppppp/kkkkkkkk/pppppppp/8/8/5P2/PPPPP1PP/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] b KQ - 0 1", "uci": "b7c7"}, {"fen": "pppppppp/k1pkkkkk/pppppppp/8/8/5P2/PPPPP1PP/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,c7:kS,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQ - 0 1", "uci": "d2d4"}, {"fen": "pppppppp/k1pkkkkk/pppppppp/8/3P4/5P2/PPP1P1PP/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,c7:kS,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] b KQ - 0 1", "uci": "c7d6"}, {"fen": "pppppppp/k2kkkkk/pppppppp/8/3P4/5P2/PPP1P1PP/RNBQKBNR[a6:s,b6:s,c6:s,d6:skS,e6:s,f6:s,g6:s,h6:s,a7:k,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQ - 0 1", "uci": "d1d2"}, {"fen": "pppppppp/k2kkkkk/pppppppp/8/3P4/5P2/PPPQP1PP/RNB1KBNR[a6:s,b6:s,c6:s,d6:skS,e6:s,f6:s,g6:s,h6:s,a7:k,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] b KQ - 1 1", "uci": "e7f7"}, {"fen": "pppppppp/k2k1pkk/pppppppp/8/3P4/5P2/PPPQP1PP/RNB1KBNR[a6:s,b6:s,c6:s,d6:skS,e6:s,f6:s,g6:s,h6:s,a7:k,d7:k,f7:kS,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQ - 1 1", "uci": "b1c3"}, {"fen": "pppppppp/k2k1pkk/pppppppp/8/3P4/2N2P2/PPPQP1PP/R1B1KBNR[a6:s,b6:s,c6:s,d6:skS,e6:s,f6:s,g6:s,h6:s,a7:k,d7:k,f7:kS,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] b KQ - 2 1", "uci": "f7e6"}, {"fen": "pppppppp/k2k2kk/pppppppp/8/3P4/2N2P2/PPPQP1PP/R1B1KBNR[a6:s,b6:s,c6:s,d6:skS,e6:skS,f6:s,g6:s,h6:s,a7:k,d7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQ - 2 1", "uci": "g2g3"}, {"fen": "pppppppp/k2k2kk/pppppppp/8/3P4/2N2PP1/PPPQP2P/R1B1KBNR[a6:s,b6:s,c6:s,d6:skS,e6:skS,f6:s,g6:s,h6:s,a7:k,d7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] b KQ - 0 1", "uci": "e6d5[2]"}, {"fen": "pppppppp/k2k2kk/pppppppp/3p4/3P4/2N2PP1/PPPQP2P/R1B1KBNR[d5:kS,a6:s,b6:s,c6:s,d6:skS,e6:s,f6:s,g6:s,h6:s,a7:k,d7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQ - 0 1", "uci": "e1d1"}, {"fen": "pppppppp/k2k2kk/pppppppp/3p4/3P4/2N2PP1/PPPQP2P/R1BK1BNR[d5:kS,a6:s,b6:s,c6:s,d6:skS,e6:s,f6:s,g6:s,h6:s,a7:k,d7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] b - - 1 1", "uci": "d8e7"}, {"fen": "ppp1pppp/k2kp1kk/pppppppp/3p4/3P4/2N2PP1/PPPQP2P/R1BK1BNR[d5:kS,a6:s,b6:s,c6:s,d6:skS,e6:s,f6:s,g6:s,h6:s,a7:k,d7:k,e7:s,g7:k,h7:k,a8:s,b8:s,c8:s,e8:s,f8:s,g8:s,h8:s] w - - 1 1", "uci": "f3f4"}, {"fen": "ppp1pppp/k2kp1kk/pppppppp/3p4/3P1P2/2N3P1/PPPQP2P/R1BK1BNR[d5:kS,a6:s,b6:s,c6:s,d6:skS,e6:s,f6:s,g6:s,h6:s,a7:k,d7:k,e7:s,g7:k,h7:k,a8:s,b8:s,c8:s,e8:s,f8:s,g8:s,h8:s] b - - 0 1", "uci": "a7b8"}, {"fen": "pkp1pppp/3kp1kk/pppppppp/3p4/3P1P2/2N3P1/PPPQP2P/R1BK1BNR[d5:kS,a6:s,b6:s,c6:s,d6:skS,e6:s,f6:s,g6:s,h6:s,d7:k,e7:s,g7:k,h7:k,a8:s,b8:sk,c8:s,e8:s,f8:s,g8:s,h8:s] w - - 0 1", "uci": "b2b3"}, {"fen": "pkp1pppp/3kp1kk/pppppppp/3p4/3P1P2/1PN3P1/P1PQP2P/R1BK1BNR[d5:kS,a6:s,b6:s,c6:s,d6:skS,e6:s,f6:s,g6:s,h6:s,d7:k,e7:s,g7:k,h7:k,a8:s,b8:sk,c8:s,e8:s,f8:s,g8:s,h8:s] b - - 0 1", "uci": "d5e4"}, {"fen": "pkp1pppp/3kp1kk/pppppppp/8/3PpP2/1PN3P1/P1PQP2P/R1BK1BNR[e4:kS,a6:s,b6:s,c6:s,d6:skS,e6:s,f6:s,g6:s,h6:s,d7:k,e7:s,g7:k,h7:k,a8:s,b8:sk,c8:s,e8:s,f8:s,g8:s,h8:s] w - - 0 1", "uci": "c1a3"}, {"fen": "pkp1pppp/3kp1kk/pppppppp/8/3PpP2/BPN3P1/P1PQP2P/R2K1BNR[e4:kS,a6:s,b6:s,c6:s,d6:skS,e6:s,f6:s,g6:s,h6:s,d7:k,e7:s,g7:k,h7:k,a8:s,b8:sk,c8:s,e8:s,f8:s,g8:s,h8:s] b - - 1 1", "uci": "d6g3"}, {"fen": "pkp1pppp/3kp1kk/ppp1pppp/8/3Pp3/BPN3P1/P1PQP2P/R2K1BNR[e4:kS,a6:s,b6:s,c6:s,e6:s,f6:s,g6:s,h6:s,d7:k,e7:s,g7:k,h7:k,a8:s,b8:sk,c8:s,e8:s,f8:s,g8:s,h8:s] w - - 1 1", "uci": "a3c5"}, {"fen": "pkp1pppp/3kp1kk/ppp1pppp/2B5/3Pp3/1PN3P1/P1PQP2P/R2K1BNR[e4:kS,a6:s,b6:s,c6:s,e6:s,f6:s,g6:s,h6:s,d7:k,e7:s,g7:k,h7:k,a8:s,b8:sk,c8:s,e8:s,f8:s,g8:s,h8:s] b - - 2 1", "uci": "f8g7"}, {"fen": "pkp1p1pp/3kp1pk/ppp1pppp/2B5/3Pp3/1PN3P1/P1PQP2P/R2K1BNR[e4:kS,a6:s,b6:s,c6:s,e6:s,f6:s,g6:s,h6:s,d7:k,e7:s,g7:ks,h7:k,a8:s,b8:sk,c8:s,e8:s,g8:s,h8:s] w - - 2 1", "uci": "b3b4"}, {"fen": "pkp1p1pp/3kp1pk/ppp1pppp/2B5/1P1Pp3/2N3P1/P1PQP2P/R2K1BNR[e4:kS,a6:s,b6:s,c6:s,e6:s,f6:s,g6:s,h6:s,d7:k,e7:s,g7:ks,h7:k,a8:s,b8:sk,c8:s,e8:s,g8:s,h8:s] b - - 0 1", "uci": "h8g7"}, {"fen": "pkp1p1p1/3kp1pk/ppp1pppp/2B5/1P1Pp3/2N3P1/P1PQP2P/R2K1BNR[e4:kS,a6:s,b6:s,c6:s,e6:s,f6:s,g6:s,h6:s,d7:k,e7:s,g7:kss,h7:k,a8:s,b8:sk,c8:s,e8:s,g8:s] w - - 0 1", "uci": "d2e1"}, {"fen": "pkp1p1p1/3kp1pk/ppp1pppp/2B5/1P1Pp3/2N3P1/P1P1P2P/R2KQBNR[e4:kS,a6:s,b6:s,c6:s,e6:s,f6:s,g6:s,h6:s,d7:k,e7:s,g7:kss,h7:k,a8:s,b8:sk,c8:s,e8:s,g8:s] b - - 1 1", "uci": "b8c7[1]"}, {"fen": "ppp1p1p1/2kkp1pk/ppp1pppp/2B5/1P1Pp3/2N3P1/P1P1P2P/R2KQBNR[e4:kS,a6:s,b6:s,c6:s,e6:s,f6:s,g6:s,h6:s,c7:k,d7:k,e7:s,g7:kss,h7:k,a8:s,b8:s,c8:s,e8:s,g8:s] w - - 1 1", "uci": "c5e7"}, {"fen": "ppp1p1p1/2kkB1pk/ppp1pppp/8/1P1Pp3/2N3P1/P1P1P2P/R2KQBNR[e4:kS,a6:s,b6:s,c6:s,e6:s,f6:s,g6:s,h6:s,c7:k,d7:k,g7:kss,h7:k,a8:s,b8:s,c8:s,e8:s,g8:s] b - - 0 1", "uci": "g8h7"}, {"fen": "ppp1p3/2kkB1pp/ppp1pppp/8/1P1Pp3/2N3P1/P1P1P2P/R2KQBNR[e4:kS,a6:s,b6:s,c6:s,e6:s,f6:s,g6:s,h6:s,c7:k,d7:k,g7:kss,h7:ks,a8:s,b8:s,c8:s,e8:s] w - - 0 1", "uci": "b4b5"}, {"fen": "ppp1p3/2kkB1pp/ppp1pppp/1P6/3Pp3/2N3P1/P1P1P2P/R2KQBNR[e4:kS,a6:s,b6:s,c6:s,e6:s,f6:s,g6:s,h6:s,c7:k,d7:k,g7:kss,h7:ks,a8:s,b8:s,c8:s,e8:s] b - - 0 1", "uci": "e4c2"}, {"fen": "ppp1p3/2kkB1pp/ppp1pppp/1P6/3P4/2N3P1/P1P1P2P/R2KQBNR[a6:s,b6:s,c6:s,e6:s,f6:s,g6:s,h6:s,c7:k,d7:k,g7:kss,h7:ks,a8:s,b8:s,c8:s,e8:s] w - - 0 1", "uci": "e7f6"}, {"fen": "ppp1p3/2kk2pp/ppp1pBpp/1P6/3P4/2N3P1/P1P1P2P/R2KQBNR[a6:s,b6:s,c6:s,e6:s,g6:s,h6:s,c7:k,d7:k,g7:kss,h7:ks,a8:s,b8:s,c8:s,e8:s] b - - 0 1", "uci": "c6a4"}, {"fen": "ppp1p3/2kk2pp/pp2pBpp/8/p2P4/2N3P1/P1P1P2P/R2KQBNR[a4:s,a6:s,b6:s,e6:s,g6:s,h6:s,c7:k,d7:k,g7:kss,h7:ks,a8:s,b8:s,c8:s,e8:s] w - - 0 1", "uci": "c3a4"}, {"fen": "ppp1p3/2kk2pp/pp2pBpp/8/N2P4/6P1/P1P1P2P/R2KQBNR[a6:s,b6:s,e6:s,g6:s,h6:s,c7:k,d7:k,g7:kss,h7:ks,a8:s,b8:s,c8:s,e8:s] b - - 0 1", "uci": "g7~f6~e5~d4~c3~b2~a1~z0~a1~a1"}, {"fen": "ppp1p3/2kk3p/pp2p1pp/8/N7/6P1/P1P1P2P/k2KQBNR[a1:kkk,a6:s,b6:s,e6:s,g6:s,h6:s,c7:k,d7:k,h7:ks,a8:s,b8:s,c8:s,e8:s] w - - 0 1", "uci": "e1b4"}, {"fen": "ppp1p3/2kk3p/pp2p1pp/8/NQ6/6P1/P1P1P2P/k2K1BNR[a1:kkk,a6:s,b6:s,e6:s,g6:s,h6:s,c7:k,d7:k,h7:ks,a8:s,b8:s,c8:s,e8:s] b - - 1 1", "uci": "h6g5"}, {"fen": "ppp1p3/2kk3p/pp2p1p1/6p1/NQ6/6P1/P1P1P2P/k2K1BNR[a1:kkk,g5:s,a6:s,b6:s,e6:s,g6:s,c7:k,d7:k,h7:ks,a8:s,b8:s,c8:s,e8:s] w - - 1 1", "uci": "c2c4"}, {"fen": "ppp1p3/2kk3p/pp2p1p1/6p1/NQP5/6P1/P3P2P/k2K1BNR[a1:kkk,g5:s,a6:s,b6:s,e6:s,g6:s,c7:k,d7:k,h7:ks,a8:s,b8:s,c8:s,e8:s] b - - 0 1", "uci": "d7e7"}, {"fen": "ppp1p3/2k1p2p/pp2p1p1/6p1/NQP5/6P1/P3P2P/k2K1BNR[a1:kkk,g5:s,a6:s,b6:s,e6:s,g6:s,c7:k,e7:S,h7:ks,a8:s,b8:s,c8:s,e8:s] w - - 0 1", "uci": "b4e7"}, {"fen": "ppp1p3/2k1Q2p/pp2p1p1/6p1/N1P5/6P1/P3P2P/k2K1BNR[a1:kkk,g5:s,a6:s,b6:s,e6:s,g6:s,c7:k,h7:ks,a8:s,b8:s,c8:s,e8:s] b - - 0 1", "uci": "e6f5"}, {"fen": "ppp1p3/2k1Q2p/pp4p1/5pp1/N1P5/6P1/P3P2P/k2K1BNR[a1:kkk,f5:s,g5:s,a6:s,b6:s,g6:s,c7:k,h7:ks,a8:s,b8:s,c8:s,e8:s] w - - 0 1", "uci": "a4c3"}, {"fen": "ppp1p3/2k1Q2p/pp4p1/5pp1/2P5/2N3P1/P3P2P/k2K1BNR[a1:kkk,f5:s,g5:s,a6:s,b6:s,g6:s,c7:k,h7:ks,a8:s,b8:s,c8:s,e8:s] b - - 1 1", "uci": "c7d7"}, {"fen": "ppp1p3/3pQ2p/pp4p1/5pp1/2P5/2N3P1/P3P2P/k2K1BNR[a1:kkk,f5:s,g5:s,a6:s,b6:s,g6:s,d7:S,h7:ks,a8:s,b8:s,c8:s,e8:s] w - - 1 1", "uci": "e7e4"}, {"fen": "ppp1p3/3p3p/pp4p1/5pp1/2P1Q3/2N3P1/P3P2P/k2K1BNR[a1:kkk,f5:s,g5:s,a6:s,b6:s,g6:s,d7:S,h7:ks,a8:s,b8:s,c8:s,e8:s] b - - 2 1", "uci": "a1a3{1,2}"}, {"fen": "ppp1p3/3p3p/pp4p1/5pp1/2P1Q3/k1N3P1/4P2P/3K1BNR[a3:SSk,f5:s,g5:s,a6:s,b6:s,g6:s,d7:S,h7:ks,a8:s,b8:s,c8:s,e8:s] w - - 2 1", "uci": "e4a8"}, {"fen": "Qpp1p3/3p3p/pp4p1/5pp1/2P5/k1N3P1/4P2P/3K1BNR[a3:SSk,f5:s,g5:s,a6:s,b6:s,g6:s,d7:S,h7:ks,b8:s,c8:s,e8:s] b - - 0 1", "uci": "f5e4"}, {"fen": "Qpp1p3/3p3p/pp4p1/6p1/2P1p3/k1N3P1/4P2P/3K1BNR[a3:SSk,e4:s,g5:s,a6:s,b6:s,g6:s,d7:S,h7:ks,b8:s,c8:s,e8:s] w - - 0 1", "uci": "e2e3"}, {"fen": "Qpp1p3/3p3p/pp4p1/6p1/2P1p3/k1N1P1P1/7P/3K1BNR[a3:SSk,e4:s,g5:s,a6:s,b6:s,g6:s,d7:S,h7:ks,b8:s,c8:s,e8:s] b - - 0 1", "uci": "h7g6[1]"}, {"fen": "Qpp1p3/3p3k/pp4p1/6p1/2P1p3/k1N1P1P1/7P/3K1BNR[a3:SSk,e4:s,g5:s,a6:s,b6:s,g6:ss,d7:S,h7:k,b8:s,c8:s,e8:s] w - - 0 1", "uci": "c3d5"}, {"fen": "Qpp1p3/3p3k/pp4p1/3N2p1/2P1p3/k3P1P1/7P/3K1BNR[a3:SSk,e4:s,g5:s,a6:s,b6:s,g6:ss,d7:S,h7:k,b8:s,c8:s,e8:s] b - - 1 1", "uci": "b8d6"}, {"fen": "Q1p1p3/3p3k/pp1p2p1/3N2p1/2P1p3/k3P1P1/7P/3K1BNR[a3:SSk,e4:s,g5:s,a6:s,b6:s,d6:S,g6:ss,d7:S,h7:k,c8:s,e8:s] w - - 1 1", "uci": "d5f6"}, {"fen": "Q1p1p3/3p3k/pp1p1Np1/6p1/2P1p3/k3P1P1/7P/3K1BNR[a3:SSk,e4:s,g5:s,a6:s,b6:s,d6:S,g6:ss,d7:S,h7:k,c8:s,e8:s] b - - 2 1", "uci": "a3c5"}, {"fen": "Q1p1p3/3p3k/pp1p1Np1/2k3p1/2P1p3/4P1P1/7P/3K1BNR[e4:s,c5:SSk,g5:s,a6:s,b6:s,d6:S,g6:ss,d7:S,h7:k,c8:s,e8:s] w - - 2 1", "uci": "f6e8"}, {"fen": "Q1p1N3/3p3k/pp1p2p1/2k3p1/2P1p3/4P1P1/7P/3K1BNR[e4:s,c5:SSk,g5:s,a6:s,b6:s,d6:S,g6:ss,d7:S,h7:k,c8:s] b - - 0 1", "uci": "h7h6"}, {"fen": "Q1p1N3/3p4/pp1p2pp/2k3p1/2P1p3/4P1P1/7P/3K1BNR[e4:s,c5:SSk,g5:s,a6:s,b6:s,d6:S,g6:ss,h6:S,d7:S,c8:s] w - - 0 1", "uci": "a8a6"}, {"fen": "2p1N3/3p4/Qp1p2pp/2k3p1/2P1p3/4P1P1/7P/3K1BNR[e4:s,c5:SSk,g5:s,b6:s,d6:S,g6:ss,h6:S,d7:S,c8:s] b - - 0 1", "uci": "c5a3"}, {"fen": "2p1N3/3p4/Qp1p2pp/6p1/2P1p3/k3P1P1/7P/3K1BNR[a3:SSk,e4:s,g5:s,b6:s,d6:S,g6:ss,h6:S,d7:S,c8:s] w - - 0 1", "uci": "h2h4"}, {"fen": "2p1N3/3p4/Qp1p2pp/6p1/2P1p2P/k3P1P1/8/3K1BNR[a3:SSk,e4:s,g5:s,b6:s,d6:S,g6:ss,h6:S,d7:S,c8:s] b - - 0 1", "uci": "a3c5[2]"}, {"fen": "2p1N3/3p4/Qp1p2pp/2k3p1/2P1p2P/p3P1P1/8/3K1BNR[a3:S,e4:s,c5:Sk,g5:s,b6:s,d6:S,g6:ss,h6:S,d7:S,c8:s] w - - 0 1", "uci": "g1h3"}, {"fen": "2p1N3/3p4/Qp1p2pp/2k3p1/2P1p2P/p3P1PN/8/3K1B1R[a3:S,e4:s,c5:Sk,g5:s,b6:s,d6:S,g6:ss,h6:S,d7:S,c8:s] b - - 1 1", "uci": "b6c5"}, {"fen": "2p1N3/3p4/Q2p2pp/2p3p1/2P1p2P/p3P1PN/8/3K1B1R[a3:S,e4:s,c5:Sks,g5:s,d6:S,g6:ss,h6:S,d7:S,c8:s] w - - 1 1", "uci": "d1c2"}, {"fen": "2p1N3/3p4/Q2p2pp/2p3p1/2P1p2P/p3P1PN/2K5/5B1R[a3:S,e4:s,c5:Sks,g5:s,d6:S,g6:ss,h6:S,d7:S,c8:s] b - - 2 1", "uci": "c5a3"}, {"fen": "2p1N3/3p4/Q2p2pp/6p1/2P1p2P/p3P1PN/2K5/5B1R[a3:SSks,e4:s,g5:s,d6:S,g6:ss,h6:S,d7:S,c8:s] w - - 2 1", "uci": "e8d6"}, {"fen": "2p5/3p4/Q2N2pp/6p1/2P1p2P/p3P1PN/2K5/5B1R[a3:SSks,e4:s,g5:s,g6:ss,h6:S,d7:S,c8:s] b - - 0 1", "uci": "a3c1[3]"}, {"fen": "2p5/3p4/Q2N2pp/6p1/2P1p2P/p3P1PN/2K5/2p2B1R[c1:Sks,a3:S,e4:s,g5:s,g6:ss,h6:S,d7:S,c8:s] w - - 0 1", "uci": "c4c5"}, {"fen": "2p5/3p4/Q2N2pp/2P3p1/4p2P/p3P1PN/2K5/2p2B1R[c1:Sks,a3:S,e4:s,g5:s,g6:ss,h6:S,d7:S,c8:s] b - - 0 1", "uci": "e4f3"}, {"fen": "2p5/3p4/Q2N2pp/2P3p1/7P/p3PpPN/2K5/2p2B1R[c1:Sks,a3:S,f3:s,g5:s,g6:ss,h6:S,d7:S,c8:s] w - - 0 1", "uci": "c2c3"}, {"fen": "2p5/3p4/Q2N2pp/2P3p1/7P/p1K1PpPN/8/2p2B1R[c1:Sks,a3:S,f3:s,g5:s,g6:ss,h6:S,d7:S,c8:s] b - - 1 1", "uci": "d7e6"}, {"fen": "2p5/8/Q2Np1pp/2P3p1/7P/p1K1PpPN/8/2p2B1R[c1:Sks,a3:S,f3:s,g5:s,e6:S,g6:ss,h6:S,c8:s] w - - 1 1", "uci": "h1g1"}, {"fen": "2p5/8/Q2Np1pp/2P3p1/7P/p1K1PpPN/8/2p2BR1[c1:Sks,a3:S,f3:s,g5:s,e6:S,g6:ss,h6:S,c8:s] b - - 2 1", "uci": "a3b2"}, {"fen": "2p5/8/Q2Np1pp/2P3p1/7P/2K1PpPN/1p6/2p2BR1[c1:Sks,b2:S,f3:s,g5:s,e6:S,g6:ss,h6:S,c8:s] w - - 2 1", "uci": "a6c4"}, {"fen": "2p5/8/3Np1pp/2P3p1/2Q4P/2K1PpPN/1p6/2p2BR1[c1:Sks,b2:S,f3:s,g5:s,e6:S,g6:ss,h6:S,c8:s] b - - 3 1", "uci": "g6e4"}, {"fen": "2p5/8/3Np2p/2P3p1/2Q1p2P/2K1PpPN/1p6/2p2BR1[c1:Sks,b2:S,f3:s,e4:ss,g5:s,e6:S,h6:S,c8:s] w - - 3 1", "uci": "d6c8"}, {"fen": "2N5/8/4p2p/2P3p1/2Q1p2P/2K1PpPN/1p6/2p2BR1[c1:Sks,b2:S,f3:s,e4:ss,g5:s,e6:S,h6:S] b - - 0 1", "uci": "g5h4"}, {"fen": "2N5/8/4p2p/2P5/2Q1p2p/2K1PpPN/1p6/2p2BR1[c1:Sks,b2:S,f3:s,e4:ss,h4:s,e6:S,h6:S] w - - 0 1", "uci": "c8a7"}, {"fen": "8/N7/4p2p/2P5/2Q1p2p/2K1PpPN/1p6/2p2BR1[c1:Sks,b2:S,f3:s,e4:ss,h4:s,e6:S,h6:S] b - - 1 1", "uci": "h4~g3~f2~g1~h0~g1"}, {"fen": "8/N7/4p2p/2P5/2Q1p3/2K1Pp1N/1p6/2p2Bk1[c1:Sks,g1:k,b2:S,f3:s,e4:ss,e6:S,h6:S] w - - 1 1", "uci": "c4b5"}, {"fen": "8/N7/4p2p/1QP5/4p3/2K1Pp1N/1p6/2p2Bk1[c1:Sks,g1:k,b2:S,f3:s,e4:ss,e6:S,h6:S] b - - 2 1", "uci": "e4f3"}, {"fen": "8/N7/4p2p/1QP5/8/2K1Pp1N/1p6/2p2Bk1[c1:Sks,g1:k,b2:S,f3:sss,e6:S,h6:S] w - - 2 1", "uci": "h3f2"}, {"fen": "8/N7/4p2p/1QP5/8/2K1Pp2/1p3N2/2p2Bk1[c1:Sks,g1:k,b2:S,f3:sss,e6:S,h6:S] b - - 3 1", "uci": "g1h1"}, {"fen": "8/N7/4p2p/1QP5/8/2K1Pp2/1p3N2/2p2B1p[c1:Sks,h1:S,b2:S,f3:sss,e6:S,h6:S] w - - 3 1", "uci": "a7c8"}, {"fen": "2N5/8/4p2p/1QP5/8/2K1Pp2/1p3N2/2p2B1p[c1:Sks,h1:S,b2:S,f3:sss,e6:S,h6:S] b - - 4 1", "uci": "f3g2"}, {"fen": "2N5/8/4p2p/1QP5/8/2K1P3/1p3Np1/2p2B1p[c1:Sks,h1:S,b2:S,g2:sss,e6:S,h6:S] w - - 4 1", "uci": "b5e8"}, {"fen": "2N1Q3/8/4p2p/2P5/8/2K1P3/1p3Np1/2p2B1p[c1:Sks,h1:S,b2:S,g2:sss,e6:S,h6:S] b - - 5 1", "uci": "g2f1"}, {"fen": "2N1Q3/8/4p2p/2P5/8/2K1P3/1p3N2/2p2k1p[c1:Sks,f1:kkk,h1:S,b2:S,e6:S,h6:S] w - - 5 1", "uci": "f2e4"}, {"fen": "2N1Q3/8/4p2p/2P5/4N3/2K1P3/1p6/2p2k1p[c1:Sks,f1:kkk,h1:S,b2:S,e6:S,h6:S] b - - 6 1", "uci": "f1g1{1}"}, {"fen": "2N1Q3/8/4p2p/2P5/4N3/2K1P3/1p6/2p3kp[c1:Sks,g1:Skk,h1:S,b2:S,e6:S,h6:S] w - - 6 1", "uci": "c3b2"}, {"fen": "2N1Q3/8/4p2p/2P5/4N3/4P3/1K6/2p3kp[c1:Sks,g1:Skk,h1:S,e6:S,h6:S] b - - 0 1", "uci": "g1f1{3}"}, {"fen": "2N1Q3/8/4p2p/2P5/4N3/4P3/1K6/2p2p1p[c1:Sks,f1:SkS,h1:S,e6:S,h6:S] w - - 0 1", "uci": "b2a3"}, {"fen": "2N1Q3/8/4p2p/2P5/4N3/K3P3/8/2p2p1p[c1:Sks,f1:SkS,h1:S,e6:S,h6:S] b - - 1 1", "uci": "e6d5"}, {"fen": "2N1Q3/8/7p/2Pp4/4N3/K3P3/8/2p2p1p[c1:Sks,f1:SkS,h1:S,d5:S,h6:S] w - - 1 1", "uci": "c8e7"}, {"fen": "4Q3/4N3/7p/2Pp4/4N3/K3P3/8/2p2p1p[c1:Sks,f1:SkS,h1:S,d5:S,h6:S] b - - 2 1", "uci": "d5e4"}, {"fen": "4Q3/4N3/7p/2P5/4N3/K3P3/8/2p2p1p[c1:Sks,f1:SkS,h1:S,h6:S] w - - 2 1", "uci": "e7c6"}, {"fen": "4Q3/8/2N4p/2P5/4N3/K3P3/8/2p2p1p[c1:Sks,f1:SkS,h1:S,h6:S] b - - 3 1", "uci": "h6g5"}, {"fen": "4Q3/8/2N5/2P3p1/4N3/K3P3/8/2p2p1p[c1:Sks,f1:SkS,h1:S,g5:S] w - - 3 1", "uci": "e4d6"}, {"fen": "4Q3/8/2NN4/2P3p1/8/K3P3/8/2p2p1p[c1:Sks,f1:SkS,h1:S,g5:S] b - - 4 1", "uci": "g5h4"}, {"fen": "4Q3/8/2NN4/2P5/7p/K3P3/8/2p2p1p[c1:Sks,f1:SkS,h1:S,h4:S] w - - 4 1", "uci": "d6b7"}, {"fen": "4Q3/1N6/2N5/2P5/7p/K3P3/8/2p2p1p[c1:Sks,f1:SkS,h1:S,h4:S] b - - 5 1", "uci": "h4g3"}, {"fen": "4Q3/1N6/2N5/2P5/8/K3P1p1/8/2p2p1p[c1:Sks,f1:SkS,h1:S,g3:S] w - - 5 1", "uci": "c6d4"}, {"fen": "4Q3/1N6/8/2P5/3N4/K3P1p1/8/2p2p1p[c1:Sks,f1:SkS,h1:S,g3:S] b - - 6 1", "uci": "g3h2"}, {"fen": "4Q3/1N6/8/2P5/3N4/K3P3/7p/2p2p1p[c1:Sks,f1:SkS,h1:S,h2:S] w - - 6 1", "uci": "e3e4"}, {"fen": "4Q3/1N6/8/2P5/3NP3/K7/7p/2p2p1p[c1:Sks,f1:SkS,h1:S,h2:S] b - - 0 1", "uci": "h2g1"}, {"fen": "4Q3/1N6/8/2P5/3NP3/K7/8/2p2ppp[c1:Sks,f1:SkS,g1:S,h1:S] w - - 0 1", "uci": "a3b3"}], "final_fen": "4Q3/1N6/8/2P5/3NP3/1K6/8/2p2ppp[c1:Sks,f1:SkS,g1:S,h1:S] b - - 1 1", "outcome": "white", "label": "NN(W) vs random(B)"}, {"history": [{"fen": "pppppppp/kkkkkkkk/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQkq - 0 1", "uci": "d2d3"}, {"fen": "pppppppp/kkkkkkkk/pppppppp/8/8/3P4/PPP1PPPP/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] b KQ - 0 1", "uci": "h7g8"}, {"fen": "ppppppkp/kkkkkkk1/pppppppp/8/8/3P4/PPP1PPPP/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:sk,h8:s] w KQ - 0 1", "uci": "g1f3"}, {"fen": "ppppppkp/kkkkkkk1/pppppppp/8/8/3P1N2/PPP1PPPP/RNBQKB1R[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:sk,h8:s] b KQ - 1 1", "uci": "c7b8"}, {"fen": "pkppppkp/kk1kkkk1/pppppppp/8/8/3P1N2/PPP1PPPP/RNBQKB1R[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,d7:k,e7:k,f7:k,g7:k,a8:s,b8:sk,c8:s,d8:s,e8:s,f8:s,g8:sk,h8:s] w KQ - 1 1", "uci": "b2b3"}, {"fen": "pkppppkp/kk1kkkk1/pppppppp/8/8/1P1P1N2/P1P1PPPP/RNBQKB1R[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,d7:k,e7:k,f7:k,g7:k,a8:s,b8:sk,c8:s,d8:s,e8:s,f8:s,g8:sk,h8:s] b KQ - 0 1", "uci": "g7h6"}, {"fen": "pkppppkp/kk1kkk2/pppppppk/8/8/1P1P1N2/P1P1PPPP/RNBQKB1R[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:sk,a7:k,b7:k,d7:k,e7:k,f7:k,a8:s,b8:sk,c8:s,d8:s,e8:s,f8:s,g8:sk,h8:s] w KQ - 0 1", "uci": "f3d4"}, {"fen": "pkppppkp/kk1kkk2/pppppppk/8/3N4/1P1P4/P1P1PPPP/RNBQKB1R[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:sk,a7:k,b7:k,d7:k,e7:k,f7:k,a8:s,b8:sk,c8:s,d8:s,e8:s,f8:s,g8:sk,h8:s] b KQ - 1 1", "uci": "f7f6"}, {"fen": "pkppppkp/kk1kk3/pppppppk/8/3N4/1P1P4/P1P1PPPP/RNBQKB1R[a6:s,b6:s,c6:s,d6:s,e6:s,f6:sS,g6:s,h6:sk,a7:k,b7:k,d7:k,e7:k,a8:s,b8:sk,c8:s,d8:s,e8:s,f8:s,g8:sk,h8:s] w KQ - 1 1", "uci": "b1a3"}, {"fen": "pkppppkp/kk1kk3/pppppppk/8/3N4/NP1P4/P1P1PPPP/R1BQKB1R[a6:s,b6:s,c6:s,d6:s,e6:s,f6:sS,g6:s,h6:sk,a7:k,b7:k,d7:k,e7:k,a8:s,b8:sk,c8:s,d8:s,e8:s,f8:s,g8:sk,h8:s] b KQ - 2 1", "uci": "f6~e5~d4~c3~d2~e1~f0~e1"}], "final_fen": "pkppppkp/kk1kk3/ppppp1pk/8/8/NP1P4/P1P1PPPP/R1BQkB1R[e1:kk,a6:s,b6:s,c6:s,d6:s,e6:s,g6:s,h6:sk,a7:k,b7:k,d7:k,e7:k,a8:s,b8:sk,c8:s,d8:s,e8:s,f8:s,g8:sk,h8:s] w KQ - 2 1", "outcome": "black", "label": "random(W) vs NN(B)"}, {"history": [{"fen": "pppppppp/kkkkkkkk/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQkq - 0 1", "uci": "b1c3"}, {"fen": "pppppppp/kkkkkkkk/pppppppp/8/8/2N5/PPPPPPPP/R1BQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] b KQ - 1 1", "uci": "g7f8"}, {"fen": "pppppkpp/kkkkkk1k/pppppppp/8/8/2N5/PPPPPPPP/R1BQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:sk,g8:s,h8:s] w KQ - 1 1", "uci": "f2f4"}, {"fen": "pppppkpp/kkkkkk1k/pppppppp/8/5P2/2N5/PPPPP1PP/R1BQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:sk,g8:s,h8:s] b KQ - 0 1", "uci": "d7c6"}, {"fen": "pppppkpp/kkk1kk1k/ppkppppp/8/5P2/2N5/PPPPP1PP/R1BQKBNR[a6:s,b6:s,c6:sk,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,e7:k,f7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:sk,g8:s,h8:s] w KQ - 0 1", "uci": "b2b3"}, {"fen": "pppppkpp/kkk1kk1k/ppkppppp/8/5P2/1PN5/P1PPP1PP/R1BQKBNR[a6:s,b6:s,c6:sk,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,e7:k,f7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:sk,g8:s,h8:s] b KQ - 0 1", "uci": "f8h6"}, {"fen": "ppppp1pp/kkk1kk1k/ppkppppk/8/5P2/1PN5/P1PPP1PP/R1BQKBNR[a6:s,b6:s,c6:sk,d6:s,e6:s,f6:s,g6:s,h6:ssk,a7:k,b7:k,c7:k,e7:k,f7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,g8:s,h8:s] w KQ - 0 1", "uci": "h2h4"}, {"fen": "ppppp1pp/kkk1kk1k/ppkppppk/8/5P1P/1PN5/P1PPP1P1/R1BQKBNR[a6:s,b6:s,c6:sk,d6:s,e6:s,f6:s,g6:s,h6:ssk,a7:k,b7:k,c7:k,e7:k,f7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,g8:s,h8:s] b KQ - 0 1", "uci": "c7d7"}, {"fen": "ppppp1pp/kk1pkk1k/ppkppppk/8/5P1P/1PN5/P1PPP1P1/R1BQKBNR[a6:s,b6:s,c6:sk,d6:s,e6:s,f6:s,g6:s,h6:ssk,a7:k,b7:k,d7:S,e7:k,f7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,g8:s,h8:s] w KQ - 0 1", "uci": "b3b4"}, {"fen": "ppppp1pp/kk1pkk1k/ppkppppk/8/1P3P1P/2N5/P1PPP1P1/R1BQKBNR[a6:s,b6:s,c6:sk,d6:s,e6:s,f6:s,g6:s,h6:ssk,a7:k,b7:k,d7:S,e7:k,f7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,g8:s,h8:s] b KQ - 0 1", "uci": "e6d5"}, {"fen": "ppppp1pp/kk1pkk1k/ppkp1ppk/3p4/1P3P1P/2N5/P1PPP1P1/R1BQKBNR[d5:s,a6:s,b6:s,c6:sk,d6:s,f6:s,g6:s,h6:ssk,a7:k,b7:k,d7:S,e7:k,f7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,g8:s,h8:s] w KQ - 0 1", "uci": "e2e3"}, {"fen": "ppppp1pp/kk1pkk1k/ppkp1ppk/3p4/1P3P1P/2N1P3/P1PP2P1/R1BQKBNR[d5:s,a6:s,b6:s,c6:sk,d6:s,f6:s,g6:s,h6:ssk,a7:k,b7:k,d7:S,e7:k,f7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,g8:s,h8:s] b KQ - 0 1", "uci": "h8g7"}, {"fen": "ppppp1p1/kk1pkkpk/ppkp1ppk/3p4/1P3P1P/2N1P3/P1PP2P1/R1BQKBNR[d5:s,a6:s,b6:s,c6:sk,d6:s,f6:s,g6:s,h6:ssk,a7:k,b7:k,d7:S,e7:k,f7:k,g7:s,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,g8:s] w KQ - 0 1", "uci": "g2g3"}, {"fen": "ppppp1p1/kk1pkkpk/ppkp1ppk/3p4/1P3P1P/2N1P1P1/P1PP4/R1BQKBNR[d5:s,a6:s,b6:s,c6:sk,d6:s,f6:s,g6:s,h6:ssk,a7:k,b7:k,d7:S,e7:k,f7:k,g7:s,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,g8:s] b KQ - 0 1", "uci": "b7a7"}, {"fen": "ppppp1p1/p2pkkpk/ppkp1ppk/3p4/1P3P1P/2N1P1P1/P1PP4/R1BQKBNR[d5:s,a6:s,b6:s,c6:sk,d6:s,f6:s,g6:s,h6:ssk,a7:kS,d7:S,e7:k,f7:k,g7:s,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,g8:s] w KQ - 0 1", "uci": "e1f2"}, {"fen": "ppppp1p1/p2pkkpk/ppkp1ppk/3p4/1P3P1P/2N1P1P1/P1PP1K2/R1BQ1BNR[d5:s,a6:s,b6:s,c6:sk,d6:s,f6:s,g6:s,h6:ssk,a7:kS,d7:S,e7:k,f7:k,g7:s,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,g8:s] b - - 1 1", "uci": "c6d6"}, {"fen": "ppppp1p1/p2pkkpk/pp1p1ppk/3p4/1P3P1P/2N1P1P1/P1PP1K2/R1BQ1BNR[d5:s,a6:s,b6:s,d6:ssS,f6:s,g6:s,h6:ssk,a7:kS,d7:S,e7:k,f7:k,g7:s,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,g8:s] w - - 1 1", "uci": "d1f3"}, {"fen": "ppppp1p1/p2pkkpk/pp1p1ppk/3p4/1P3P1P/2N1PQP1/P1PP1K2/R1B2BNR[d5:s,a6:s,b6:s,d6:ssS,f6:s,g6:s,h6:ssk,a7:kS,d7:S,e7:k,f7:k,g7:s,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,g8:s] b - - 2 1", "uci": "d8e7"}, {"fen": "ppp1p1p1/p2ppkpk/pp1p1ppk/3p4/1P3P1P/2N1PQP1/P1PP1K2/R1B2BNR[d5:s,a6:s,b6:s,d6:ssS,f6:s,g6:s,h6:ssk,a7:kS,d7:S,e7:ks,f7:k,g7:s,h7:k,a8:s,b8:s,c8:s,e8:s,g8:s] w - - 2 1", "uci": "g1e2"}, {"fen": "ppp1p1p1/p2ppkpk/pp1p1ppk/3p4/1P3P1P/2N1PQP1/P1PPNK2/R1B2B1R[d5:s,a6:s,b6:s,d6:ssS,f6:s,g6:s,h6:ssk,a7:kS,d7:S,e7:ks,f7:k,g7:s,h7:k,a8:s,b8:s,c8:s,e8:s,g8:s] b - - 3 1", "uci": "b8d6"}, {"fen": "p1p1p1p1/p2ppkpk/pp1p1ppk/3p4/1P3P1P/2N1PQP1/P1PPNK2/R1B2B1R[d5:s,a6:s,b6:s,d6:ssSS,f6:s,g6:s,h6:ssk,a7:kS,d7:S,e7:ks,f7:k,g7:s,h7:k,a8:s,c8:s,e8:s,g8:s] w - - 3 1", "uci": "h4h5"}, {"fen": "p1p1p1p1/p2ppkpk/pp1p1ppk/3p3P/1P3P2/2N1PQP1/P1PPNK2/R1B2B1R[d5:s,a6:s,b6:s,d6:ssSS,f6:s,g6:s,h6:ssk,a7:kS,d7:S,e7:ks,f7:k,g7:s,h7:k,a8:s,c8:s,e8:s,g8:s] b - - 0 1", "uci": "f7e6"}, {"fen": "p1p1p1p1/p2pp1pk/pp1pkppk/3p3P/1P3P2/2N1PQP1/P1PPNK2/R1B2B1R[d5:s,a6:s,b6:s,d6:ssSS,e6:k,f6:s,g6:s,h6:ssk,a7:kS,d7:S,e7:ks,g7:s,h7:k,a8:s,c8:s,e8:s,g8:s] w - - 0 1", "uci": "h5g6"}, {"fen": "p1p1p1p1/p2pp1pk/pp1pkpPk/3p4/1P3P2/2N1PQP1/P1PPNK2/R1B2B1R[d5:s,a6:s,b6:s,d6:ssSS,e6:k,f6:s,h6:ssk,a7:kS,d7:S,e7:ks,g7:s,h7:k,a8:s,c8:s,e8:s,g8:s] b - - 0 1", "uci": "h7g6"}, {"fen": "p1p1p1p1/p2pp1p1/pp1pkpPk/3p4/1P3P2/2N1PQP1/P1PPNK2/R1B2B1R[d5:s,a6:s,b6:s,d6:ssSS,e6:k,f6:s,h6:ssk,a7:kS,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s,g8:s] w - - 0 1", "uci": "f3g4"}, {"fen": "p1p1p1p1/p2pp1p1/pp1pkpPk/3p4/1P3PQ1/2N1P1P1/P1PPNK2/R1B2B1R[d5:s,a6:s,b6:s,d6:ssSS,e6:k,f6:s,h6:ssk,a7:kS,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s,g8:s] b - - 1 1", "uci": "g8f7"}, {"fen": "p1p1p3/p2pppp1/pp1pkpPk/3p4/1P3PQ1/2N1P1P1/P1PPNK2/R1B2B1R[d5:s,a6:s,b6:s,d6:ssSS,e6:k,f6:s,h6:ssk,a7:kS,d7:S,e7:ks,f7:s,g7:s,a8:s,c8:s,e8:s] w - - 1 1", "uci": "f2g1"}, {"fen": "p1p1p3/p2pppp1/pp1pkpPk/3p4/1P3PQ1/2N1P1P1/P1PPN3/R1B2BKR[d5:s,a6:s,b6:s,d6:ssSS,e6:k,f6:s,h6:ssk,a7:kS,d7:S,e7:ks,f7:s,g7:s,a8:s,c8:s,e8:s] b - - 2 1", "uci": "d6h2"}, {"fen": "p1p1p3/p2pppp1/pp2kpPk/3p4/1P4Q1/2N1P3/P1PPN2p/R1B2BKR[h2:ssSS,d5:s,a6:s,b6:s,e6:k,f6:s,h6:ssk,a7:kS,d7:S,e7:ks,f7:s,g7:s,a8:s,c8:s,e8:s] w - - 2 1", "uci": "h1h2"}, {"fen": "p1p1p3/p2pppp1/pp2kpPk/3p4/1P4Q1/2N1P3/P1PPN2R/R1B2BK1[d5:s,a6:s,b6:s,e6:k,f6:s,h6:ssk,a7:kS,d7:S,e7:ks,f7:s,g7:s,a8:s,c8:s,e8:s] b - - 0 1", "uci": "f7g6"}, {"fen": "p1p1p3/p2pp1p1/pp2kpPk/3p4/1P4Q1/2N1P3/P1PPN2R/R1B2BK1[d5:s,a6:s,b6:s,e6:k,f6:s,h6:ssk,a7:kS,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] w - - 0 1", "uci": "c3b5"}, {"fen": "p1p1p3/p2pp1p1/pp2kpPk/1N1p4/1P4Q1/4P3/P1PPN2R/R1B2BK1[d5:s,a6:s,b6:s,e6:k,f6:s,h6:ssk,a7:kS,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] b - - 1 1", "uci": "h6d2"}, {"fen": "p1p1p3/p2pp1p1/pp2kpP1/1N1p4/1P4Q1/8/P1PPN2R/R1B2BK1[d5:s,a6:s,b6:s,e6:k,f6:s,a7:kS,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] w - - 1 1", "uci": "f1g2"}, {"fen": "p1p1p3/p2pp1p1/pp2kpP1/1N1p4/1P4Q1/8/P1PPN1BR/R1B3K1[d5:s,a6:s,b6:s,e6:k,f6:s,a7:kS,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] b - - 2 1", "uci": "a6b5"}, {"fen": "p1p1p3/p2pp1p1/1p2kpP1/1N1p4/1P4Q1/8/P1PPN1BR/R1B3K1[d5:s,b6:s,e6:k,f6:s,a7:kS,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] w - - 2 1", "uci": "b5a7"}, {"fen": "p1p1p3/N2pp1p1/1p2kpP1/3p4/1P4Q1/8/P1PPN1BR/R1B3K1[d5:s,b6:s,e6:k,f6:s,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] b - - 0 1", "uci": "e6d5"}, {"fen": "p1p1p3/N2pp1p1/1p3pP1/3k4/1P4Q1/8/P1PPN1BR/R1B3K1[d5:sk,b6:s,f6:s,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] w - - 0 1", "uci": "e2f4"}, {"fen": "p1p1p3/N2pp1p1/1p3pP1/3k4/1P3NQ1/8/P1PP2BR/R1B3K1[d5:sk,b6:s,f6:s,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] b - - 1 1", "uci": "d5c4[1]"}, {"fen": "p1p1p3/N2pp1p1/1p3pP1/3p4/1Pk2NQ1/8/P1PP2BR/R1B3K1[c4:k,d5:s,b6:s,f6:s,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] w - - 1 1", "uci": "a7b5"}, {"fen": "p1p1p3/3pp1p1/1p3pP1/1N1p4/1Pk2NQ1/8/P1PP2BR/R1B3K1[c4:k,d5:s,b6:s,f6:s,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] b - - 2 1", "uci": "c4b5"}, {"fen": "p1p1p3/3pp1p1/1p3pP1/1N1p4/1P3NQ1/8/P1PP2BR/R1B3K1[d5:s,b6:s,f6:s,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] w - - 2 1", "uci": "c2c4"}, {"fen": "p1p1p3/3pp1p1/1p3pP1/1N1p4/1PP2NQ1/8/P2P2BR/R1B3K1[d5:s,b6:s,f6:s,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] b - - 0 1", "uci": "d5c4"}, {"fen": "p1p1p3/3pp1p1/1p3pP1/1N6/1PP2NQ1/8/P2P2BR/R1B3K1[b6:s,f6:s,d7:S,e7:ks,g7:s,a8:s,c8:s,e8:s] w - - 0 1", "uci": "g2a8"}, {"fen": "B1p1p3/3pp1p1/1p3pP1/1N6/1PP2NQ1/8/P2P3R/R1B3K1[b6:s,f6:s,d7:S,e7:ks,g7:s,c8:s,e8:s] b - - 0 1", "uci": "b6a5"}, {"fen": "B1p1p3/3pp1p1/5pP1/pN6/1PP2NQ1/8/P2P3R/R1B3K1[a5:s,f6:s,d7:S,e7:ks,g7:s,c8:s,e8:s] w - - 0 1", "uci": "b5c3"}, {"fen": "B1p1p3/3pp1p1/5pP1/p7/1PP2NQ1/2N5/P2P3R/R1B3K1[a5:s,f6:s,d7:S,e7:ks,g7:s,c8:s,e8:s] b - - 1 1", "uci": "c8b7"}, {"fen": "B3p3/1p1pp1p1/5pP1/p7/1PP2NQ1/2N5/P2P3R/R1B3K1[a5:s,f6:s,b7:s,d7:S,e7:ks,g7:s,e8:s] w - - 1 1", "uci": "h2e2"}, {"fen": "B3p3/1p1pp1p1/5pP1/p7/1PP2NQ1/2N5/P2PR3/R1B3K1[a5:s,f6:s,b7:s,d7:S,e7:ks,g7:s,e8:s] b - - 2 1", "uci": "e7c5"}, {"fen": "B3p3/1p1p2p1/5pP1/p1p5/1PP2NQ1/2N5/P2PR3/R1B3K1[a5:s,c5:ks,f6:s,b7:s,d7:S,g7:s,e8:s] w - - 2 1", "uci": "g4h5"}, {"fen": "B3p3/1p1p2p1/5pP1/p1p4Q/1PP2N2/2N5/P2PR3/R1B3K1[a5:s,c5:ks,f6:s,b7:s,d7:S,g7:s,e8:s] b - - 3 1", "uci": "c5b4"}, {"fen": "B3p3/1p1p2p1/5pP1/p6Q/1PP2N2/2N5/P2PR3/R1B3K1[a5:s,f6:s,b7:s,d7:S,g7:s,e8:s] w - - 3 1", "uci": "c3d1"}, {"fen": "B3p3/1p1p2p1/5pP1/p6Q/1PP2N2/8/P2PR3/R1BN2K1[a5:s,f6:s,b7:s,d7:S,g7:s,e8:s] b - - 4 1", "uci": "a5b4"}, {"fen": "B3p3/1p1p2p1/5pP1/7Q/1PP2N2/8/P2PR3/R1BN2K1[f6:s,b7:s,d7:S,g7:s,e8:s] w - - 4 1", "uci": "e2e8"}, {"fen": "B3R3/1p1p2p1/5pP1/7Q/1PP2N2/8/P2P4/R1BN2K1[f6:s,b7:s,d7:S,g7:s] b - - 0 1", "uci": "g7h6"}, {"fen": "B3R3/1p1p4/5pPp/7Q/1PP2N2/8/P2P4/R1BN2K1[f6:s,h6:s,b7:s,d7:S] w - - 0 1", "uci": "e8g8"}, {"fen": "B5R1/1p1p4/5pPp/7Q/1PP2N2/8/P2P4/R1BN2K1[f6:s,h6:s,b7:s,d7:S] b - - 1 1", "uci": "b7c6"}, {"fen": "B5R1/3p4/2p2pPp/7Q/1PP2N2/8/P2P4/R1BN2K1[c6:s,f6:s,h6:s,d7:S] w - - 1 1", "uci": "g1h1"}, {"fen": "B5R1/3p4/2p2pPp/7Q/1PP2N2/8/P2P4/R1BN3K[c6:s,f6:s,h6:s,d7:S] b - - 2 1", "uci": "h6g5"}, {"fen": "B5R1/3p4/2p2pP1/6pQ/1PP2N2/8/P2P4/R1BN3K[g5:s,c6:s,f6:s,d7:S] w - - 2 1", "uci": "g6g7"}, {"fen": "B5R1/3p2P1/2p2p2/6pQ/1PP2N2/8/P2P4/R1BN3K[g5:s,c6:s,f6:s,d7:S] b - - 0 1", "uci": "g5f4"}, {"fen": "B5R1/3p2P1/2p2p2/7Q/1PP2N2/8/P2P4/R1BN3K[c6:s,f6:s,d7:S] w - - 0 1", "uci": "a2a4"}, {"fen": "B5R1/3p2P1/2p2p2/7Q/PPP2N2/8/3P4/R1BN3K[c6:s,f6:s,d7:S] b - - 0 1", "uci": "c6d5"}, {"fen": "B5R1/3p2P1/5p2/3p3Q/PPP2N2/8/3P4/R1BN3K[d5:s,f6:s,d7:S] w - - 0 1", "uci": "h5h2"}, {"fen": "B5R1/3p2P1/5p2/3p4/PPP2N2/8/3P3Q/R1BN3K[d5:s,f6:s,d7:S] b - - 1 1", "uci": "d5c4"}, {"fen": "B5R1/3p2P1/5p2/8/PPP2N2/8/3P3Q/R1BN3K[f6:s,d7:S] w - - 1 1", "uci": "h1g1"}, {"fen": "B5R1/3p2P1/5p2/8/PPP2N2/8/3P3Q/R1BN2K1[f6:s,d7:S] b - - 2 1", "uci": "d7c6"}, {"fen": "B5R1/6P1/2p2p2/8/PPP2N2/8/3P3Q/R1BN2K1[c6:S,f6:s] w - - 2 1", "uci": "h2h4"}, {"fen": "B5R1/6P1/2p2p2/8/PPP2N1Q/8/3P4/R1BN2K1[c6:S,f6:s] b - - 3 1", "uci": "f6e5"}, {"fen": "B5R1/6P1/2p5/4p3/PPP2N1Q/8/3P4/R1BN2K1[e5:s,c6:S] w - - 3 1", "uci": "a1a2"}, {"fen": "B5R1/6P1/2p5/4p3/PPP2N1Q/8/R2P4/2BN2K1[e5:s,c6:S] b - - 4 1", "uci": "e5g3"}, {"fen": "B5R1/6P1/2p5/8/PPP4Q/6p1/R2P4/2BN2K1[g3:s,c6:S] w - - 4 1", "uci": "h4e4"}, {"fen": "B5R1/6P1/2p5/8/PPP1Q3/6p1/R2P4/2BN2K1[g3:s,c6:S] b - - 5 1", "uci": "g3f2"}, {"fen": "B5R1/6P1/2p5/8/PPP1Q3/8/R2P1p2/2BN2K1[f2:s,c6:S] w - - 5 1", "uci": "g1h2"}, {"fen": "B5R1/6P1/2p5/8/PPP1Q3/8/R2P1p1K/2BN4[f2:s,c6:S] b - - 6 1", "uci": "c6d5"}, {"fen": "B5R1/6P1/8/3p4/PPP1Q3/8/R2P1p1K/2BN4[f2:s,d5:S] w - - 6 1", "uci": "e4f3"}, {"fen": "B5R1/6P1/8/3p4/PPP5/5Q2/R2P1p1K/2BN4[f2:s,d5:S] b - - 7 1", "uci": "d5c4"}, {"fen": "B5R1/6P1/8/8/PPP5/5Q2/R2P1p1K/2BN4[f2:s] w - - 7 1", "uci": "d1f2"}], "final_fen": "B5R1/6P1/8/8/PPP5/5Q2/R2P1N1K/2B5 b - - 0 1", "outcome": "white", "label": "NN(W) vs random(B)"}, {"history": [{"fen": "pppppppp/kkkkkkkk/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQkq - 0 1", "uci": "d2d4"}, {"fen": "pppppppp/kkkkkkkk/pppppppp/8/3P4/8/PPP1PPPP/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] b KQ - 0 1", "uci": "c7c8"}, {"fen": "pppppppp/kk1kkkkk/pppppppp/8/3P4/8/PPP1PPPP/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:sS,d8:s,e8:s,f8:s,g8:s,h8:s] w KQ - 0 1", "uci": "h2h3"}, {"fen": "pppppppp/kk1kkkkk/pppppppp/8/3P4/7P/PPP1PPP1/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,d7:k,e7:k,f7:k,g7:k,h7:k,a8:s,b8:s,c8:sS,d8:s,e8:s,f8:s,g8:s,h8:s] b KQ - 0 1", "uci": "h7h8"}, {"fen": "pppppppp/kk1kkkk1/pppppppp/8/3P4/7P/PPP1PPP1/RNBQKBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,d7:k,e7:k,f7:k,g7:k,a8:s,b8:s,c8:sS,d8:s,e8:s,f8:s,g8:s,h8:sS] w KQ - 0 1", "uci": "d1d2"}, {"fen": "pppppppp/kk1kkkk1/pppppppp/8/3P4/7P/PPPQPPP1/RNB1KBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,d7:k,e7:k,f7:k,g7:k,a8:s,b8:s,c8:sS,d8:s,e8:s,f8:s,g8:s,h8:sS] b KQ - 1 1", "uci": "d7c8"}, {"fen": "ppkppppp/kk2kkk1/pppppppp/8/3P4/7P/PPPQPPP1/RNB1KBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,e7:k,f7:k,g7:k,a8:s,b8:s,c8:sSk,d8:s,e8:s,f8:s,g8:s,h8:sS] w KQ - 1 1", "uci": "d2c3"}, {"fen": "ppkppppp/kk2kkk1/pppppppp/8/3P4/2Q4P/PPP1PPP1/RNB1KBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,a7:k,b7:k,e7:k,f7:k,g7:k,a8:s,b8:s,c8:sSk,d8:s,e8:s,f8:s,g8:s,h8:sS] b KQ - 2 1", "uci": "e7f6"}, {"fen": "ppkppppp/kk3kk1/pppppkpp/8/3P4/2Q4P/PPP1PPP1/RNB1KBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:sk,g6:s,h6:s,a7:k,b7:k,f7:k,g7:k,a8:s,b8:s,c8:sSk,d8:s,e8:s,f8:s,g8:s,h8:sS] w KQ - 2 1", "uci": "g2g4"}, {"fen": "ppkppppp/kk3kk1/pppppkpp/8/3P2P1/2Q4P/PPP1PP2/RNB1KBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:sk,g6:s,h6:s,a7:k,b7:k,f7:k,g7:k,a8:s,b8:s,c8:sSk,d8:s,e8:s,f8:s,g8:s,h8:sS] b KQ - 0 1", "uci": "f7e8"}, {"fen": "ppkpkppp/kk4k1/pppppkpp/8/3P2P1/2Q4P/PPP1PP2/RNB1KBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:sk,g6:s,h6:s,a7:k,b7:k,g7:k,a8:s,b8:s,c8:sSk,d8:s,e8:sk,f8:s,g8:s,h8:sS] w KQ - 0 1", "uci": "b1a3"}, {"fen": "ppkpkppp/kk4k1/pppppkpp/8/3P2P1/N1Q4P/PPP1PP2/R1B1KBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:sk,g6:s,h6:s,a7:k,b7:k,g7:k,a8:s,b8:s,c8:sSk,d8:s,e8:sk,f8:s,g8:s,h8:sS] b KQ - 1 1", "uci": "c8c7"}, {"fen": "pp1pkppp/kkp3k1/pppppkpp/8/3P2P1/N1Q4P/PPP1PP2/R1B1KBNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:sk,g6:s,h6:s,a7:k,b7:k,c7:sSS,g7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sS] w KQ - 1 1", "uci": "e1d1"}, {"fen": "pp1pkppp/kkp3k1/pppppkpp/8/3P2P1/N1Q4P/PPP1PP2/R1BK1BNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:sk,g6:s,h6:s,a7:k,b7:k,c7:sSS,g7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sS] b - - 2 1", "uci": "g7h8"}, {"fen": "pp1pkppk/kkp5/pppppkpp/8/3P2P1/N1Q4P/PPP1PP2/R1BK1BNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:sk,g6:s,h6:s,a7:k,b7:k,c7:sSS,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] w - - 2 1", "uci": "c1g5"}, {"fen": "pp1pkppk/kkp5/pppppkpp/6B1/3P2P1/N1Q4P/PPP1PP2/R2K1BNR[a6:s,b6:s,c6:s,d6:s,e6:s,f6:sk,g6:s,h6:s,a7:k,b7:k,c7:sSS,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] b - - 3 1", "uci": "f6~g5~h4~i3~h2~g1~f0~g1"}, {"fen": "pp1pkppk/kkp5/ppppp1pp/8/3P2P1/N1Q4P/PPP1PP2/R2K1BkR[g1:kk,a6:s,b6:s,c6:s,d6:s,e6:s,g6:s,h6:s,a7:k,b7:k,c7:sSS,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] w - - 3 1", "uci": "h1g1"}, {"fen": "pp1pkppk/kkp5/ppppp1pp/8/3P2P1/N1Q4P/PPP1PP2/R2K1BR1[a6:s,b6:s,c6:s,d6:s,e6:s,g6:s,h6:s,a7:k,b7:k,c7:sSS,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] b - - 0 1", "uci": "b7c8"}, {"fen": "ppkpkppk/k1p5/ppppp1pp/8/3P2P1/N1Q4P/PPP1PP2/R2K1BR1[a6:s,b6:s,c6:s,d6:s,e6:s,g6:s,h6:s,a7:k,c7:sSS,a8:s,b8:s,c8:k,d8:s,e8:sk,f8:s,g8:s,h8:sSk] w - - 0 1", "uci": "g4g5"}, {"fen": "ppkpkppk/k1p5/ppppp1pp/6P1/3P4/N1Q4P/PPP1PP2/R2K1BR1[a6:s,b6:s,c6:s,d6:s,e6:s,g6:s,h6:s,a7:k,c7:sSS,a8:s,b8:s,c8:k,d8:s,e8:sk,f8:s,g8:s,h8:sSk] b - - 0 1", "uci": "h6f4"}, {"fen": "ppkpkppk/k1p5/ppppp1p1/8/3P1p2/N1Q4P/PPP1PP2/R2K1BR1[f4:s,a6:s,b6:s,c6:s,d6:s,e6:s,g6:s,a7:k,c7:sSS,a8:s,b8:s,c8:k,d8:s,e8:sk,f8:s,g8:s,h8:sSk] w - - 0 1", "uci": "g1g5"}, {"fen": "ppkpkppk/k1p5/ppppp1p1/6R1/3P1p2/N1Q4P/PPP1PP2/R2K1B2[f4:s,a6:s,b6:s,c6:s,d6:s,e6:s,g6:s,a7:k,c7:sSS,a8:s,b8:s,c8:k,d8:s,e8:sk,f8:s,g8:s,h8:sSk] b - - 1 1", "uci": "c8d7"}, {"fen": "pp1pkppk/k1pk4/ppppp1p1/6R1/3P1p2/N1Q4P/PPP1PP2/R2K1B2[f4:s,a6:s,b6:s,c6:s,d6:s,e6:s,g6:s,a7:k,c7:sSS,d7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] w - - 1 1", "uci": "c3e1"}, {"fen": "pp1pkppk/k1pk4/ppppp1p1/6R1/3P1p2/N6P/PPP1PP2/R2KQB2[f4:s,a6:s,b6:s,c6:s,d6:s,e6:s,g6:s,a7:k,c7:sSS,d7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] b - - 2 1", "uci": "a7b6"}, {"fen": "pp1pkppk/2pk4/pkppp1p1/6R1/3P1p2/N6P/PPP1PP2/R2KQB2[f4:s,a6:s,b6:sk,c6:s,d6:s,e6:s,g6:s,c7:sSS,d7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] w - - 2 1", "uci": "h3h4"}, {"fen": "pp1pkppk/2pk4/pkppp1p1/6R1/3P1p1P/N7/PPP1PP2/R2KQB2[f4:s,a6:s,b6:sk,c6:s,d6:s,e6:s,g6:s,c7:sSS,d7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] b - - 0 1", "uci": "b6b5"}, {"fen": "pp1pkppk/2pk4/p1ppp1p1/1p4R1/3P1p1P/N7/PPP1PP2/R2KQB2[f4:s,b5:sS,a6:s,c6:s,d6:s,e6:s,g6:s,c7:sSS,d7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] w - - 0 1", "uci": "a3b5"}, {"fen": "pp1pkppk/2pk4/p1ppp1p1/1N4R1/3P1p1P/8/PPP1PP2/R2KQB2[f4:s,a6:s,c6:s,d6:s,e6:s,g6:s,c7:sSS,d7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] b - - 0 1", "uci": "c6b5"}, {"fen": "pp1pkppk/2pk4/p2pp1p1/1N4R1/3P1p1P/8/PPP1PP2/R2KQB2[f4:s,a6:s,d6:s,e6:s,g6:s,c7:sSS,d7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] w - - 0 1", "uci": "e2e3"}, {"fen": "pp1pkppk/2pk4/p2pp1p1/1N4R1/3P1p1P/4P3/PPP2P2/R2KQB2[f4:s,a6:s,d6:s,e6:s,g6:s,c7:sSS,d7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] b - - 0 1", "uci": "f4~e3~d2~e1~f0~e1"}, {"fen": "pp1pkppk/2pk4/p2pp1p1/1N4R1/3P3P/8/PPP2P2/R2KkB2[e1:k,a6:s,d6:s,e6:s,g6:s,c7:sSS,d7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] w - - 0 1", "uci": "d1c1"}, {"fen": "pp1pkppk/2pk4/p2pp1p1/1N4R1/3P3P/8/PPP2P2/R1K1kB2[e1:k,a6:s,d6:s,e6:s,g6:s,c7:sSS,d7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] b - - 1 1", "uci": "e1~f2~g3~h4~i5~h4"}, {"fen": "pp1pkppk/2pk4/p2pp1p1/1N4R1/3P3k/8/PPP5/R1K2B2[h4:k,a6:s,d6:s,e6:s,g6:s,c7:sSS,d7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] w - - 1 1", "uci": "g5g6"}, {"fen": "pp1pkppk/2pk4/p2pp1R1/1N6/3P3k/8/PPP5/R1K2B2[h4:k,a6:s,d6:s,e6:s,c7:sSS,d7:k,a8:s,b8:s,d8:s,e8:sk,f8:s,g8:s,h8:sSk] b - - 0 1", "uci": "e8g6"}, {"fen": "pp1p1ppk/2pk4/p2pp1R1/1N6/3P3k/8/PPP5/R1K2B2[h4:k,a6:s,d6:s,e6:s,c7:sSS,d7:k,a8:s,b8:s,d8:s,f8:s,g8:s,h8:sSk] w - - 0 1", "uci": "b5c7"}, {"fen": "pp1p1ppk/2Nk4/p2pp1R1/8/3P3k/8/PPP5/R1K2B2[h4:k,a6:s,d6:s,e6:s,d7:k,a8:s,b8:s,d8:s,f8:s,g8:s,h8:sSk] b - - 0 1", "uci": "d8b6"}, {"fen": "pp3ppk/3k4/pp1pp1R1/8/3P3k/8/PPP5/R1K2B2[h4:k,a6:s,b6:s,d6:s,e6:s,d7:k,a8:s,b8:s,f8:s,g8:s,h8:sSk] w - - 0 1", "uci": "c1d1"}, {"fen": "pp3ppk/3k4/pp1pp1R1/8/3P3k/8/PPP5/R2K1B2[h4:k,a6:s,b6:s,d6:s,e6:s,d7:k,a8:s,b8:s,f8:s,g8:s,h8:sSk] b - - 1 1", "uci": "e6d5"}, {"fen": "pp3ppk/3k4/pp1p2R1/3p4/3P3k/8/PPP5/R2K1B2[h4:k,d5:s,a6:s,b6:s,d6:s,d7:k,a8:s,b8:s,f8:s,g8:s,h8:sSk] w - - 1 1", "uci": "f1b5"}, {"fen": "pp3ppk/3k4/pp1p2R1/1B1p4/3P3k/8/PPP5/R2K4[h4:k,d5:s,a6:s,b6:s,d6:s,d7:k,a8:s,b8:s,f8:s,g8:s,h8:sSk] b - - 2 1", "uci": "a6b5"}, {"fen": "pp3ppk/3k4/1p1p2R1/1B1p4/3P3k/8/PPP5/R2K4[h4:k,d5:s,b6:s,d6:s,d7:k,a8:s,b8:s,f8:s,g8:s,h8:sSk] w - - 2 1", "uci": "d1e1"}, {"fen": "pp3ppk/3k4/1p1p2R1/1B1p4/3P3k/8/PPP5/R3K3[h4:k,d5:s,b6:s,d6:s,d7:k,a8:s,b8:s,f8:s,g8:s,h8:sSk] b - - 3 1", "uci": "h4g5"}, {"fen": "pp3ppk/3k4/1p1p2R1/1B1p2k1/3P4/8/PPP5/R3K3[d5:s,g5:k,b6:s,d6:s,d7:k,a8:s,b8:s,f8:s,g8:s,h8:sSk] w - - 3 1", "uci": "a2a4"}, {"fen": "pp3ppk/3k4/1p1p2R1/1B1p2k1/P2P4/8/1PP5/R3K3[d5:s,g5:k,b6:s,d6:s,d7:k,a8:s,b8:s,f8:s,g8:s,h8:sSk] b - - 0 1", "uci": "d7c6"}, {"fen": "pp3ppk/8/1pkp2R1/1B1p2k1/P2P4/8/1PP5/R3K3[d5:s,g5:k,b6:s,c6:k,d6:s,a8:s,b8:s,f8:s,g8:s,h8:sSk] w - - 0 1", "uci": "a1d1"}, {"fen": "pp3ppk/8/1pkp2R1/1B1p2k1/P2P4/8/1PP5/3RK3[d5:s,g5:k,b6:s,c6:k,d6:s,a8:s,b8:s,f8:s,g8:s,h8:sSk] b - - 1 1", "uci": "d5e4"}, {"fen": "pp3ppk/8/1pkp2R1/1B4k1/P2Pp3/8/1PP5/3RK3[e4:s,g5:k,b6:s,c6:k,d6:s,a8:s,b8:s,f8:s,g8:s,h8:sSk] w - - 1 1", "uci": "b2b3"}, {"fen": "pp3ppk/8/1pkp2R1/1B4k1/P2Pp3/1P6/2P5/3RK3[e4:s,g5:k,b6:s,c6:k,d6:s,a8:s,b8:s,f8:s,g8:s,h8:sSk] b - - 0 1", "uci": "b8a7"}, {"fen": "p4ppk/p7/1pkp2R1/1B4k1/P2Pp3/1P6/2P5/3RK3[e4:s,g5:k,b6:s,c6:k,d6:s,a7:s,a8:s,f8:s,g8:s,h8:sSk] w - - 0 1", "uci": "d1b1"}, {"fen": "p4ppk/p7/1pkp2R1/1B4k1/P2Pp3/1P6/2P5/1R2K3[e4:s,g5:k,b6:s,c6:k,d6:s,a7:s,a8:s,f8:s,g8:s,h8:sSk] b - - 1 1", "uci": "h8g7[1]"}, {"fen": "p4ppp/p5k1/1pkp2R1/1B4k1/P2Pp3/1P6/2P5/1R2K3[e4:s,g5:k,b6:s,c6:k,d6:s,a7:s,g7:k,a8:s,f8:s,g8:s,h8:sS] w - - 1 1", "uci": "c2c4"}, {"fen": "p4ppp/p5k1/1pkp2R1/1B4k1/P1PPp3/1P6/8/1R2K3[e4:s,g5:k,b6:s,c6:k,d6:s,a7:s,g7:k,a8:s,f8:s,g8:s,h8:sS] b - - 0 1", "uci": "d6c5"}, {"fen": "p4ppp/p5k1/1pk3R1/1Bp3k1/P1PPp3/1P6/8/1R2K3[e4:s,c5:s,g5:k,b6:s,c6:k,a7:s,g7:k,a8:s,f8:s,g8:s,h8:sS] w - - 0 1", "uci": "g6e6"}, {"fen": "p4ppp/p5k1/1pk1R3/1Bp3k1/P1PPp3/1P6/8/1R2K3[e4:s,c5:s,g5:k,b6:s,c6:k,a7:s,g7:k,a8:s,f8:s,g8:s,h8:sS] b - - 1 1", "uci": "c6b5"}, {"fen": "p4ppp/p5k1/1p2R3/1Bp3k1/P1PPp3/1P6/8/1R2K3[e4:s,c5:s,g5:k,b6:s,a7:s,g7:k,a8:s,f8:s,g8:s,h8:sS] w - - 1 1", "uci": "e6d6"}, {"fen": "p4ppp/p5k1/1p1R4/1Bp3k1/P1PPp3/1P6/8/1R2K3[e4:s,c5:s,g5:k,b6:s,a7:s,g7:k,a8:s,f8:s,g8:s,h8:sS] b - - 2 1", "uci": "c5d4"}, {"fen": "p4ppp/p5k1/1p1R4/1B4k1/P1PPp3/1P6/8/1R2K3[e4:s,g5:k,b6:s,a7:s,g7:k,a8:s,f8:s,g8:s,h8:sS] w - - 2 1", "uci": "e1f1"}, {"fen": "p4ppp/p5k1/1p1R4/1B4k1/P1PPp3/1P6/8/1R3K2[e4:s,g5:k,b6:s,a7:s,g7:k,a8:s,f8:s,g8:s,h8:sS] b - - 3 1", "uci": "a8b7"}, {"fen": "5ppp/pp4k1/1p1R4/1B4k1/P1PPp3/1P6/8/1R3K2[e4:s,g5:k,b6:s,a7:s,b7:s,g7:k,f8:s,g8:s,h8:sS] w - - 3 1", "uci": "d6b6"}, {"fen": "5ppp/pp4k1/1R6/1B4k1/P1PPp3/1P6/8/1R3K2[e4:s,g5:k,a7:s,b7:s,g7:k,f8:s,g8:s,h8:sS] b - - 0 1", "uci": "a7~b6~c5~d4~e3~e3"}, {"fen": "5ppp/1p4k1/8/1B4k1/P1P1p3/1P2p3/8/1R3K2[e3:s,e4:s,g5:k,b7:s,g7:k,f8:s,g8:s,h8:sS] w - - 0 1", "uci": "c4c5"}, {"fen": "5ppp/1p4k1/8/1BP3k1/P3p3/1P2p3/8/1R3K2[e3:s,e4:s,g5:k,b7:s,g7:k,f8:s,g8:s,h8:sS] b - - 0 1", "uci": "g8h7"}, {"fen": "5p1p/1p4kp/8/1BP3k1/P3p3/1P2p3/8/1R3K2[e3:s,e4:s,g5:k,b7:s,g7:k,h7:s,f8:s,h8:sS] w - - 0 1", "uci": "b1a1"}, {"fen": "5p1p/1p4kp/8/1BP3k1/P3p3/1P2p3/8/R4K2[e3:s,e4:s,g5:k,b7:s,g7:k,h7:s,f8:s,h8:sS] b - - 1 1", "uci": "b7c6"}, {"fen": "5p1p/6kp/2p5/1BP3k1/P3p3/1P2p3/8/R4K2[e3:s,e4:s,g5:k,c6:s,g7:k,h7:s,f8:s,h8:sS] w - - 1 1", "uci": "a1d1"}, {"fen": "5p1p/6kp/2p5/1BP3k1/P3p3/1P2p3/8/3R1K2[e3:s,e4:s,g5:k,c6:s,g7:k,h7:s,f8:s,h8:sS] b - - 2 1", "uci": "g5h4"}, {"fen": "5p1p/6kp/2p5/1BP5/P3p2k/1P2p3/8/3R1K2[e3:s,e4:s,h4:k,c6:s,g7:k,h7:s,f8:s,h8:sS] w - - 2 1", "uci": "f1e2"}, {"fen": "5p1p/6kp/2p5/1BP5/P3p2k/1P2p3/4K3/3R4[e3:s,e4:s,h4:k,c6:s,g7:k,h7:s,f8:s,h8:sS] b - - 3 1", "uci": "h4g3"}, {"fen": "5p1p/6kp/2p5/1BP5/P3p3/1P2p1k1/4K3/3R4[e3:s,g3:k,e4:s,c6:s,g7:k,h7:s,f8:s,h8:sS] w - - 3 1", "uci": "b5d3"}, {"fen": "5p1p/6kp/2p5/2P5/P3p3/1P1Bp1k1/4K3/3R4[e3:s,g3:k,e4:s,c6:s,g7:k,h7:s,f8:s,h8:sS] b - - 4 1", "uci": "e4d3"}, {"fen": "5p1p/6kp/2p5/2P5/P7/1P1Bp1k1/4K3/3R4[e3:s,g3:k,c6:s,g7:k,h7:s,f8:s,h8:sS] w - - 4 1", "uci": "a4a5"}, {"fen": "5p1p/6kp/2p5/P1P5/8/1P1Bp1k1/4K3/3R4[e3:s,g3:k,c6:s,g7:k,h7:s,f8:s,h8:sS] b - - 0 1", "uci": "g3f2"}], "final_fen": "5p1p/6kp/2p5/P1P5/8/1P1Bp3/4Kk2/3R4[f2:k,e3:s,c6:s,g7:k,h7:s,f8:s,h8:sS] w - - 0 1", "outcome": "black", "label": "random(W) vs NN(B)"}];
+  const TEMPO_MS = 700;
+
+  const SQ = 80;
+  const PIECE_COLOR_WHITE = '#f8f4eb';
+  const PIECE_COLOR_BLACK_STROKE = '#1a1a1a';
+
+  // Unicode glyphs for white pieces. We render them in an SVG <text>.
+  const WHITE_GLYPH = { P: '♙', N: '♘', B: '♗', R: '♖', Q: '♕', K: '♔' };
+
+  function parseFEN(fen) {
+    // Returns {board: 8x8 of {color, type} | null, turn, stacks: {sq: pieces}}
+    // FEN forms used by the engine:
+    //   "<rows> [<overlay>] <turn> <castle> <ep> <half> <full>"
+    //   "<rows> <turn> ..."
+    let rows, overlay = '', rest;
+    const m = fen.match(/^([^\s\[]+)(?:\[([^\]]*)\])?\s+(.*)$/);
+    if (!m) return null;
+    rows = m[1]; overlay = m[2] || ''; rest = m[3].trim();
+    const turn = rest.split(/\s+/)[0] === 'b' ? 'black' : 'white';
+
+    const board = Array.from({length: 8}, () => Array(8).fill(null));
+    const ranks = rows.split('/');
+    for (let i = 0; i < 8; i++) {
+      const y = 7 - i;
+      let x = 0;
+      for (const ch of ranks[i]) {
+        if (/\d/.test(ch)) { x += +ch; continue; }
+        if (ch >= 'A' && ch <= 'Z') {
+          board[y][x] = { color: 'white', type: ch };
+        } else if (ch === 'p') {
+          board[y][x] = { color: 'black', type: 'stone' };
+        } else if (ch === 'k') {
+          board[y][x] = { color: 'black', type: 'king' };
+        }
+        x += 1;
+      }
+    }
+    const stacks = {};
+    if (overlay) {
+      for (const entry of overlay.split(',')) {
+        const t = entry.trim();
+        if (!t.includes(':')) continue;
+        const [sq, pieces] = t.split(':');
+        stacks[sq] = pieces;
+      }
+    }
+    return { board, turn, stacks };
+  }
+
+  function sqName(x, y) {
+    return String.fromCharCode(97 + x) + (y + 1);
+  }
+  function fromUCI(uci) {
+    if (!uci || uci.length < 4) return null;
+    const a = uci.slice(0, 2), b = uci.slice(2, 4);
+    return [a, b];
+  }
+
+  function render(fen, lastUci) {
+    const svg = document.getElementById('board');
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+    const parsed = parseFEN(fen);
+    if (!parsed) return;
+    const { board, stacks } = parsed;
+    const lm = fromUCI(lastUci);
+
+    for (let y = 7; y >= 0; y--) {
+      for (let x = 0; x < 8; x++) {
+        const px = x * SQ;
+        const py = (7 - y) * SQ;
+        const isLight = (x + y) % 2 === 1;
+        const sn = sqName(x, y);
+        const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        r.setAttribute('x', px); r.setAttribute('y', py);
+        r.setAttribute('width', SQ); r.setAttribute('height', SQ);
+        r.setAttribute('class', isLight ? 'light' : 'dark');
+        if (lm && (lm[0] === sn || lm[1] === sn)) {
+          r.classList.add('last-move');
+        }
+        svg.appendChild(r);
+
+        // file/rank labels in the corner
+        if (x === 0) {
+          const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+          t.setAttribute('x', px + 3); t.setAttribute('y', py + 11);
+          t.setAttribute('class', 'rank-label'); t.textContent = (y + 1).toString();
+          svg.appendChild(t);
+        }
+        if (y === 0) {
+          const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+          t.setAttribute('x', px + SQ - 9); t.setAttribute('y', py + SQ - 4);
+          t.setAttribute('class', 'file-label');
+          t.textContent = String.fromCharCode(97 + x);
+          svg.appendChild(t);
+        }
+
+        const cell = board[y][x];
+        if (cell) {
+          if (cell.color === 'white') {
+            const g = WHITE_GLYPH[cell.type];
+            const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            t.setAttribute('x', px + SQ / 2); t.setAttribute('y', py + SQ / 2 + 22);
+            t.setAttribute('text-anchor', 'middle');
+            t.setAttribute('font-size', '60');
+            t.setAttribute('fill', PIECE_COLOR_WHITE);
+            t.setAttribute('stroke', PIECE_COLOR_BLACK_STROKE);
+            t.setAttribute('stroke-width', '1.2');
+            t.textContent = g || '?';
+            svg.appendChild(t);
+          } else {
+            // Black: red disk with optional crown for kings.
+            const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            c.setAttribute('cx', px + SQ / 2); c.setAttribute('cy', py + SQ / 2);
+            c.setAttribute('r', SQ * 0.36);
+            c.setAttribute('fill', '#e63946');
+            c.setAttribute('stroke', '#1a1a1a');
+            c.setAttribute('stroke-width', '2');
+            svg.appendChild(c);
+            if (cell.type === 'king') {
+              const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+              t.setAttribute('x', px + SQ / 2); t.setAttribute('y', py + SQ / 2 + 12);
+              t.setAttribute('text-anchor', 'middle');
+              t.setAttribute('font-size', '32');
+              t.setAttribute('fill', '#fff');
+              t.setAttribute('stroke', '#000');
+              t.setAttribute('stroke-width', '0.5');
+              t.textContent = '♛';
+              svg.appendChild(t);
+            }
+          }
+        }
+
+        // Stack-height badge for towers > 1.
+        const stack = stacks[sn];
+        if (stack && stack.length > 1) {
+          const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+          t.setAttribute('x', px + SQ - 4); t.setAttribute('y', py + SQ - 4);
+          t.setAttribute('text-anchor', 'end');
+          t.setAttribute('font-size', '20');
+          t.setAttribute('class', 'stack-badge');
+          t.textContent = stack.length.toString();
+          svg.appendChild(t);
+          // King markers: count 'k' in stack and show as e.g. "k1,2"
+          const kingPositions = [];
+          for (let idx = 0; idx < stack.length; idx++) {
+            if (stack[idx] === 'k') kingPositions.push(stack.length - idx);
+          }
+          if (kingPositions.length > 0) {
+            const kt = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            kt.setAttribute('x', px + SQ - 4); kt.setAttribute('y', py + SQ - 22);
+            kt.setAttribute('text-anchor', 'end');
+            kt.setAttribute('font-size', '12');
+            kt.setAttribute('class', 'stack-badge');
+            kt.textContent = 'k' + kingPositions.sort((a,b)=>a-b).join(',');
+            svg.appendChild(kt);
+          }
+        }
+      }
+    }
+  }
+
+  // ---- state ----
+  let gameIdx = 0;
+  let plyIdx = 0;
+  let plies = [];
+  let playing = false;
+  let timer = null;
+  const $ = (id) => document.getElementById(id);
+
+  function pliesFor(g) {
+    const fens = (g.history || []).map(h => h.fen);
+    if (g.final_fen) fens.push(g.final_fen);
+    return fens;
+  }
+  function uciAt(g, idx) {
+    if (idx <= 0) return null;
+    const h = g.history || [];
+    return idx - 1 < h.length ? h[idx - 1].uci : null;
+  }
+
+  function loadGame(idx) {
+    if (idx < 0 || idx >= GAMES.length) return;
+    gameIdx = idx;
+    const g = GAMES[idx];
+    plies = pliesFor(g);
+    plyIdx = 0;
+    $('outcome').textContent = g.outcome || '—';
+    $('outcome').className = 'v ' + (g.outcome || 'draw');
+    $('ply-slider').max = String(Math.max(0, plies.length - 1));
+    $('game-select').value = String(idx);
+    renderPly();
+  }
+
+  function renderPly() {
+    if (!plies.length) return;
+    const fen = plies[plyIdx];
+    const luc = uciAt(GAMES[gameIdx], plyIdx);
+    render(fen, luc);
+    const turn = parseFEN(fen).turn;
+    $('turn').textContent = turn;
+    $('turn').className = 'v ' + turn;
+    $('ply').textContent = `${plyIdx} / ${plies.length - 1}`;
+    $('last-uci').textContent = luc || '(start)';
+    $('ply-slider').value = String(plyIdx);
+  }
+
+  function setPlaying(p) {
+    playing = p;
+    $('play-pause').textContent = playing ? '⏸ pause' : '▶ play';
+    if (timer) { clearInterval(timer); timer = null; }
+    if (playing) {
+      timer = setInterval(() => {
+        if (plyIdx < plies.length - 1) {
+          plyIdx += 1;
+          renderPly();
+        } else {
+          setPlaying(false);
+        }
+      }, TEMPO_MS);
+    }
+  }
+
+  // controls
+  $('prev-ply').onclick = () => { if (plyIdx > 0) { plyIdx -= 1; renderPly(); setPlaying(false); } };
+  $('next-ply').onclick = () => { if (plyIdx < plies.length - 1) { plyIdx += 1; renderPly(); setPlaying(false); } };
+  $('prev-game').onclick = () => loadGame(gameIdx - 1);
+  $('next-game').onclick = () => loadGame(gameIdx + 1);
+  $('restart').onclick = () => { plyIdx = 0; renderPly(); setPlaying(true); };
+  $('play-pause').onclick = () => setPlaying(!playing);
+  $('ply-slider').oninput = (e) => { plyIdx = parseInt(e.target.value, 10); renderPly(); setPlaying(false); };
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') $('prev-ply').click();
+    else if (e.key === 'ArrowRight') $('next-ply').click();
+    else if (e.key === ' ') { e.preventDefault(); $('play-pause').click(); }
+  });
+
+  // game selector
+  const sel = $('game-select');
+  GAMES.forEach((g, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = `game ${i+1}: ${g.label || ''} → ${g.outcome || '?'}`;
+    sel.appendChild(opt);
+  });
+  sel.onchange = () => loadGame(+sel.value);
+
+  loadGame(0);
+  setPlaying(true);
+</script>
+</body>
+</html>
