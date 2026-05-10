@@ -62,7 +62,15 @@ class ReplayBuffer:
             return
         if cur_mtime == self._last_mtime:
             return
-        files = sorted(self.root.glob("*.pkl"), key=lambda p: p.stat().st_mtime)
+        # Files can vanish between glob() and stat() under concurrent worker
+        # writes / sidecar churn — treat a missing file as oldest so it falls
+        # off in the prune step (or is silently skipped by the load loop).
+        def _safe_mtime(p: Path) -> float:
+            try:
+                return p.stat().st_mtime
+            except FileNotFoundError:
+                return 0.0
+        files = sorted(self.root.glob("*.pkl"), key=_safe_mtime)
         # Prune oldest if over cap.
         if len(files) > self.max_games:
             for old in files[: len(files) - self.max_games]:
