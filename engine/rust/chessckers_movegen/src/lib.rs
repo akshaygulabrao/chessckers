@@ -195,7 +195,6 @@ fn find_capture_hops(
     let mut waypoints_so_far: Vec<String> = Vec::new();
 
     let mut crossed_rank1 = false;
-    let mut pending_ram: Option<CaptureHop> = None;
 
     let path = match capture_paths().get(&(f0, r0, df0, dr0)) {
         Some(p) => p,
@@ -212,16 +211,13 @@ fn find_capture_hops(
         if step.r == 0 {
             crossed_rank1 = true;
         }
-        let step_num = step_idx + 1; // 1-based, matches Python `step`
+        let _step_num = step_idx + 1; // 1-based, matches Python `step`
 
         if step.sq >= 0 {
             let sq = step.sq as u8;
             let cap_mask = 1u64 << sq;
             if captured_set & cap_mask != 0 {
                 // Revisit of an already-captured (now empty) square.
-                if let Some(p) = pending_ram.take() {
-                    options.push(p);
-                }
                 if !captures_so_far.is_empty() {
                     options.push(CaptureHop {
                         direction: (step.df, step.dr),
@@ -237,9 +233,6 @@ fn find_capture_hops(
                 let o = owner(occupied, occupied_white, sq);
                 match o {
                     SQ_EMPTY => {
-                        if let Some(p) = pending_ram.take() {
-                            options.push(p);
-                        }
                         if !captures_so_far.is_empty() {
                             options.push(CaptureHop {
                                 direction: (step.df, step.dr),
@@ -253,17 +246,18 @@ fn find_capture_hops(
                         }
                     }
                     SQ_BLACK if stacks.contains_key(&sq) => {
-                        // Friendly tower → invalidate pending k=d ram.
-                        pending_ram = None;
+                        // Friendly tower terminates the trace.
                         break;
                     }
                     _ => {
                         // White piece (or defensive black-without-stack).
-                        if let Some(p) = pending_ram.take() {
-                            options.push(p);
-                        }
-                        if step_num <= n || !captures_so_far.is_empty() {
-                            let ram = CaptureHop {
+                        // Per §3B step 2: rams require k > d (path capture
+                        // exists). Landing on the first enemy (captures_so_far
+                        // empty) is no longer a legal hop. Emit ram BEFORE
+                        // adding this white to captures_so_far so the landing
+                        // White isn't double-counted.
+                        if !captures_so_far.is_empty() {
+                            options.push(CaptureHop {
                                 direction: (step.df, step.dr),
                                 landing_key: cur_key.clone(),
                                 landing_square: Some(sq),
@@ -271,12 +265,7 @@ fn find_capture_hops(
                                 waypoints: waypoints_so_far.clone(),
                                 is_suicide: true,
                                 crossed_rank1,
-                            };
-                            if captures_so_far.is_empty() {
-                                pending_ram = Some(ram);
-                            } else {
-                                options.push(ram);
-                            }
+                            });
                         }
                         captures_so_far.push(sq);
                         captured_set |= cap_mask;
@@ -285,9 +274,6 @@ fn find_capture_hops(
             }
         } else {
             // Rim square (T) — never friendly.
-            if let Some(p) = pending_ram.take() {
-                options.push(p);
-            }
             if !captures_so_far.is_empty() {
                 options.push(CaptureHop {
                     direction: (step.df, step.dr),
@@ -965,16 +951,22 @@ fn black_charge_moves_native(
                 };
 
                 if is_ram {
-                    moves.push(ChargeMove {
-                        uci: format!("{}{}", from_name, to_name),
-                        from_name: from_name.clone(),
-                        to_name,
-                        piece: "king",
-                        capture: capture_field,
-                        demoted_kings: None,
-                        demotions_required: None,
-                        source_king_positions: None,
-                    });
+                    // Per §3C (revised): rams require ≥1 path capture —
+                    // the charge must overshoot at least one enemy before
+                    // crashing. A dist-1 charge has 0 intermediate squares
+                    // and is illegal as a ram.
+                    if !path_captures.is_empty() {
+                        moves.push(ChargeMove {
+                            uci: format!("{}{}", from_name, to_name),
+                            from_name: from_name.clone(),
+                            to_name,
+                            piece: "king",
+                            capture: capture_field,
+                            demoted_kings: None,
+                            demotions_required: None,
+                            source_king_positions: None,
+                        });
+                    }
                     continue;
                 }
 
