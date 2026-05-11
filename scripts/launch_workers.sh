@@ -85,6 +85,28 @@ else
     uv pip install --python '$PYTHON_BIN' -e '$WORK_DIR/engine'"
 fi
 
+# ---- 2b. N_WORKERS=auto: derive from cgroup / sysctl --------------------
+# On vast, nproc returns the HOST core count (e.g. 64), not the bid's
+# effective allotment — cgroup CPU quota is the real cap. On macOS, the
+# cgroup files don't exist; sysctl is truth. Subtract RESERVE_CORES so
+# the inference server thread + pruner + ssh have headroom.
+if [ "${N_WORKERS:-}" = "auto" ]; then
+  CORES=$(remote 'if [ -f /sys/fs/cgroup/cpu.max ]; then
+    read -r q p < /sys/fs/cgroup/cpu.max
+    [ "$q" != "max" ] && [ -n "$p" ] && echo $((q/p)) && exit 0
+  fi
+  if [ -f /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
+    q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us); p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+    [ "$q" != "-1" ] && [ -n "$p" ] && echo $((q/p)) && exit 0
+  fi
+  command -v sysctl >/dev/null && sysctl -n hw.ncpu 2>/dev/null && exit 0
+  nproc' | tr -d '[:space:]')
+  RESERVE="${RESERVE_CORES:-2}"
+  N_WORKERS=$(( CORES - RESERVE ))
+  [ "$N_WORKERS" -lt 1 ] && N_WORKERS=1
+  log "N_WORKERS=auto -> $N_WORKERS  (effective cores=$CORES, reserve=$RESERVE)"
+fi
+
 # ---- 3. launch in tmux ---------------------------------------------------
 # Args common to both modes (model arch, MCTS hyper-params, shared inference).
 SHARED_ARGS="--run-dir '$RUN_DIR' \
