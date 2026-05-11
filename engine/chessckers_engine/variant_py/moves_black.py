@@ -333,11 +333,11 @@ def _find_capture_hops(
     Walk along (df0, dr0) up to n+1 steps from (f0, r0) using the
     precomputed straight-diagonal path (`_CAPTURE_PATHS`). Emit a CaptureHop
     for every legal landing (every k where the hop terminates: empty board
-    revisit-after-capture, White ram, empty board with prior captures, or
-    rim-T after captures). Defers k=d (first-enemy) rams until the next
-    step proves k=d+1 reachable per §3B step 5. Per spec §3B step 3 there
-    is no bouncing — if the precomputed path runs out before reaching
-    cadence, that direction is unavailable."""
+    revisit-after-capture, White ram (k > d only), empty board with prior
+    captures, or rim-T after captures). Per §3B step 2, rams require k > d
+    — the first-enemy ram (k=d, no path captures) is no longer emitted.
+    Per spec §3B step 3 there is no bouncing — if the precomputed path
+    runs out before reaching cadence, that direction is unavailable."""
     options: list[CaptureHop] = []
     captures_so_far: list[int] = []
     captured_set: set[int] = set()
@@ -350,7 +350,6 @@ def _find_capture_hops(
     occupied_white = board.occupied_co[chess.WHITE]
 
     crossed_rank1 = False
-    pending_ram: CaptureHop | None = None
 
     path = _CAPTURE_PATHS[(f0, r0, df0, dr0)]
     # Walk only the steps we actually need: max n+1 steps; precomputed path
@@ -368,9 +367,6 @@ def _find_capture_hops(
         if sq != -1:
             if sq in captured_set:
                 # Revisit of an already-captured (now empty) square.
-                if pending_ram is not None:
-                    options.append(pending_ram)
-                    pending_ram = None
                 if captures_so_far:
                     options.append(CaptureHop(
                         direction=(df, dr),
@@ -391,9 +387,6 @@ def _find_capture_hops(
                 else:
                     owner = SQ_BLACK
                 if owner == SQ_EMPTY:
-                    if pending_ram is not None:
-                        options.append(pending_ram)
-                        pending_ram = None
                     if captures_so_far:
                         options.append(CaptureHop(
                             direction=(df, dr),
@@ -404,17 +397,14 @@ def _find_capture_hops(
                             crossed_rank1=crossed_rank1,
                         ))
                 elif owner == SQ_BLACK and sq in stacks:
-                    # Friendly tower at k=d+1 invalidates a pending k=d ram.
-                    pending_ram = None
+                    # Friendly tower terminates the trace.
                     break
                 else:
                     # White piece (or Black-piece-without-stack, defensive).
-                    if pending_ram is not None:
-                        options.append(pending_ram)
-                        pending_ram = None
-                    # n+1 gating: A White only reachable at step n+1 with no
-                    # prior captures is not a valid first enemy.
-                    if step <= n or captures_so_far:
+                    # Per §3B step 2: rams require k > d (an intermediate path
+                    # capture must have already happened). Landing on the first
+                    # enemy (captures_so_far empty) is no longer a legal hop.
+                    if captures_so_far:
                         ram_hop = CaptureHop(
                             direction=(df, dr),
                             landing_key=cur_key,
@@ -424,18 +414,11 @@ def _find_capture_hops(
                             is_suicide=True,
                             crossed_rank1=crossed_rank1,
                         )
-                        if not captures_so_far:
-                            # k=d ram — defer until next step proves k=d+1 reachable.
-                            pending_ram = ram_hop
-                        else:
-                            options.append(ram_hop)
+                        options.append(ram_hop)
                     captures_so_far.append(sq)
                     captured_set.add(sq)
         else:
-            # Rim square (T) — never friendly. Commit pending ram + emit T-landing if captures.
-            if pending_ram is not None:
-                options.append(pending_ram)
-                pending_ram = None
+            # Rim square (T) — never friendly. Emit T-landing if captures.
             if captures_so_far:
                 options.append(CaptureHop(
                     direction=(df, dr),
@@ -1106,22 +1089,27 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
                     capture_field = None
 
                 if is_ram:
-                    # Ram: tower destroyed at landing; demotion choice is moot.
-                    moves.append({
-                        "uci": f"{from_name}{to_name}",
-                        "from": from_name,
-                        "to": to_name,
-                        "piece": "king",
-                        "color": "black",
-                        "capture": capture_field,
-                        "waypoints": None,
-                        "chainHops": None,
-                        "promotion": None,
-                        "demotedKings": None,
-                        "demotionsRequired": None,
-                        "sourceKingPositions": None,
-                        "deployCount": None,
-                    })
+                    # Per §3C (revised): rams require at least one path
+                    # capture — the charge must overshoot at least one enemy
+                    # before crashing. A distance-1 ram (no intermediate
+                    # squares) has zero path captures and is illegal.
+                    if path_captures:
+                        # Ram: tower destroyed at landing; demotion choice is moot.
+                        moves.append({
+                            "uci": f"{from_name}{to_name}",
+                            "from": from_name,
+                            "to": to_name,
+                            "piece": "king",
+                            "color": "black",
+                            "capture": capture_field,
+                            "waypoints": None,
+                            "chainHops": None,
+                            "promotion": None,
+                            "demotedKings": None,
+                            "demotionsRequired": None,
+                            "sourceKingPositions": None,
+                            "deployCount": None,
+                        })
                     # The white at d remains on the board for OUR move-gen
                     # purposes; longer charges pass over it as a path capture
                     # (not a blocker). Continue scanning.
