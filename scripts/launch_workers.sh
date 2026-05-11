@@ -46,7 +46,12 @@ remote() {
   if [ "$HOST" = "local" ]; then
     bash -lc "$1"
   else
-    ssh "${SSH_OPTS[@]}" -p "$PORT" "$USER@$HOST" "$1"
+    # Prepend /opt/homebrew/bin + /usr/local/bin so brew-installed tools
+    # (tmux, uv) on macOS remotes are findable — zsh over non-interactive
+    # ssh only sources .zshenv, not .zprofile where brew shellenv lives.
+    # On Linux remotes those paths don't exist; harmless prepend.
+    ssh "${SSH_OPTS[@]}" -p "$PORT" "$USER@$HOST" \
+      "export PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH; $1"
   fi
 }
 
