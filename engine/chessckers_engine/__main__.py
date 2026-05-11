@@ -22,6 +22,18 @@ def main() -> int:
     port = int(os.environ.get("ENGINE_PORT", "8082"))
     default_picker = os.environ.get("ENGINE_DEFAULT_PICKER", "random")
     mcts_sims = int(os.environ.get("ENGINE_MCTS_SIMS", "100"))
+    puct_sims = int(os.environ.get("ENGINE_PUCT_SIMS", "50"))
+    # Override the ChesskersScorer arch for nn/puct pickers when the
+    # trained checkpoint isn't the default (128, 96, 4) shape. Required
+    # because load_checkpoint() uses strict=False — a shape mismatch
+    # would silently leave most layers at random init.
+    arch_overrides: dict[str, int] = {}
+    for env_key, kwarg in (("ENGINE_D_HIDDEN", "d_hidden"),
+                            ("ENGINE_C_FILTERS", "c_filters"),
+                            ("ENGINE_N_BLOCKS", "n_blocks")):
+        v = os.environ.get(env_key)
+        if v is not None:
+            arch_overrides[kwarg] = int(v)
 
     # ENGINE_MODEL takes precedence; if unset, auto-pick the latest .pt under weights/.
     model_path = os.environ.get("ENGINE_MODEL")
@@ -39,7 +51,8 @@ def main() -> int:
         log.error("cannot reach API at %s (start the server first)", api_url)
         return 1
 
-    pickers = build_pickers(client, model_path, log, mcts_sims=mcts_sims)
+    pickers = build_pickers(client, model_path, log, mcts_sims=mcts_sims,
+                             puct_sims=puct_sims, **arch_overrides)
     if default_picker not in pickers:
         log.error("ENGINE_DEFAULT_PICKER=%r is not in available pickers %s", default_picker, sorted(pickers))
         client.close()

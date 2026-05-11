@@ -37,6 +37,9 @@ def build_pickers(
     log: logging.Logger,
     mcts_sims: int = 100,
     puct_sims: int = 50,
+    d_hidden: int | None = None,
+    c_filters: int | None = None,
+    n_blocks: int | None = None,
 ) -> dict[str, Picker]:
     pickers: dict[str, Picker] = {}
 
@@ -60,7 +63,14 @@ def build_pickers(
         from chessckers_engine.model import ChesskersScorer
         from chessckers_engine.nn_player import pick_nn
 
-        model = ChesskersScorer()
+        # When the trained checkpoint uses a non-default arch, pass it
+        # explicitly. load_checkpoint() uses strict=False, so a shape
+        # mismatch would silently leave most layers at random init.
+        arch_kwargs: dict[str, int] = {}
+        if d_hidden is not None: arch_kwargs["d_hidden"] = d_hidden
+        if c_filters is not None: arch_kwargs["c_filters"] = c_filters
+        if n_blocks is not None: arch_kwargs["n_blocks"] = n_blocks
+        model = ChesskersScorer(**arch_kwargs)
         if model_path:
             log.info("loading NN weights from %s", model_path)
             load_checkpoint(model, model_path)
