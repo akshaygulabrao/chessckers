@@ -626,7 +626,16 @@ def _build_final_move(
     from_name = _SQ_NAME[chain_start]
     dest_name = _SQ_NAME[final_landing]
     if len(hops) > 1:
-        uci = f"{from_name}~{'~'.join(all_waypoints)}~{dest_name}"
+        # UCI shows ONLY hop landings (each chainHop), not the in-between
+        # squares each hop traverses. For chains that bounced off the rim,
+        # the dest is the end-of-turn-fallback square and differs from the
+        # last hop landing — include it. For chains that don't bounce, the
+        # last hop landing IS dest, so don't duplicate it.
+        landings = [hop.landing_key for hop in hops]
+        if landings[-1] != dest_name:
+            uci = f"{from_name}~{'~'.join(landings)}~{dest_name}"
+        else:
+            uci = f"{from_name}~{'~'.join(landings)}"
         waypoints_field: list[str] | None = list(all_waypoints)
     else:
         uci = f"{from_name}{dest_name}"
