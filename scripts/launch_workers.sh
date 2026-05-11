@@ -140,7 +140,13 @@ case "${MODE:-workers_only}" in
 esac
 
 log "[3/3] launch $MODULE (MODE=$MODE) in tmux session 'workers'"
-CMD="cd '$WORK_DIR/engine' && exec '$PYTHON_BIN' -m $MODULE $SHARED_ARGS $MODE_ARGS"
+# OMP/MKL=1 prevents PyTorch oversubscription: each of N worker processes
+# would otherwise default to ~N OMP threads, totalling N^2 threads
+# fighting for the same cores. Single-thread per worker is correct when
+# we have many worker processes (i.e. per-worker inference mode); harmless
+# when --shared-inference is set (only the server thread does forwards).
+CMD="cd '$WORK_DIR/engine' && OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  exec '$PYTHON_BIN' -m $MODULE $SHARED_ARGS $MODE_ARGS"
 
 remote "mkdir -p '$RUN_DIR'; tmux kill-session -t workers 2>/dev/null; \
   tmux new-session -d -s workers \"$CMD\""
