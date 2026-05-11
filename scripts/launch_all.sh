@@ -7,15 +7,30 @@
 # Idempotent: aborts if any of the three pieces is already running.
 #
 # Usage:
-#   scripts/launch_all.sh <vast_host> <vast_port>
+#   scripts/launch_all.sh <vast_instance_id>
+#
+# Resolves direct SSH (public_ipaddr + direct_port_end) from the instance
+# ID via `vastai ssh-url` — never uses the proxy ssh*.vast.ai endpoint
+# (proxy is unreliable; see feedback memory).
 #
 # Env:
 #   SKIP_SYNC=1   don't start the sync sidecar (you'll need it eventually
 #                 or cloud workers stay idle waiting for weights.pt).
 set -euo pipefail
 
-VAST_HOST="${1:?Usage: $0 <vast_host> <vast_port>}"
-VAST_PORT="${2:?Usage: $0 <vast_host> <vast_port>}"
+VAST_INSTANCE="${1:?Usage: $0 <vast_instance_id>}"
+
+# Resolve direct SSH. `vastai ssh-url` returns ssh://root@<ip>:<port>.
+SSH_URL=$(vastai ssh-url "$VAST_INSTANCE" 2>&1)
+case "$SSH_URL" in
+  ssh://*) ;;
+  *) echo "ABORT: could not resolve ssh-url for instance $VAST_INSTANCE: $SSH_URL" >&2; exit 1 ;;
+esac
+# Strip ssh:// then split user@host:port.
+SSH_REST="${SSH_URL#ssh://*@}"
+VAST_HOST="${SSH_REST%:*}"
+VAST_PORT="${SSH_REST##*:}"
+echo "[$(date +%H:%M:%S)] resolved instance $VAST_INSTANCE -> $VAST_HOST:$VAST_PORT (direct)" >&2
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
