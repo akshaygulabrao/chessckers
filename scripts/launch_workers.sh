@@ -121,8 +121,11 @@ SHARED_ARGS="--run-dir '$RUN_DIR' \
 case "${MODE:-workers_only}" in
   bundled)
     # selfplay_az_async = workers + trainer + eval in one supervised process.
+    # --eval-workers 1: keep the periodic NN-vs-random eval cheap (default
+    # was 4, which spawned 4 extra worker processes for ~minutes during
+    # each eval cycle — noticeable on a quiet dev laptop).
     MODULE="chessckers_engine.selfplay_az_async"
-    MODE_ARGS="--run-seconds ${RUN_SECONDS:-86400}"
+    MODE_ARGS="--run-seconds ${RUN_SECONDS:-86400} --eval-workers ${EVAL_WORKERS:-1}"
     [ -n "${RESUME_FROM:-}" ] && MODE_ARGS="$MODE_ARGS --resume-from '$RESUME_FROM'"
     [ -n "${BASE_WEIGHTS:-}" ] && MODE_ARGS="$MODE_ARGS --base '$BASE_WEIGHTS'"
     ;;
