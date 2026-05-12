@@ -1062,32 +1062,65 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
                 if stop_after:
                     break
                 # Scan path 1..d-1 for blockers / collect path captures fresh.
+                # Per §3C revised: rim squares are allowed mid-path (no
+                # pieces there, no captures); only off-grid (file/rank
+                # outside [-1, 8] in board coords) invalidates the charge.
                 blocked = False
+                off_grid = False
                 path_captures: list[str] = []
+                last_on_board_sq: int | None = None
                 for k in range(1, d):
                     pf = from_file + k * df
                     pr = from_rank + k * dr
-                    psq = chess.square(pf, pr)
-                    powner = _owner(state.board, psq)
-                    if powner != SQ_EMPTY:
+                    if pf < -1 or pf > 8 or pr < -1 or pr > 8:
+                        off_grid = True
+                        break
+                    if 0 <= pf <= 7 and 0 <= pr <= 7:
+                        psq = chess.square(pf, pr)
+                        powner = _owner(state.board, psq)
                         if powner == SQ_BLACK and psq in state.stacks:
                             blocked = True
                             break
                         if powner == SQ_WHITE:
                             path_captures.append(_SQ_NAME[psq])
+                        last_on_board_sq = psq
+                    # else: rim square, no action
+                if off_grid:
+                    # Higher d would also be off-grid in this direction.
+                    break
                 if blocked:
                     break
                 tf = from_file + d * df
                 tr = from_rank + d * dr
-                if not _on_board(tf, tr):
-                    break
-                to_sq = chess.square(tf, tr)
-                to_name = _SQ_NAME[to_sq]
-                towner = _owner(state.board, to_sq)
-                is_ram = towner == SQ_WHITE
-                is_friendly_merge = (
-                    towner == SQ_BLACK and to_sq in state.stacks
-                )
+                if tf < -1 or tf > 8 or tr < -1 or tr > 8:
+                    break  # off-grid landing; higher d also off-grid
+                # Determine landing classification: board / rim-with-fallback.
+                if 0 <= tf <= 7 and 0 <= tr <= 7:
+                    to_sq = chess.square(tf, tr)
+                    to_name = _SQ_NAME[to_sq]
+                    towner = _owner(state.board, to_sq)
+                    is_ram = towner == SQ_WHITE
+                    is_friendly_merge = (
+                        towner == SQ_BLACK and to_sq in state.stacks
+                    )
+                else:
+                    # Rim landing → fallback to last on-board square (per §3C
+                    # revised). If no path step landed on the board (i.e. d=1
+                    # rim, impossible since origin is on board so d=1 lands
+                    # adjacent), there's no fallback target — skip.
+                    if last_on_board_sq is None:
+                        # d=1 charge with rim landing would imply origin is
+                        # one square from rim AND the only step IS rim;
+                        # fallback square == origin, which is a no-op.
+                        continue
+                    to_sq = last_on_board_sq
+                    to_name = _SQ_NAME[to_sq]
+                    # The fallback square is always empty: either it was
+                    # empty originally, or it was a white captured during
+                    # the path traversal. Treat as a normal empty landing.
+                    towner = SQ_EMPTY
+                    is_ram = False
+                    is_friendly_merge = False
 
                 # Capture-field convention (scalachess parity).
                 if path_captures:

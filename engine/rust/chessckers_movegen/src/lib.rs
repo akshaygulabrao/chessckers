@@ -911,14 +911,23 @@ fn black_charge_moves_native(
                 if stop_after {
                     break;
                 }
+                // Path scan 1..d-1. Allow rim squares (no pieces, no
+                // captures). Off-grid (file/rank outside [-1, 8]) ends
+                // the charge for this and higher d.
                 let mut blocked = false;
+                let mut off_grid = false;
                 let mut path_captures: Vec<String> = Vec::new();
+                let mut last_on_board_sq: Option<u8> = None;
                 for k in 1..d {
                     let pf = from_file + (k as i8) * df;
                     let pr = from_rank + (k as i8) * dr;
-                    let psq = sq_idx(pf, pr);
-                    let powner = owner(occupied, occupied_white, psq);
-                    if powner != SQ_EMPTY {
+                    if pf < -1 || pf > 8 || pr < -1 || pr > 8 {
+                        off_grid = true;
+                        break;
+                    }
+                    if (0..=7).contains(&pf) && (0..=7).contains(&pr) {
+                        let psq = sq_idx(pf, pr);
+                        let powner = owner(occupied, occupied_white, psq);
                         if powner == SQ_BLACK && stacks.contains_key(&psq) {
                             blocked = true;
                             break;
@@ -926,21 +935,41 @@ fn black_charge_moves_native(
                         if powner == SQ_WHITE {
                             path_captures.push(sq_n[psq as usize].clone());
                         }
+                        last_on_board_sq = Some(psq);
                     }
+                    // else: rim square, no action
+                }
+                if off_grid {
+                    break;
                 }
                 if blocked {
                     break;
                 }
                 let tf = from_file + (d as i8) * df;
                 let tr = from_rank + (d as i8) * dr;
-                if !on_board(tf, tr) {
-                    break;
+                if tf < -1 || tf > 8 || tr < -1 || tr > 8 {
+                    break; // off-grid landing
                 }
-                let to_sq = sq_idx(tf, tr);
-                let to_name = sq_n[to_sq as usize].clone();
-                let towner = owner(occupied, occupied_white, to_sq);
-                let is_ram = towner == SQ_WHITE;
-                let is_friendly_merge = towner == SQ_BLACK && stacks.contains_key(&to_sq);
+                // Landing classification: on-board or rim-with-fallback.
+                let (to_sq, to_name, towner, is_ram, is_friendly_merge) =
+                    if (0..=7).contains(&tf) && (0..=7).contains(&tr) {
+                        let s = sq_idx(tf, tr);
+                        let n = sq_n[s as usize].clone();
+                        let o = owner(occupied, occupied_white, s);
+                        let r = o == SQ_WHITE;
+                        let m = o == SQ_BLACK && stacks.contains_key(&s);
+                        (s, n, o, r, m)
+                    } else {
+                        // Rim landing → fallback to last on-board square.
+                        // If no on-board path step exists (d=1 rim), skip.
+                        match last_on_board_sq {
+                            Some(s) => {
+                                let n = sq_n[s as usize].clone();
+                                (s, n, SQ_EMPTY, false, false)
+                            }
+                            None => continue,
+                        }
+                    };
 
                 let capture_field: Option<String> = if !path_captures.is_empty() {
                     Some(path_captures[0].clone())
