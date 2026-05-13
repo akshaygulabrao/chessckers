@@ -126,7 +126,19 @@ case "${MODE:-workers_only}" in
     # each eval cycle — noticeable on a quiet dev laptop).
     MODULE="chessckers_engine.selfplay_az_async"
     MODE_ARGS="--run-seconds ${RUN_SECONDS:-86400} --eval-workers ${EVAL_WORKERS:-1}"
-    [ -n "${RESUME_FROM:-}" ] && MODE_ARGS="$MODE_ARGS --resume-from '$RESUME_FROM'"
+    # Prefer the latest durable checkpoint written by THIS run over RESUME_FROM.
+    # RESUME_FROM is the *seed* for the first launch in a fresh run dir; once
+    # the trainer has written checkpoints into $RUN_DIR/checkpoints/, every
+    # subsequent restart should pick those up so we don't redo the steps
+    # between RESUME_FROM and the last checkpoint.
+    LATEST_CKPT=$(remote "ls -t '$RUN_DIR/checkpoints/'*.pt 2>/dev/null | head -1" | tr -d '[:space:]')
+    if [ -n "$LATEST_CKPT" ]; then
+      log "  resume: $LATEST_CKPT (latest local; overrides RESUME_FROM=$RESUME_FROM)"
+      MODE_ARGS="$MODE_ARGS --resume-from '$LATEST_CKPT'"
+    elif [ -n "${RESUME_FROM:-}" ]; then
+      log "  resume: $RESUME_FROM (no local checkpoints yet)"
+      MODE_ARGS="$MODE_ARGS --resume-from '$RESUME_FROM'"
+    fi
     [ -n "${BASE_WEIGHTS:-}" ] && MODE_ARGS="$MODE_ARGS --base '$BASE_WEIGHTS'"
     [ -n "${RUN_GAMES:-}" ] && MODE_ARGS="$MODE_ARGS --run-games $RUN_GAMES"
     [ -n "${EXTRA_BUNDLED_ARGS:-}" ] && MODE_ARGS="$MODE_ARGS $EXTRA_BUNDLED_ARGS"
