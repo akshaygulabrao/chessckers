@@ -128,6 +128,8 @@ case "${MODE:-workers_only}" in
     MODE_ARGS="--run-seconds ${RUN_SECONDS:-86400} --eval-workers ${EVAL_WORKERS:-1}"
     [ -n "${RESUME_FROM:-}" ] && MODE_ARGS="$MODE_ARGS --resume-from '$RESUME_FROM'"
     [ -n "${BASE_WEIGHTS:-}" ] && MODE_ARGS="$MODE_ARGS --base '$BASE_WEIGHTS'"
+    [ -n "${RUN_GAMES:-}" ] && MODE_ARGS="$MODE_ARGS --run-games $RUN_GAMES"
+    [ -n "${EXTRA_BUNDLED_ARGS:-}" ] && MODE_ARGS="$MODE_ARGS $EXTRA_BUNDLED_ARGS"
     ;;
   workers_only)
     # Pure inference farm. Reads $RUN_DIR/weights.pt, polls for updates.

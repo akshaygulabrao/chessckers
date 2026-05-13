@@ -48,6 +48,29 @@ from chessckers_engine.trainer_loop import TrainerLoop
 log = logging.getLogger("chessckers_engine.selfplay_az_async")
 
 
+def _count_lifetime_games(buffer_root: Path) -> int:
+    """Sum over workers of max game_id seen in buffer/.
+
+    Filenames are '<worker_id>_<game_id>.pkl' where game_id increments per
+    finished game within a worker process. Buffer pruning evicts oldest
+    mtime first (= lowest game_id), so the per-worker max persists and the
+    sum is a monotonic lifetime-games proxy across the bundled-mode run.
+    Returns 0 if the dir doesn't exist yet."""
+    if not buffer_root.exists():
+        return 0
+    maxes: dict[str, int] = {}
+    for p in buffer_root.glob("*.pkl"):
+        stem = p.stem
+        try:
+            wid, gid_str = stem.split("_", 1)
+            gid = int(gid_str)
+        except (ValueError, IndexError):
+            continue
+        if gid > maxes.get(wid, 0):
+            maxes[wid] = gid
+    return sum(maxes.values())
+
+
 def _build_worker_payload(worker_id: int, *, buffer_root: Path,
                           stop_path: Path, n_sims: int, c_puct: float,
                           temperature: float, dirichlet_alpha: float,
@@ -99,9 +122,14 @@ def _build_worker_payload(worker_id: int, *, buffer_root: Path,
 def _eval_snapshot_and_log(*, weights_path: Path, snapshot_path: Path,
                            model_arch: dict, device: str, eval_games: int,
                            eval_sims: int, eval_workers: int, eval_log_path: Path,
-                           trainer_step: int) -> dict:
-    """Snapshot current weights and play `eval_games` vs random, both sides.
-    Appends one JSON line to `eval_log_path` and returns the summary."""
+                           trainer_step: int,
+                           eval_opponents: Optional[list[tuple[str, Path]]] = None) -> dict:
+    """Snapshot current weights and play `eval_games` vs random + each opponent, both sides.
+    Appends one JSON line to `eval_log_path` and returns the summary.
+
+    `eval_opponents` is a list of (label, checkpoint_path) pairs. For each, two
+    additional series run: snapshot-as-white-vs-opp-as-black and vice versa.
+    Results land under keys `as_white_vs_<label>` / `as_black_vs_<label>`."""
     if not weights_path.exists():
         log.info("eval skipped — weights not yet written")
         return {}
@@ -115,7 +143,7 @@ def _eval_snapshot_and_log(*, weights_path: Path, snapshot_path: Path,
     as_black = _run_eval_parallel(
         None, str(snapshot_path), eval_games, eval_sims, model_arch, device, eval_workers,
     )
-    summary = {
+    summary: dict = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "trainer_step": trainer_step,
         "eval_games_per_side": eval_games,
@@ -123,13 +151,31 @@ def _eval_snapshot_and_log(*, weights_path: Path, snapshot_path: Path,
         "as_white_vs_random": as_white,
         "as_black_vs_random": as_black,
     }
-    with eval_log_path.open("a") as f:
-        f.write(json.dumps(summary))
-        f.write("\n")
-    log.info("eval @ step %d | W: %d/%d/%d | B: %d/%d/%d",
+    log.info("eval @ step %d vs random | W: %d/%d/%d | B: %d/%d/%d",
              trainer_step,
              as_white["white"], as_white["black"], as_white["draw"],
              as_black["black"], as_black["white"], as_black["draw"])
+    for label, opp_path in (eval_opponents or []):
+        opp_str = str(opp_path)
+        # snapshot plays white; opponent plays black
+        vs_w = _run_eval_parallel(
+            str(snapshot_path), opp_str, eval_games, eval_sims,
+            model_arch, device, eval_workers,
+        )
+        # snapshot plays black; opponent plays white
+        vs_b = _run_eval_parallel(
+            opp_str, str(snapshot_path), eval_games, eval_sims,
+            model_arch, device, eval_workers,
+        )
+        summary[f"as_white_vs_{label}"] = vs_w
+        summary[f"as_black_vs_{label}"] = vs_b
+        log.info("eval @ step %d vs %s | W: %d/%d/%d | B: %d/%d/%d",
+                 trainer_step, label,
+                 vs_w["white"], vs_w["black"], vs_w["draw"],
+                 vs_b["black"], vs_b["white"], vs_b["draw"])
+    with eval_log_path.open("a") as f:
+        f.write(json.dumps(summary))
+        f.write("\n")
     return summary
 
 
@@ -160,9 +206,11 @@ def run_async_training(
     eval_sims: int = 200,
     eval_workers: int = 4,
     run_seconds: float = 24 * 3600,
+    run_games: Optional[int] = None,
     seed: int = 0,
     base_weights: Optional[Path] = None,
     resume_from: Optional[Path] = None,
+    eval_opponents: Optional[list[tuple[str, Path]]] = None,
     main_loop_poll_seconds: float = 5.0,
     shared_inference: bool = False,
     shared_max_batch_size: int = 64,
@@ -288,9 +336,19 @@ def run_async_training(
 
     start = time.perf_counter()
     last_eval = 0.0  # first eval fires after eval_every_seconds wall-clock
+    last_games_log = 0
     try:
         while not stop_path.exists() and (time.perf_counter() - start) < run_seconds:
             elapsed = time.perf_counter() - start
+            if run_games is not None:
+                games_done = _count_lifetime_games(buffer_root)
+                if games_done - last_games_log >= 100:
+                    log.info("games progress: %d / %d", games_done, run_games)
+                    last_games_log = games_done
+                if games_done >= run_games:
+                    log.info("game target hit: %d >= %d — tripping stop file", games_done, run_games)
+                    stop_path.touch()
+                    break
             if (elapsed - last_eval) >= eval_every_seconds and trainer.step > 0:
                 _eval_snapshot_and_log(
                     weights_path=weights_path, snapshot_path=eval_snapshot_path,
@@ -298,6 +356,7 @@ def run_async_training(
                     eval_games=eval_games, eval_sims=eval_sims,
                     eval_workers=eval_workers, eval_log_path=eval_log_path,
                     trainer_step=trainer.step,
+                    eval_opponents=eval_opponents,
                 )
                 last_eval = elapsed
             time.sleep(main_loop_poll_seconds)
@@ -377,6 +436,10 @@ def main() -> int:
     p.add_argument("--eval-sims", type=int, default=200)
     p.add_argument("--eval-workers", type=int, default=4)
     p.add_argument("--run-seconds", type=float, default=24 * 3600)
+    p.add_argument("--run-games", type=int, default=None,
+                   help="Stop after this many lifetime games across all workers. "
+                        "If set, ends the run when reached. --run-seconds still "
+                        "applies as a safety cap; whichever fires first wins.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--base", type=Path, default=None,
                    help="Optional starting weights to load before training (model only).")
@@ -384,6 +447,10 @@ def main() -> int:
                    help="Resume from a durable checkpoint dict (model + optimizer + step). "
                         "Use over --base when continuing a preempted run, so Adam moments "
                         "and step counter survive.")
+    p.add_argument("--eval-opponent", action="append", default=[], metavar="LABEL=PATH",
+                   help="Extra eval opponent (repeatable). Format 'label=path/to/ckpt.pt' "
+                        "adds two series per cycle: as_white_vs_<label> and as_black_vs_<label>. "
+                        "Bare paths (no '=') derive the label from the filename stem.")
     p.add_argument("--d-hidden", type=int, default=256)
     p.add_argument("--c-filters", type=int, default=128)
     p.add_argument("--n-blocks", type=int, default=6)
@@ -401,6 +468,14 @@ def main() -> int:
     args = p.parse_args()
 
     model_arch = {"d_hidden": args.d_hidden, "c_filters": args.c_filters, "n_blocks": args.n_blocks}
+    eval_opponents: list[tuple[str, Path]] = []
+    for token in args.eval_opponent:
+        if "=" in token:
+            label, raw_path = token.split("=", 1)
+        else:
+            raw_path = token
+            label = Path(raw_path).stem
+        eval_opponents.append((label, Path(raw_path)))
     run_async_training(
         run_dir=args.run_dir, model_arch=model_arch, device=args.device,
         n_workers=args.workers, n_sims=args.sims, c_puct=args.c_puct,
@@ -413,8 +488,10 @@ def main() -> int:
         grad_clip=args.grad_clip, value_loss_weight=args.value_loss_weight,
         eval_every_seconds=args.eval_every_seconds, eval_games=args.eval_games,
         eval_sims=args.eval_sims, eval_workers=args.eval_workers,
-        run_seconds=args.run_seconds, seed=args.seed, base_weights=args.base,
+        run_seconds=args.run_seconds, run_games=args.run_games,
+        seed=args.seed, base_weights=args.base,
         resume_from=args.resume_from,
+        eval_opponents=eval_opponents,
         shared_inference=args.shared_inference,
         shared_max_batch_size=args.shared_max_batch_size,
         shared_timeout_ms=args.shared_timeout_ms,
