@@ -48,6 +48,30 @@ from chessckers_engine.trainer_loop import TrainerLoop
 log = logging.getLogger("chessckers_engine.selfplay_az_async")
 
 
+def _log_eval_to_wandb(wandb_run, opponent_label: str,
+                       vs_w: dict, vs_b: dict, trainer_step: int) -> None:
+    """Log per-opponent/side eval rates to W&B as scalar series.
+
+    Each opponent gets four series per side: win/loss/draw rate + total games.
+    These plot directly in the W&B run dashboard as eval/<opponent>/as_white/...
+    keyed by trainer_step on the x-axis."""
+    if wandb_run is None:
+        return
+    metrics: dict[str, float] = {}
+    for side_label, result in (("as_white", vs_w), ("as_black", vs_b)):
+        games = max(int(result.get("games", 0)), 1)
+        # 'white'/'black' counts the *color* that won; our snapshot played the
+        # color matching side_label, so snapshot_wins is that color's count.
+        snapshot_color = "white" if side_label == "as_white" else "black"
+        opponent_color = "black" if side_label == "as_white" else "white"
+        prefix = f"eval/{opponent_label}/{side_label}"
+        metrics[f"{prefix}/win_rate"] = result.get(snapshot_color, 0) / games
+        metrics[f"{prefix}/loss_rate"] = result.get(opponent_color, 0) / games
+        metrics[f"{prefix}/draw_rate"] = result.get("draw", 0) / games
+        metrics[f"{prefix}/games"] = games
+    wandb_run.log(metrics, step=trainer_step)
+
+
 def _count_games_since(buffer_root: Path, since_mtime: float) -> int:
     """Count *.pkl files in buffer/ with mtime >= since_mtime.
 
@@ -122,7 +146,8 @@ def _eval_snapshot_and_log(*, weights_path: Path, snapshot_path: Path,
                            model_arch: dict, device: str, eval_games: int,
                            eval_sims: int, eval_workers: int, eval_log_path: Path,
                            trainer_step: int,
-                           eval_opponents: Optional[list[tuple[str, Path]]] = None) -> dict:
+                           eval_opponents: Optional[list[tuple[str, Path]]] = None,
+                           wandb_run=None) -> dict:
     """Snapshot current weights and play `eval_games` vs random + each opponent, both sides.
     Appends one JSON line to `eval_log_path` and returns the summary.
 
@@ -154,6 +179,7 @@ def _eval_snapshot_and_log(*, weights_path: Path, snapshot_path: Path,
              trainer_step,
              as_white["white"], as_white["black"], as_white["draw"],
              as_black["black"], as_black["white"], as_black["draw"])
+    _log_eval_to_wandb(wandb_run, "random", as_white, as_black, trainer_step)
     for label, opp_path in (eval_opponents or []):
         opp_str = str(opp_path)
         # snapshot plays white; opponent plays black
@@ -172,6 +198,7 @@ def _eval_snapshot_and_log(*, weights_path: Path, snapshot_path: Path,
                  trainer_step, label,
                  vs_w["white"], vs_w["black"], vs_w["draw"],
                  vs_b["black"], vs_b["white"], vs_b["draw"])
+        _log_eval_to_wandb(wandb_run, label, vs_w, vs_b, trainer_step)
     with eval_log_path.open("a") as f:
         f.write(json.dumps(summary))
         f.write("\n")
@@ -210,6 +237,9 @@ def run_async_training(
     base_weights: Optional[Path] = None,
     resume_from: Optional[Path] = None,
     eval_opponents: Optional[list[tuple[str, Path]]] = None,
+    wandb_project: Optional[str] = "chessckers",
+    wandb_run_id: Optional[str] = None,
+    wandb_mode: str = "online",
     main_loop_poll_seconds: float = 5.0,
     shared_inference: bool = False,
     shared_max_batch_size: int = 64,
@@ -233,6 +263,50 @@ def run_async_training(
 
     if device == "auto":
         device = str(pick_device())
+
+    # Initialise wandb run if not disabled. The run id defaults to the
+    # run_dir basename (e.g. "local-006") so repeated invocations against
+    # the same dir resume the same W&B run — wandb owns the canonical
+    # "where did I leave off" answer instead of fragile filesystem scans.
+    wandb_run = None
+    if wandb_mode not in ("disabled", "off", "none"):
+        try:
+            import wandb as _wandb
+            wandb_run = _wandb.init(
+                project=wandb_project or "chessckers",
+                id=wandb_run_id or run_dir.name,
+                resume="allow",
+                mode=wandb_mode,
+                dir=str(run_dir),
+                config={
+                    "n_workers": n_workers, "n_sims": n_sims, "c_puct": c_puct,
+                    "temperature": temperature,
+                    "dirichlet_alpha": dirichlet_alpha, "dirichlet_eps": dirichlet_eps,
+                    "mcts_batch_size": mcts_batch_size, "vloss_batch": vloss_batch,
+                    "max_plies": max_plies, "trainer_batch_size": trainer_batch_size,
+                    "trainer_lr": trainer_lr, "weight_save_every": weight_save_every,
+                    "checkpoint_every": checkpoint_every,
+                    "buffer_max_games": buffer_max_games, "grad_clip": grad_clip,
+                    "value_loss_weight": value_loss_weight,
+                    "eval_every_seconds": eval_every_seconds,
+                    "eval_games": eval_games, "eval_sims": eval_sims,
+                    "eval_workers": eval_workers, "run_seconds": run_seconds,
+                    "run_games": run_games, "seed": seed,
+                    "base_weights": str(base_weights) if base_weights else None,
+                    "resume_from": str(resume_from) if resume_from else None,
+                    "device": device, "model_arch": model_arch,
+                    "eval_opponents": [
+                        {"label": lbl, "path": str(p)}
+                        for lbl, p in (eval_opponents or [])
+                    ],
+                },
+            )
+            log.info("wandb run: %s (id=%s, mode=%s)",
+                     wandb_run.url if wandb_run else "n/a",
+                     wandb_run.id if wandb_run else "n/a", wandb_mode)
+        except Exception as e:
+            log.warning("wandb init failed (%s); continuing without it", e)
+            wandb_run = None
 
     # Initialize model on `device` and broadcast initial weights so workers
     # don't sit idle waiting for the trainer's first save (which only fires
@@ -328,7 +402,7 @@ def run_async_training(
         weight_save_every=weight_save_every, checkpoint_every=checkpoint_every,
         min_buffer_games=min_buffer_games, value_loss_weight=value_loss_weight,
         grad_clip=grad_clip, log_every=50, stop_event=trainer_stop,
-        resume_from=resume_from,
+        resume_from=resume_from, wandb_run=wandb_run,
     )
     trainer_thread = threading.Thread(target=trainer.run, name="trainer")
     trainer_thread.start()
@@ -348,6 +422,13 @@ def run_async_training(
                 if games_done - last_games_log >= 100:
                     log.info("games progress: %d / %d", games_done, run_games)
                     last_games_log = games_done
+                    if wandb_run is not None:
+                        wandb_run.log({
+                            "games/done": games_done,
+                            "games/target": run_games,
+                            "games/elapsed_min": elapsed / 60.0,
+                            "games/per_min": games_done / max(elapsed / 60.0, 1e-9),
+                        }, step=trainer.step)
                 if games_done >= run_games:
                     log.info("game target hit: %d >= %d — tripping stop file", games_done, run_games)
                     stop_path.touch()
@@ -360,6 +441,7 @@ def run_async_training(
                     eval_workers=eval_workers, eval_log_path=eval_log_path,
                     trainer_step=trainer.step,
                     eval_opponents=eval_opponents,
+                    wandb_run=wandb_run,
                 )
                 last_eval = elapsed
             time.sleep(main_loop_poll_seconds)
@@ -408,6 +490,9 @@ def run_async_training(
     }
     (run_dir / "run_summary.json").write_text(json.dumps(summary, indent=2))
     log.info("done: %s", summary)
+    if wandb_run is not None:
+        wandb_run.summary.update(summary)
+        wandb_run.finish()
     return summary
 
 
@@ -454,6 +539,15 @@ def main() -> int:
                    help="Extra eval opponent (repeatable). Format 'label=path/to/ckpt.pt' "
                         "adds two series per cycle: as_white_vs_<label> and as_black_vs_<label>. "
                         "Bare paths (no '=') derive the label from the filename stem.")
+    p.add_argument("--wandb-project", default="chessckers",
+                   help="W&B project name. Set --wandb-mode disabled to skip W&B entirely.")
+    p.add_argument("--wandb-run-id", default=None,
+                   help="W&B run id (defaults to run_dir basename, e.g. 'local-006'). "
+                        "Repeated launches against the same run_dir resume the same run.")
+    p.add_argument("--wandb-mode", default="online",
+                   choices=["online", "offline", "disabled"],
+                   help="online: stream to wandb.ai; offline: log to local dir for later sync; "
+                        "disabled: no wandb at all.")
     p.add_argument("--d-hidden", type=int, default=256)
     p.add_argument("--c-filters", type=int, default=128)
     p.add_argument("--n-blocks", type=int, default=6)
@@ -495,6 +589,9 @@ def main() -> int:
         seed=args.seed, base_weights=args.base,
         resume_from=args.resume_from,
         eval_opponents=eval_opponents,
+        wandb_project=args.wandb_project,
+        wandb_run_id=args.wandb_run_id,
+        wandb_mode=args.wandb_mode,
         shared_inference=args.shared_inference,
         shared_max_batch_size=args.shared_max_batch_size,
         shared_timeout_ms=args.shared_timeout_ms,

@@ -48,6 +48,7 @@ class TrainerLoop:
         max_steps: Optional[int] = None,
         stop_event: Optional[mp.Event] = None,
         resume_from: Optional[str | os.PathLike] = None,
+        wandb_run=None,
     ):
         self.model = model.to(device)
         self.buffer = buffer
@@ -68,6 +69,7 @@ class TrainerLoop:
         self.max_steps = max_steps
         self.stop_event = stop_event
         self.resume_from = Path(resume_from) if resume_from else None
+        self.wandb_run = wandb_run
         self.step = 0
         # Set lazily in run() so we can rehydrate optimizer state too.
         self._opt: Optional[torch.optim.Optimizer] = None
@@ -181,11 +183,23 @@ class TrainerLoop:
                 now = time.perf_counter()
                 steps_per_s = self.log_every / max(now - last_log, 1e-9)
                 last_log = now
+                p_loss_v = p_loss.item()
+                v_loss_v = v_loss.item()
+                total_v = total.item()
+                buffer_games = self.buffer.count_games()
                 log.info(
                     "step=%d policy=%.4f value=%.4f total=%.4f steps/s=%.2f games=%d",
-                    self.step, p_loss.item(), v_loss.item(), total.item(),
-                    steps_per_s, self.buffer.count_games(),
+                    self.step, p_loss_v, v_loss_v, total_v,
+                    steps_per_s, buffer_games,
                 )
+                if self.wandb_run is not None:
+                    self.wandb_run.log({
+                        "trainer/policy_loss": p_loss_v,
+                        "trainer/value_loss": v_loss_v,
+                        "trainer/total_loss": total_v,
+                        "trainer/steps_per_sec": steps_per_s,
+                        "trainer/buffer_games": buffer_games,
+                    }, step=self.step)
 
         self.save_weights_atomic()
         self.save_checkpoint(suffix="final")
