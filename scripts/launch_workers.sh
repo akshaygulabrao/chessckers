@@ -131,7 +131,15 @@ case "${MODE:-workers_only}" in
     # the trainer has written checkpoints into $RUN_DIR/checkpoints/, every
     # subsequent restart should pick those up so we don't redo the steps
     # between RESUME_FROM and the last checkpoint.
-    LATEST_CKPT=$(remote "ls -t '$RUN_DIR/checkpoints/'*.pt 2>/dev/null | head -1" | tr -d '[:space:]')
+    #
+    # We sort by filename (lexical, descending), NOT mtime. Filenames are
+    # 'step_NNNNNNNN[_final].pt' with zero-padded step numbers, so lexical
+    # sort matches step order. mtime is unreliable here: a restart that
+    # re-passes a step (e.g. trainer resumed from N-2k and re-saves step N)
+    # would re-touch an older checkpoint file and look "latest" by mtime,
+    # even though a higher-step checkpoint from the previous incarnation
+    # still exists with an older mtime.
+    LATEST_CKPT=$(remote "ls '$RUN_DIR/checkpoints/'*.pt 2>/dev/null | sort -r | head -1" | tr -d '[:space:]')
     if [ -n "$LATEST_CKPT" ]; then
       log "  resume: $LATEST_CKPT (latest local; overrides RESUME_FROM=$RESUME_FROM)"
       MODE_ARGS="$MODE_ARGS --resume-from '$LATEST_CKPT'"
