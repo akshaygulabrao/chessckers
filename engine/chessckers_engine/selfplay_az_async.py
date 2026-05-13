@@ -48,27 +48,26 @@ from chessckers_engine.trainer_loop import TrainerLoop
 log = logging.getLogger("chessckers_engine.selfplay_az_async")
 
 
-def _count_lifetime_games(buffer_root: Path) -> int:
-    """Sum over workers of max game_id seen in buffer/.
+def _count_games_since(buffer_root: Path, since_mtime: float) -> int:
+    """Count *.pkl files in buffer/ with mtime >= since_mtime.
 
-    Filenames are '<worker_id>_<game_id>.pkl' where game_id increments per
-    finished game within a worker process. Buffer pruning evicts oldest
-    mtime first (= lowest game_id), so the per-worker max persists and the
-    sum is a monotonic lifetime-games proxy across the bundled-mode run.
-    Returns 0 if the dir doesn't exist yet."""
+    One .pkl == one finished game. The mtime gate excludes games rsync'd in
+    from remote workers' historical buffers (cloud_sync_sidecar uses
+    `rsync -a` which preserves source mtime, so stale leftovers come in
+    with old timestamps and are skipped). Pruning could in principle drop
+    a counted file before the next poll — but the trainer's mtime-based
+    eviction only triggers at buffer overflow (>buffer_max_games=4000),
+    which is far above any --run-games target we set on a single run."""
     if not buffer_root.exists():
         return 0
-    maxes: dict[str, int] = {}
+    n = 0
     for p in buffer_root.glob("*.pkl"):
-        stem = p.stem
         try:
-            wid, gid_str = stem.split("_", 1)
-            gid = int(gid_str)
-        except (ValueError, IndexError):
+            if p.stat().st_mtime >= since_mtime:
+                n += 1
+        except OSError:
             continue
-        if gid > maxes.get(wid, 0):
-            maxes[wid] = gid
-    return sum(maxes.values())
+    return n
 
 
 def _build_worker_payload(worker_id: int, *, buffer_root: Path,
@@ -335,13 +334,17 @@ def run_async_training(
     trainer_thread.start()
 
     start = time.perf_counter()
+    # Wall-clock timestamp for gating the games counter — any .pkl file with
+    # mtime >= run_start_mtime was produced during this run; stale leftovers
+    # rsync'd from remote workers' previous-run buffers don't count.
+    run_start_mtime = time.time()
     last_eval = 0.0  # first eval fires after eval_every_seconds wall-clock
     last_games_log = 0
     try:
         while not stop_path.exists() and (time.perf_counter() - start) < run_seconds:
             elapsed = time.perf_counter() - start
             if run_games is not None:
-                games_done = _count_lifetime_games(buffer_root)
+                games_done = _count_games_since(buffer_root, run_start_mtime)
                 if games_done - last_games_log >= 100:
                     log.info("games progress: %d / %d", games_done, run_games)
                     last_games_log = games_done
