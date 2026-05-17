@@ -6,22 +6,21 @@
 #   RUN_DIR=runs/local-007 scripts/status.sh
 #
 # Probes (in order): local coord, local tmux, sync sidecars, watchdog,
-# remote (Leena + vast) tmux + buffer counts, eval log, latest checkpoint,
-# vast.ai billing status. One section per topic; no command-by-command
-# spelunking required during an incident.
+# worker heartbeats, eval log, latest checkpoint, each active remote tmux
+# + buffer count (sourced from scripts/active_remotes.env), optional
+# vast.ai billing if VAST_INSTANCE is set. One section per topic; no
+# command-by-command spelunking required during an incident.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 RUN_DIR="${RUN_DIR:-$REPO_ROOT/engine/runs/local-006}"
-LEENA_HOST="${LEENA_HOST:-192.168.68.183}"
-LEENA_PORT="${LEENA_PORT:-22}"
-LEENA_USER="${LEENA_USER:-leenagulabrao}"
-LEENA_RUN="${LEENA_RUN:-/Users/leenagulabrao/chessckers/engine/run}"
 VAST_INSTANCE="${VAST_INSTANCE:-}"
-VAST_HOST="${VAST_HOST:-}"
-VAST_PORT="${VAST_PORT:-}"
-VAST_USER="${VAST_USER:-root}"
-VAST_RUN="${VAST_RUN:-/root/run}"
+
+# Active remotes are sourced from one config; this script doesn't hardcode
+# any particular box (so removing/adding a remote is a one-line edit).
+ACTIVE_REMOTES=()
+[ -f scripts/active_remotes.env ] && source scripts/active_remotes.env
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 dim()  { printf '\033[2m%s\033[0m\n' "$*"; }
@@ -120,23 +119,25 @@ if [ -f /tmp/watchdog.log ]; then
 fi
 echo
 
-bold "── Leena remote (${LEENA_HOST}) ──"
-ssh -o ConnectTimeout=3 -p "$LEENA_PORT" "$LEENA_USER@$LEENA_HOST" \
-  'export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
-   tmux ls 2>&1 | head -5
-   if [ -d "'"$LEENA_RUN"'/buffer" ]; then
-     echo "buffer files: $(ls "'"$LEENA_RUN"'/buffer" | wc -l | tr -d " ")"
-   fi' 2>&1 | sed 's/^/  /' | head -10
-echo
-
-if [ -n "$VAST_HOST" ] && [ -n "$VAST_PORT" ]; then
-  bold "── vast remote (${VAST_HOST}:${VAST_PORT}) ──"
-  ssh -o ConnectTimeout=3 -p "$VAST_PORT" "$VAST_USER@$VAST_HOST" \
-    'tmux ls 2>&1 | head -5
-     if [ -d "'"$VAST_RUN"'/buffer" ]; then
-       echo "buffer files: $(ls "'"$VAST_RUN"'/buffer" | wc -l | tr -d " ")"
-     fi' 2>&1 | sed 's/^/  /' | head -10
+if [ "${#ACTIVE_REMOTES[@]}" -eq 0 ]; then
+  bold "── active remotes ──"
+  echo "  (none — local-only run; uncomment lines in scripts/active_remotes.env to add)"
   echo
+else
+  for entry in "${ACTIVE_REMOTES[@]}"; do
+    IFS='|' read -r r_name r_host r_port r_user r_run <<< "$entry"
+    bold "── $r_name ($r_user@$r_host:$r_port) ──"
+    ssh -o ConnectTimeout=3 -p "$r_port" "$r_user@$r_host" \
+      "export PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH
+       tmux ls 2>&1 | head -5
+       if [ -d '$r_run/buffer' ]; then
+         echo \"buffer files: \$(ls '$r_run/buffer' | wc -l | tr -d ' ')\"
+       fi
+       if [ -d '$r_run/heartbeats' ]; then
+         echo \"heartbeat files: \$(ls '$r_run/heartbeats' | wc -l | tr -d ' ')\"
+       fi" 2>&1 | sed 's/^/  /' | head -12
+    echo
+  done
 fi
 
 if [ -n "$VAST_INSTANCE" ] && command -v vastai >/dev/null; then

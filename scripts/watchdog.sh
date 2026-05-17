@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Watchdog for the local-006 training stack.
+# Watchdog for the local training stack.
 #
 # Polls every $POLL_SEC seconds and restarts any of:
 #   - `workers` tmux session (bundled coord: trainer + 1 local worker + eval)
-#   - `sync_leena` tmux session (bidirectional rsync to Leena LAN box)
-#   - `sync_vast`  tmux session (bidirectional rsync to vast.ai box)
+#   - each `sync_*` session listed in scripts/active_remotes.env
 #
 # Exits cleanly when $LOCAL_RUN/STOP exists (run intentionally ended). When
 # the workers coord writes run_summary.json at end-of-run, it also drops a
@@ -14,9 +13,12 @@
 # Launch wrapped in caffeinate so the Mac doesn't idle-sleep:
 #   tmux new-session -d -s watchdog "caffeinate -i bash scripts/watchdog.sh"
 #
+# To add/remove a remote box: edit scripts/active_remotes.env (no code
+# change to this file required).
+#
 # Known limit: this watchdog runs inside tmux; if the tmux server itself
 # dies, the watchdog dies with it. For a fully self-healing setup, run
-# this via launchd instead. Good enough for an overnight run.
+# this via launchd (see scripts/com.chessckers.watchdog.plist).
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,21 +26,13 @@ cd "$REPO_ROOT"
 
 LOCAL_RUN="${LOCAL_RUN:-/Users/ox/AAworkspace/chessckers/engine/runs/local-006}"
 POLL_SEC="${POLL_SEC:-60}"
-
-# Per-target settings inlined here. If we end up adding more sidecars
-# (e.g. a second vast box), refactor to an array; for three sessions it's
-# clearer to read the explicit functions.
-LEENA_HOST="${LEENA_HOST:-192.168.68.183}"
-LEENA_PORT="${LEENA_PORT:-22}"
-LEENA_USER="${LEENA_USER:-leenagulabrao}"
-LEENA_RUN="${LEENA_RUN:-/Users/leenagulabrao/chessckers/engine/run}"
-
-VAST_HOST="${VAST_HOST:-220.82.52.202}"
-VAST_PORT="${VAST_PORT:-52232}"
-VAST_USER="${VAST_USER:-root}"
-VAST_RUN="${VAST_RUN:-/root/run}"
-
 LOG_PATH="${LOG_PATH:-/tmp/watchdog.log}"
+
+# Source the active remotes config. Defines ACTIVE_REMOTES bash array.
+# Empty by default (local-only mode); user uncomments lines when a remote
+# is bid up.
+ACTIVE_REMOTES=()
+[ -f scripts/active_remotes.env ] && source scripts/active_remotes.env
 
 log() {
   local line
@@ -52,33 +46,30 @@ restart_workers() {
   bash scripts/launch_workers.sh local >> "$LOG_PATH" 2>&1
 }
 
-restart_sync_leena() {
-  log "sync_leena missing — restarting"
-  tmux kill-session -t sync_leena 2>/dev/null || true
-  tmux new-session -d -s sync_leena \
-    "CLOUD_HOST='$LEENA_HOST' CLOUD_PORT='$LEENA_PORT' CLOUD_USER='$LEENA_USER' \
-     REMOTE_RUN='$LEENA_RUN' LOCAL_RUN='$LOCAL_RUN' SYNC_DOWN=60 \
-     bash scripts/cloud_sync_sidecar.sh 2>&1 | tee /tmp/sync_leena.log"
+restart_remote_sidecar() {
+  # Args: "name|host|port|user|remote_run_dir"
+  local entry="$1"
+  local name host port user run_dir
+  IFS='|' read -r name host port user run_dir <<< "$entry"
+  log "$name missing — restarting (host=$host:$port user=$user)"
+  tmux kill-session -t "$name" 2>/dev/null || true
+  tmux new-session -d -s "$name" \
+    "CLOUD_HOST='$host' CLOUD_PORT='$port' CLOUD_USER='$user' \
+     REMOTE_RUN='$run_dir' LOCAL_RUN='$LOCAL_RUN' SYNC_DOWN=60 \
+     bash scripts/cloud_sync_sidecar.sh 2>&1 | tee /tmp/${name}.log"
 }
 
-restart_sync_vast() {
-  log "sync_vast missing — restarting"
-  tmux kill-session -t sync_vast 2>/dev/null || true
-  tmux new-session -d -s sync_vast \
-    "CLOUD_HOST='$VAST_HOST' CLOUD_PORT='$VAST_PORT' CLOUD_USER='$VAST_USER' \
-     REMOTE_RUN='$VAST_RUN' LOCAL_RUN='$LOCAL_RUN' SYNC_DOWN=60 \
-     bash scripts/cloud_sync_sidecar.sh 2>&1 | tee /tmp/sync_vast.log"
-}
-
-log "watchdog up; LOCAL_RUN=$LOCAL_RUN, POLL_SEC=${POLL_SEC}s"
+log "watchdog up; LOCAL_RUN=$LOCAL_RUN, POLL_SEC=${POLL_SEC}s, remotes=${#ACTIVE_REMOTES[@]}"
 
 while true; do
   if [ -f "$LOCAL_RUN/STOP" ]; then
     log "STOP file present at $LOCAL_RUN/STOP — exiting watchdog cleanly"
     exit 0
   fi
-  tmux has-session -t workers    2>/dev/null || restart_workers
-  tmux has-session -t sync_leena 2>/dev/null || restart_sync_leena
-  tmux has-session -t sync_vast  2>/dev/null || restart_sync_vast
+  tmux has-session -t workers 2>/dev/null || restart_workers
+  for entry in "${ACTIVE_REMOTES[@]}"; do
+    name="${entry%%|*}"
+    tmux has-session -t "$name" 2>/dev/null || restart_remote_sidecar "$entry"
+  done
   sleep "$POLL_SEC"
 done
