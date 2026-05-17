@@ -435,6 +435,10 @@ def run_async_training(
     # counted files; mtime gating became meaningless).
     run_start_wall_ts = time.time()
     run_start_mtime = run_start_wall_ts  # kept for any legacy callers
+
+    from chessckers_engine.alerter import Alerter
+    alerter = Alerter(wandb_run=wandb_run, run_dir=run_dir,
+                      coord_start_ts=run_start_wall_ts)
     last_eval = 0.0  # first eval fires after eval_every_seconds wall-clock
     last_games_log = 0
 
@@ -463,6 +467,7 @@ def run_async_training(
             if run_games is not None:
                 from chessckers_engine.heartbeat import count_games_for_run
                 games_done = count_games_for_run(run_dir, run_start_wall_ts)
+                alerter.check(trainer_step=trainer.step, games_done=games_done)
                 if games_done - last_games_log >= 100:
                     log.info("games progress: %d / %d", games_done, run_games)
                     last_games_log = games_done
@@ -478,7 +483,7 @@ def run_async_training(
                     stop_path.touch()
                     break
             if (elapsed - last_eval) >= eval_every_seconds and trainer.step > 0:
-                _eval_snapshot_and_log(
+                eval_summary = _eval_snapshot_and_log(
                     weights_path=weights_path, snapshot_path=eval_snapshot_path,
                     model_arch=model_arch, device=device,
                     eval_games=eval_games, eval_sims=eval_sims,
@@ -488,6 +493,8 @@ def run_async_training(
                     wandb_run=wandb_run,
                     stop_path=stop_path,
                 )
+                if eval_summary:
+                    alerter.check_eval(trainer_step=trainer.step, summary=eval_summary)
                 last_eval = elapsed
             time.sleep(main_loop_poll_seconds)
     finally:
