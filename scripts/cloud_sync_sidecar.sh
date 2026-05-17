@@ -31,6 +31,12 @@ while true; do
   after=$(ls "$LOCAL_RUN/buffer" 2>/dev/null | wc -l | tr -d ' ')
   delta=$((after - before))
 
+  # 1b. Pull heartbeats. Tiny JSON files (~100 bytes each), one per worker;
+  # the coord's authoritative game counter and status dashboard read these.
+  mkdir -p "$LOCAL_RUN/heartbeats" 2>/dev/null
+  rsync -az --update -e "$RSYNC_SSH" \
+    "$CLOUD_USER@$CLOUD_HOST:$REMOTE_RUN/heartbeats/" "$LOCAL_RUN/heartbeats/" 2>/dev/null || true
+
   # 2. Push weights if changed
   cur_mtime=$(stat -f %m "$LOCAL_RUN/weights.pt" 2>/dev/null || echo 0)
   pushed=""

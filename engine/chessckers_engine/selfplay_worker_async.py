@@ -110,6 +110,23 @@ def play_forever(payload: dict) -> int:
     max_games = payload.get("max_games")
     max_plies = int(payload.get("max_plies", 400))
 
+    # Heartbeat setup. run_dir is derived from buffer_root's parent;
+    # heartbeats land at run_dir/heartbeats/<machine>_<worker_id>.json.
+    # `machine` is a string tag passed by the launcher (local / leena /
+    # vast / ...); defaults to "unknown" if not set so heartbeats still
+    # work for legacy callers.
+    from chessckers_engine import heartbeat as _hb
+    machine = str(payload.get("machine", "unknown"))
+    run_dir = Path(payload["buffer_root"]).parent
+    incarnation_id = time.time()
+    # Emit a 0-games heartbeat at startup so the coord knows we're alive
+    # even before the first game finishes.
+    try:
+        _hb.write(run_dir, machine=machine, worker_id=worker_id,
+                  role="worker", games_played=0, incarnation_id=incarnation_id)
+    except OSError as e:
+        log.warning("worker %d initial heartbeat failed: %s", worker_id, e)
+
     use_shared = "request_q" in payload and "response_q" in payload
 
     # ---- Inference setup ----
@@ -188,6 +205,12 @@ def play_forever(payload: dict) -> int:
             buffer.append_game(
                 worker_id=worker_id, game_id=games_played, examples=examples
             )
+            try:
+                _hb.write(run_dir, machine=machine, worker_id=worker_id,
+                          role="worker", games_played=games_played,
+                          incarnation_id=incarnation_id)
+            except OSError as e:
+                log.debug("worker %d heartbeat write failed: %s", worker_id, e)
     finally:
         client.close()
         if server is not None:

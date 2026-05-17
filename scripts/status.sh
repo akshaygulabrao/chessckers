@@ -77,6 +77,42 @@ for log in /tmp/sync_leena.log /tmp/sync_vast.log; do
 done
 echo
 
+bold "── worker heartbeats ──"
+if [ -d "$RUN_DIR/heartbeats" ]; then
+  python3 - "$RUN_DIR/heartbeats" <<'PY'
+import json, time, os, sys
+hb_dir = sys.argv[1]
+now = time.time()
+rows = []
+for name in sorted(os.listdir(hb_dir)):
+    if not name.endswith(".json"): continue
+    try:
+        with open(os.path.join(hb_dir, name)) as f:
+            d = json.load(f)
+    except Exception:
+        continue
+    age = now - float(d.get("wall_ts", 0))
+    alive = "ALIVE" if age <= 90 else "STALE"
+    rows.append((d.get("machine", "?"), int(d.get("worker_id", -1)),
+                 d.get("role", "?"), int(d.get("games_played", 0)),
+                 age, alive))
+rows.sort()
+if not rows:
+    print("  (none)")
+else:
+    fmt = "  {:>7}  wid={:<4}  role={:<8}  games={:<6}  age={:>5.0f}s  {}"
+    for m, wid, role, g, age, alive in rows:
+        print(fmt.format(m, wid, role, g, age, alive))
+    total_games_alive = sum(g for _, _, _, g, _, alive in rows if alive == "ALIVE")
+    total_games_all = sum(g for _, _, _, g, _, _ in rows)
+    print(f"  TOTAL games (alive workers): {total_games_alive}")
+    print(f"  TOTAL games (all heartbeats): {total_games_all}")
+PY
+else
+  echo "  (no heartbeats dir yet)"
+fi
+echo
+
 bold "── watchdog ──"
 if [ -f /tmp/watchdog.log ]; then
   echo "log tail:"

@@ -125,6 +125,7 @@ def _build_per_worker_payload(*, wid: int, buffer_root: Path, stop_path: Path,
         "mcts_batch_size": args.mcts_batch_size,
         "weights_poll_seconds": args.weights_poll_seconds,
         "pin_cpu": (wid % os.cpu_count()) if args.pin_cpu else None,
+        "machine": os.environ.get("MACHINE", "unknown"),
     }
 
 
@@ -148,6 +149,7 @@ def _build_shared_payload(*, wid: int, q_index: int, buffer_root: Path, stop_pat
         "request_q": request_q,
         "response_q": response_q,
         "pin_cpu": (wid % os.cpu_count()) if args.pin_cpu else None,
+        "machine": os.environ.get("MACHINE", "unknown"),
     }
 
 

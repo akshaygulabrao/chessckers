@@ -99,6 +99,7 @@ def _build_worker_payload(worker_id: int, *, buffer_root: Path,
                           temperature: float, dirichlet_alpha: float,
                           dirichlet_eps: float, vloss_batch: int,
                           max_plies: int, seed: int,
+                          machine: str = "local",
                           # Per-worker mode args (omit/None when shared):
                           weights_path: Optional[Path] = None,
                           model_arch: Optional[dict] = None,
@@ -122,6 +123,7 @@ def _build_worker_payload(worker_id: int, *, buffer_root: Path,
         "stop_path": str(stop_path),
         "max_games": None,
         "pin_cpu": pin_cpu,
+        "machine": machine,
     }
     if request_q is not None and response_q is not None:
         payload["request_q"] = request_q
@@ -387,12 +389,14 @@ def run_async_training(
 
     # Spawn workers (subprocesses).
     workers: list[mp.Process] = []
+    local_machine = os.environ.get("MACHINE", "local")
     for w in range(n_workers):
         payload = _build_worker_payload(
             w, buffer_root=buffer_root, stop_path=stop_path,
             n_sims=n_sims, c_puct=c_puct, temperature=temperature,
             dirichlet_alpha=dirichlet_alpha, dirichlet_eps=dirichlet_eps,
             vloss_batch=vloss_batch, max_plies=max_plies, seed=seed,
+            machine=local_machine,
             weights_path=(None if shared_inference else weights_path),
             model_arch=(None if shared_inference else model_arch),
             device=(None if shared_inference else device),
@@ -423,10 +427,14 @@ def run_async_training(
     trainer_thread.start()
 
     start = time.perf_counter()
-    # Wall-clock timestamp for gating the games counter — any .pkl file with
-    # mtime >= run_start_mtime was produced during this run; stale leftovers
-    # rsync'd from remote workers' previous-run buffers don't count.
-    run_start_mtime = time.time()
+    # Wall-clock timestamp at coord boot. The heartbeat-based game counter
+    # uses this as the "this run" filter: any worker whose incarnation_id
+    # is < run_start_wall_ts started before us and is treated as stale
+    # (its games don't count). Replaces the previous mtime-of-buffer-files
+    # heuristic, which broke once the buffer cap kicked in (pruning evicted
+    # counted files; mtime gating became meaningless).
+    run_start_wall_ts = time.time()
+    run_start_mtime = run_start_wall_ts  # kept for any legacy callers
     last_eval = 0.0  # first eval fires after eval_every_seconds wall-clock
     last_games_log = 0
 
@@ -453,7 +461,8 @@ def run_async_training(
         while not stop_path.exists() and (time.perf_counter() - start) < run_seconds:
             elapsed = time.perf_counter() - start
             if run_games is not None:
-                games_done = _count_games_since(buffer_root, run_start_mtime)
+                from chessckers_engine.heartbeat import count_games_for_run
+                games_done = count_games_for_run(run_dir, run_start_wall_ts)
                 if games_done - last_games_log >= 100:
                     log.info("games progress: %d / %d", games_done, run_games)
                     last_games_log = games_done
