@@ -244,13 +244,18 @@ def _run_eval_parallel(
     model_arch: dict,
     device: str,
     workers: int,
+    stop_path: Path | None = None,
 ) -> dict[str, int]:
     """Multiprocess version of evaluate.evaluate(). Each game runs in its own
     worker subprocess so we get true parallelism on the GPU during eval/gating
     instead of single-game-at-a-time. Same return shape: {'white','black','draw','games'}.
 
     For gating: both args are checkpoint paths (current vs best).
-    For vs-random eval: one arg is a path, the other is None."""
+    For vs-random eval: one arg is a path, the other is None.
+
+    If `stop_path` is given and the file appears mid-cycle, the consumer loop
+    terminates the pool early. Returned 'games' reflects how many actually
+    completed, so the caller can spot a truncated cycle."""
     import multiprocessing as _mp
 
     counts = {"white": 0, "black": 0, "draw": 0}
@@ -265,12 +270,20 @@ def _run_eval_parallel(
         for _ in range(n_games)
     ]
     ctx = _mp.get_context("spawn")
+    completed = 0
     with ctx.Pool(processes=min(workers, n_games)) as pool:
-        for i, outcome in enumerate(pool.imap_unordered(_eval_game_subprocess, payloads)):
+        it = pool.imap_unordered(_eval_game_subprocess, payloads)
+        for i, outcome in enumerate(it):
             counts[outcome] += 1
+            completed = i + 1
             log.info("game %d/%d -> %s  (running: W=%d B=%d D=%d)",
-                     i + 1, n_games, outcome, counts["white"], counts["black"], counts["draw"])
-    return {**counts, "games": n_games}
+                     completed, n_games, outcome, counts["white"], counts["black"], counts["draw"])
+            if stop_path is not None and stop_path.exists():
+                log.warning("STOP file detected mid-eval — terminating pool after %d/%d games",
+                            completed, n_games)
+                pool.terminate()
+                break
+    return {**counts, "games": completed if stop_path is not None and completed < n_games else n_games}
 
 
 def _atomic_write(path: Path, write_fn) -> None:

@@ -147,7 +147,8 @@ def _eval_snapshot_and_log(*, weights_path: Path, snapshot_path: Path,
                            eval_sims: int, eval_workers: int, eval_log_path: Path,
                            trainer_step: int,
                            eval_opponents: Optional[list[tuple[str, Path]]] = None,
-                           wandb_run=None) -> dict:
+                           wandb_run=None,
+                           stop_path: Optional[Path] = None) -> dict:
     """Snapshot current weights and play `eval_games` vs random + each opponent, both sides.
     Appends one JSON line to `eval_log_path` and returns the summary.
 
@@ -163,9 +164,14 @@ def _eval_snapshot_and_log(*, weights_path: Path, snapshot_path: Path,
     os.replace(tmp, snapshot_path)
     as_white = _run_eval_parallel(
         str(snapshot_path), None, eval_games, eval_sims, model_arch, device, eval_workers,
+        stop_path=stop_path,
     )
+    if stop_path is not None and stop_path.exists():
+        log.warning("STOP mid-eval after as_white_vs_random — skipping rest of cycle")
+        return {"trainer_step": trainer_step, "partial": True, "as_white_vs_random": as_white}
     as_black = _run_eval_parallel(
         None, str(snapshot_path), eval_games, eval_sims, model_arch, device, eval_workers,
+        stop_path=stop_path,
     )
     summary: dict = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -181,16 +187,25 @@ def _eval_snapshot_and_log(*, weights_path: Path, snapshot_path: Path,
              as_black["black"], as_black["white"], as_black["draw"])
     _log_eval_to_wandb(wandb_run, "random", as_white, as_black, trainer_step)
     for label, opp_path in (eval_opponents or []):
+        if stop_path is not None and stop_path.exists():
+            log.warning("STOP mid-eval at opponent %s — skipping remaining", label)
+            summary["partial"] = True
+            break
         opp_str = str(opp_path)
         # snapshot plays white; opponent plays black
         vs_w = _run_eval_parallel(
             str(snapshot_path), opp_str, eval_games, eval_sims,
-            model_arch, device, eval_workers,
+            model_arch, device, eval_workers, stop_path=stop_path,
         )
+        if stop_path is not None and stop_path.exists():
+            summary[f"as_white_vs_{label}"] = vs_w
+            summary["partial"] = True
+            log.warning("STOP after as_white_vs_%s — skipping rest", label)
+            break
         # snapshot plays black; opponent plays white
         vs_b = _run_eval_parallel(
             opp_str, str(snapshot_path), eval_games, eval_sims,
-            model_arch, device, eval_workers,
+            model_arch, device, eval_workers, stop_path=stop_path,
         )
         summary[f"as_white_vs_{label}"] = vs_w
         summary[f"as_black_vs_{label}"] = vs_b
@@ -414,6 +429,26 @@ def run_async_training(
     run_start_mtime = time.time()
     last_eval = 0.0  # first eval fires after eval_every_seconds wall-clock
     last_games_log = 0
+
+    # Time-cap watcher thread: trips STOP when run_seconds is exceeded so that
+    # both the main loop AND any in-flight eval cycle see it. Without this the
+    # main loop's `(perf_counter - start) < run_seconds` check is gated by the
+    # eval call returning, and a 90-min eval cycle can overrun the cap by up
+    # to its own duration.
+    cap_stop = threading.Event()
+    def _time_cap_watcher():
+        while not cap_stop.is_set():
+            if time.perf_counter() - start >= run_seconds:
+                log.warning("time cap exceeded — tripping STOP")
+                try:
+                    stop_path.touch()
+                except OSError:
+                    pass
+                return
+            time.sleep(1.0)
+    cap_thread = threading.Thread(target=_time_cap_watcher, name="time_cap_watcher", daemon=True)
+    cap_thread.start()
+
     try:
         while not stop_path.exists() and (time.perf_counter() - start) < run_seconds:
             elapsed = time.perf_counter() - start
@@ -442,10 +477,12 @@ def run_async_training(
                     trainer_step=trainer.step,
                     eval_opponents=eval_opponents,
                     wandb_run=wandb_run,
+                    stop_path=stop_path,
                 )
                 last_eval = elapsed
             time.sleep(main_loop_poll_seconds)
     finally:
+        cap_stop.set()
         # Wind everything down cleanly. Order matters: stop workers first
         # so they finish in-flight games, then stop trainer.
         if not stop_path.exists():
