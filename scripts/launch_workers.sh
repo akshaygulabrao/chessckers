@@ -37,10 +37,79 @@ PORT="${2:-${PORT:-22}}"
 PYTHON_BIN="${PYTHON_BIN:-$VENV_DIR/bin/python}"
 
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
+abort() { echo "[ABORT] $*" >&2; exit 1; }
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR
           -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
 [ -n "${SSH_KEY:-}" ] && SSH_OPTS+=(-i "$SSH_KEY")
+
+# ---- 0. pre-flight checks --------------------------------------------------
+# Better to fail loud here than burn hours discovering a missing checkpoint
+# or a logged-out wandb mid-eval. Set SKIP_PREFLIGHT=1 to bypass (e.g. on
+# remote-only restarts where the local environment doesn't apply).
+preflight_local() {
+  log "[pre-flight] verifying local environment"
+
+  # 1. Eval opponent checkpoints (referenced by EXTRA_BUNDLED_ARGS).
+  if [ -n "${EXTRA_BUNDLED_ARGS:-}" ]; then
+    # Extract paths from --eval-opponent label=PATH tokens.
+    echo "$EXTRA_BUNDLED_ARGS" | tr ' ' '\n' | grep -oE '\-\-eval-opponent [^ ]*' \
+      | awk '{print $2}' | sed 's/.*=//' | while read -r p; do
+        [ -z "$p" ] && continue
+        [ -f "$p" ] || abort "eval-opponent checkpoint missing: $p"
+      done
+  fi
+
+  # 2. Resume checkpoint (if provided).
+  if [ -n "${RESUME_FROM:-}" ] && [ ! -f "$RESUME_FROM" ]; then
+    # OK if a newer local checkpoint will override (auto-resume picks latest).
+    LATEST_LOCAL=$(ls "$RUN_DIR/checkpoints/"*.pt 2>/dev/null | sort -r | head -1)
+    [ -z "$LATEST_LOCAL" ] && abort "RESUME_FROM missing and no local checkpoints: $RESUME_FROM"
+  fi
+
+  # 3. wandb login (only if WANDB_MODE is not disabled).
+  if [ "${WANDB_MODE:-online}" = "online" ] && [ -x "$VENV_DIR/bin/wandb" ]; then
+    if ! "$VENV_DIR/bin/wandb" login --verify >/dev/null 2>&1; then
+      abort "wandb not logged in. Run: cd $REPO_ROOT/engine && .venv/bin/wandb login  (or set WANDB_MODE=offline)"
+    fi
+  fi
+
+  # 4. Caffeinate keeping Mac awake (warn only — user's call).
+  if [ "$(uname -s)" = "Darwin" ] && ! pgrep -x caffeinate >/dev/null; then
+    log "[pre-flight] WARN: no caffeinate process — Mac may sleep mid-run."
+    log "[pre-flight]       Recommended: tmux new-session -d -s watchdog 'caffeinate -i bash scripts/watchdog.sh'"
+  fi
+
+  # 5. Disk space — bail if <5GB free in the run-dir partition.
+  FREE_KB=$(df -k "$RUN_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
+  if [ -n "$FREE_KB" ] && [ "$FREE_KB" -lt 5000000 ]; then
+    abort "low disk: only $((FREE_KB/1024))MB free at $RUN_DIR"
+  fi
+  log "[pre-flight] local OK"
+}
+
+preflight_remote() {
+  log "[pre-flight] verifying remote $USER@$HOST:$PORT"
+
+  # 1. SSH reachability.
+  if ! ssh "${SSH_OPTS[@]}" -p "$PORT" -o ConnectTimeout=5 "$USER@$HOST" 'true' 2>/dev/null; then
+    abort "remote $USER@$HOST:$PORT unreachable via SSH"
+  fi
+
+  # 2. PYTHON_BIN exists on remote.
+  if ! remote "test -x '$PYTHON_BIN'" 2>/dev/null; then
+    abort "PYTHON_BIN=$PYTHON_BIN not found or not executable on remote"
+  fi
+  log "[pre-flight] remote OK"
+}
+
+if [ "${SKIP_PREFLIGHT:-0}" != "1" ]; then
+  if [ "$HOST" = "local" ]; then
+    preflight_local
+  else
+    preflight_remote
+  fi
+fi
 
 remote() {
   if [ "$HOST" = "local" ]; then
