@@ -34,8 +34,8 @@ from chessckers_engine.mcts_puct import pick_puct
 from chessckers_engine.model import ChesskersScorer
 from chessckers_engine.random_player import pick_random
 from chessckers_engine.selfplay_az import JsonlWatchSink, az_game_to_examples, play_az_game
-from chessckers_engine.server_client import ServerClient
 from chessckers_engine.train_az import save_checkpoint, train_az
+from chessckers_engine.variant_py import PyVariantClient
 
 log = logging.getLogger("chessckers_engine.selfplay_az_loop")
 
@@ -46,7 +46,7 @@ def _temperature_for(iter_idx: int, n_iters: int, t0: float, t_final: float) -> 
     return t0 + (t_final - t0) * (iter_idx / (n_iters - 1))
 
 
-def _make_puct_picker(evaluator, client: ServerClient, n_sims: int):
+def _make_puct_picker(evaluator, client: PyVariantClient, n_sims: int):
     """Build a state→move picker driven by PUCT MCTS. `evaluator` is either a
     `ChesskersScorer` model (in-thread forward) or an `InferenceServer`
     (cross-game batched inference)."""
@@ -132,8 +132,8 @@ def _play_one_game(
     workers — either a model (each worker calls it sequentially) or an
     InferenceServer (workers' calls get batched on the inference thread)."""
     if client_class is None:
-        from chessckers_engine.server_client import ServerClient as _SC
-        client_class = _SC
+        from chessckers_engine.variant_py import PyVariantClient as _PVC
+        client_class = _PVC
     client = client_class()
     rng = torch.Generator().manual_seed(seed)
     try:
@@ -370,7 +370,7 @@ def _load_resume_state(
 
 def run_az_iterations(
     model: ChesskersScorer,
-    client: ServerClient,
+    client: PyVariantClient,
     n_iters: int,
     games_per_iter: int,
     n_sims: int,
@@ -695,7 +695,8 @@ def main() -> int:
                         "spectator sink disabled when >1).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--use-pyvariant", action="store_true",
-                   help="Use in-process PyVariantClient instead of scalachess HTTP server")
+                   help="Deprecated no-op: PyVariant is always used (the scalachess "
+                        "HTTP server was removed). Accepted for backward compat.")
     p.add_argument("--buffer-iters", type=int, default=1,
                    help="Replay buffer size in iterations. Each training step uses the "
                         "concatenated examples from the last N iters' self-play. "
@@ -747,18 +748,11 @@ def main() -> int:
 
     device = pick_device(args.device)
 
-    if args.use_pyvariant:
-        from chessckers_engine.variant_py import PyVariantClient
-        client_class = PyVariantClient
-        client = PyVariantClient()
-    else:
-        client_class = ServerClient
-        client = ServerClient()
-        try:
-            client.new_game()
-        except Exception as e:  # noqa: BLE001
-            log.error("cannot reach API: %s", e)
-            return 1
+    # PyVariant is the only client now — the scalachess HTTP server was removed.
+    # --use-pyvariant is accepted for backward compat (some launch scripts still
+    # pass it) but is a no-op.
+    client_class = PyVariantClient
+    client = PyVariantClient()
 
     torch.manual_seed(args.seed)
     model = ChesskersScorer(

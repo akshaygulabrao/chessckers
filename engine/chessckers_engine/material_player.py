@@ -22,7 +22,7 @@ log = logging.getLogger("chessckers_engine.material_player")
 
 
 class _Mover(Protocol):
-    """Subset of ServerClient's API that pick_material needs (testable)."""
+    """Subset of the client API (PyVariantClient) that pick_material needs."""
 
     def make_move(self, fen: str, uci: str) -> dict[str, Any]: ...
 

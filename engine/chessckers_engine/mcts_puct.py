@@ -68,7 +68,8 @@ class PuctNode:
     # Fast-path caches: parent State (so children can be built without
     # re-parsing the FEN) and the legal moves at this node (so MCTS doesn't
     # re-enumerate them in get_legal). Both are populated lazily by the
-    # variant_py fast path; for the legacy ServerClient path they stay None.
+    # variant_py fast path; on the dict-API path (new_game/make_move) they
+    # stay None.
     state: Any | None = None
     legal_moves: list[LegalMove] | None = None
 

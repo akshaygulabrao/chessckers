@@ -25,7 +25,6 @@ from chessckers_engine.checkpoints import load_checkpoint
 from chessckers_engine.evaluate import play_game
 from chessckers_engine.mcts_puct import pick_puct
 from chessckers_engine.model import ChesskersScorer
-from chessckers_engine.server_client import ServerClient
 from chessckers_engine.variant_py import PyVariantClient
 
 log = logging.getLogger("chessckers_engine.gauntlet")
@@ -40,7 +39,7 @@ def _load_model(path: Path) -> ChesskersScorer:
     return model
 
 
-def _make_puct_picker(model: ChesskersScorer, client: ServerClient,
+def _make_puct_picker(model: ChesskersScorer, client: PyVariantClient,
                       n_sims: int, c_puct: float) -> Picker:
     def picker(state: dict) -> dict | None:
         return pick_puct(state, client, model, n_sims=n_sims, c_puct=c_puct)
@@ -54,7 +53,7 @@ def _empty_record() -> dict[str, int]:
 def gauntlet_match(
     challenger: ChesskersScorer,
     champion: ChesskersScorer,
-    client: ServerClient,
+    client: PyVariantClient,
     n_games: int,
     n_sims: int,
     c_puct: float,
@@ -106,7 +105,7 @@ def format_match(challenger_name: str, champion_name: str, result: dict) -> str:
 
 def run_ladder(
     ladder_dir: Path,
-    client: ServerClient,
+    client: PyVariantClient,
     games_per_match: int,
     n_sims: int,
     c_puct: float,
@@ -179,7 +178,7 @@ def main() -> int:
     p.add_argument("--max-plies", type=int, default=400)
     p.add_argument("--api-url", default="http://localhost:8080")
     p.add_argument("--use-server", action="store_true",
-                   help="use the scalachess HTTP server instead of the in-process Python variant")
+                   help="Deprecated no-op: PyVariant is always used (scalachess server removed).")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -187,15 +186,8 @@ def main() -> int:
         p.error("must provide either --ladder-dir or both --challenger and --champion")
 
     torch.manual_seed(args.seed)
-    if args.use_server:
-        client = ServerClient(base_url=args.api_url)
-        try:
-            client.new_game()
-        except Exception as e:  # noqa: BLE001
-            log.error("cannot reach API at %s: %s", args.api_url, e)
-            return 1
-    else:
-        client = PyVariantClient()
+    # PyVariant is the only client now; --use-server / --api-url are ignored.
+    client = PyVariantClient()
 
     if args.ladder_dir:
         rows = run_ladder(Path(args.ladder_dir), client,

@@ -1,5 +1,4 @@
-"""Construct the dict of named pickers used by both the HTTP server and the
-evaluation harness.
+"""Construct the dict of named pickers used by the evaluation harness.
 
 `build_pickers` returns `{"random": ..., "material": ..., "nn": ...}`. The NN
 picker is wrapped in a try/except so a missing torch install or unloadable
@@ -9,8 +8,12 @@ checkpoint doesn't take down the random and material pickers.
 from __future__ import annotations
 
 import logging
+from typing import Any, Callable
 
-from chessckers_engine.http_server import GameState, LegalMove, Picker
+# Engine-wide DTO aliases (formerly defined in the removed http_server module).
+GameState = dict[str, Any]
+LegalMove = dict[str, Any]
+Picker = Callable[[GameState], "LegalMove | None"]
 
 
 def setup_logging(level: int = logging.INFO) -> None:
@@ -28,11 +31,11 @@ def setup_logging(level: int = logging.INFO) -> None:
 from chessckers_engine.material_player import pick_material
 from chessckers_engine.mcts import pick_mcts
 from chessckers_engine.random_player import pick_random
-from chessckers_engine.server_client import ServerClient
+from chessckers_engine.variant_py import PyVariantClient
 
 
 def build_pickers(
-    client: ServerClient,
+    client: PyVariantClient,
     model_path: str | None,
     log: logging.Logger,
     mcts_sims: int = 100,

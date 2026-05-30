@@ -31,8 +31,8 @@ import torch
 from chessckers_engine.checkpoints import default_checkpoint_path, load_checkpoint
 from chessckers_engine.demos import extract_examples, filter_games_for_color, load_games
 from chessckers_engine.model import ChesskersScorer
-from chessckers_engine.server_client import ServerClient
 from chessckers_engine.train import save_checkpoint, train
+from chessckers_engine.variant_py import PyVariantClient
 
 log = logging.getLogger("chessckers_engine.train_demos")
 
@@ -71,12 +71,7 @@ def main() -> int:
             outcomes["loss"] += 1
     log.info("%s outcomes: %d wins, %d losses, %d draws", args.color, outcomes["win"], outcomes["loss"], outcomes["draw"])
 
-    client = ServerClient()
-    try:
-        client.new_game()
-    except Exception as e:  # noqa: BLE001
-        log.error("cannot reach API: %s", e)
-        return 1
+    client = PyVariantClient()
 
     examples = extract_examples(games, args.color, client)
     log.info("extracted %d (fen, move, target) examples for %s", len(examples), args.color)

@@ -1,7 +1,7 @@
 """Training-data generator for the supervised material-target phase.
 
-Walks random self-play games using a `ServerClient`-like Mover. At every ply,
-asks the server to apply *each* legal move and records the resulting position's
+Walks random self-play games using a `PyVariantClient`-like Mover. At every ply,
+asks the client to apply *each* legal move and records the resulting position's
 material score (from the moving side's perspective, with king_value=0 — king
 capture is game-ending and handled at the status level rather than as a
 +/-1000 outlier).
