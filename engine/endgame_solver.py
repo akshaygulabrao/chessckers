@@ -39,12 +39,12 @@ def _dtm_black(fen: str, depth: int) -> int | None:
     best: int | None = None
     for m in _legal(fen):
         s2 = _client.make_move(fen, m["uci"])
-        st = s2.get("status")
-        if st == "mate":
-            best = 1
-            break
-        if st == "variantEnd":  # black blundered into losing all towers
-            continue
+        st, win = s2.get("status"), s2.get("winner")
+        if st is not None:          # terminal right after Black's move
+            if win == "black":      # checkmate OR White stuck → Black wins now
+                best = 1
+                break
+            continue                # Black lost/drew this line; skip it
         d = _dtm_white(s2["fen"], depth - 1)
         if d is not None and (best is None or 1 + d < best):
             best = 1 + d
@@ -66,8 +66,8 @@ def _dtm_white(fen: str, depth: int) -> int | None:
     worst = 0
     for m in moves:
         s2 = _client.make_move(fen, m["uci"])
-        if s2.get("status") == "variantEnd":  # white wins -> escapes
-            _memo[key] = None
+        if s2.get("status") is not None:  # terminal after White's move = White
+            _memo[key] = None             # escaped (Black stuck/eliminated)
             return None
         d = _dtm_black(s2["fen"], depth - 1)
         if d is None:  # this white move avoids forced mate within depth

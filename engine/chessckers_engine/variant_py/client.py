@@ -51,22 +51,17 @@ ChainStepResponse = dict[str, Any]
 def _detect_status(state: State) -> tuple[str | None, str | None]:
     """Return (status, winner) for the given state.
 
-    Detection paths:
+    Detection paths handled here (cheap, no move-gen):
     - Black eliminated → variantEnd / winner=white.
-    - White's king is checkmated → mate / winner=black.
     - White's king captured during a Black chain → variantEnd / winner=black.
-    - Black stalemate (no legal moves) is detected in _state_to_dict after
-      move-gen, since it needs the full move list."""
+    White checkmate/stalemate and Black stalemate need the full legal-move
+    list, so they're detected in _state_to_dict after move generation. (Mate
+    uses the Chessckers check predicate, NOT python-chess's FIDE is_checkmate,
+    which wrongly treats an adjacent Black King as giving check.)"""
     if not state.stacks:
         return ("variantEnd", "white")
     if state.board.king(chess.WHITE) is None:
         return ("variantEnd", "black")
-    if state.board.turn == chess.WHITE:
-        try:
-            if state.board.is_checkmate():
-                return ("mate", "black")
-        except Exception:  # noqa: BLE001
-            pass
     return (None, None)
 
 
@@ -88,6 +83,11 @@ def _state_to_dict(state: State, fen_override: str | None = None) -> GameState:
     status, winner = _detect_status(state)
     if state.board.turn == chess.WHITE:
         legal_moves = white_legal_moves(state)
+        # White checkmate / stalemate (Chessckers, not FIDE): no legal move →
+        # Black wins. "mate" if the king is in Chessckers-check, else White is
+        # simply stuck — being stuck loses, mirroring the Black rule below.
+        if not legal_moves and status is None:
+            status, winner = ("mate" if check else "variantEnd"), "black"
     else:
         all_moves = (
             black_diagonal_quiet_moves(state)
