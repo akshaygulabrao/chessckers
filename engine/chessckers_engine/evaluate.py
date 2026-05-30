@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 from typing import Any, Callable
 
 from chessckers_engine.checkpoints import latest_checkpoint
@@ -129,7 +128,6 @@ def main() -> int:
     p.add_argument("--games", type=int, default=20)
     p.add_argument("--max-plies", type=int, default=400)
     p.add_argument("--model", default=None, help="Path to .pt weights for nn (default: auto-discovery)")
-    p.add_argument("--api-url", default=os.environ.get("API_URL", "http://localhost:8080"))
     p.add_argument("--use-server", action="store_true",
                    help="Deprecated no-op: PyVariant is always used (scalachess server removed).")
     args = p.parse_args()
@@ -142,7 +140,7 @@ def main() -> int:
             log.info("auto-selected latest checkpoint: %s", model_path)
 
     # PyVariant is the only client now (the scalachess HTTP server was removed).
-    # --use-server / --api-url are accepted but ignored.
+    # --use-server is accepted but ignored.
     client = PyVariantClient()
 
     pickers = build_pickers(client, model_path, log, mcts_sims=args.mcts_sims)

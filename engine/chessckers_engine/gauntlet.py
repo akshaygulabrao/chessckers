@@ -176,7 +176,6 @@ def main() -> int:
     p.add_argument("--sims", type=int, default=25)
     p.add_argument("--c-puct", type=float, default=1.5)
     p.add_argument("--max-plies", type=int, default=400)
-    p.add_argument("--api-url", default="http://localhost:8080")
     p.add_argument("--use-server", action="store_true",
                    help="Deprecated no-op: PyVariant is always used (scalachess server removed).")
     p.add_argument("--seed", type=int, default=0)
@@ -186,7 +185,7 @@ def main() -> int:
         p.error("must provide either --ladder-dir or both --challenger and --champion")
 
     torch.manual_seed(args.seed)
-    # PyVariant is the only client now; --use-server / --api-url are ignored.
+    # PyVariant is the only client now; --use-server is ignored.
     client = PyVariantClient()
 
     if args.ladder_dir:
