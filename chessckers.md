@@ -157,11 +157,11 @@ A King-top tower may move along a rank or file in a single straight line. Path W
 
 ---
 
-<!-- §5 anchors: promotion — Chessckers.scala:179-205 (promoteStack/applyPromotion/hopPromotes); White-win/Black-stalemate-loss — Chessckers.scala:54-67 (specialEnd) -->
+<!-- §5 anchors: promotion — variant_py/moves_black.py (hop promotion); win conditions — variant_py/client.py _detect_status / _state_to_dict (king-capture, Chessckers checkmate, stalemate) -->
 ## 5. Promotion & Win Conditions
 
 **Promotion.** Whenever the path traced by any Black move other than a charge (quiet diagonal, deploy, sprint, capture hop, or capture chain) touches rank 1 — either by landing there or by stepping through it on the way to a rim square — every Stone in the tower is promoted to a King. The promotion takes effect immediately, so any later hops in the same chain use the now-promoted (King-top) tower for direction and capability. Charges never promote.
 
 **White wins** if Black has no pieces left on the board, or if Black has no legal moves on their turn. (Chessckers does not treat Black being unable to move as a draw — being stuck loses the game.)
 
-**Black wins** by checkmating the White king under standard FIDE rules.
+**Black wins** by checkmating the White king, where *check* is meant in the **Chessckers** sense, not FIDE. White is in check when some Black move would capture the king **in transit** — a diagonal capture-hop, or a capturing charge whose path crosses the king's square. A Black King merely standing adjacent to the White king gives **no** check: Black threatens only along the diagonals and files it actually captures along, and (per §3B) a Ram that *lands* on the king does not capture it. It is **checkmate** — and Black wins — when White is in check and has no legal move that escapes it. Black also wins if White, on their turn, has no legal move at all (the same "being stuck loses" rule that costs Black the game, applied in reverse), or if the king is captured outright during a Black chain.
