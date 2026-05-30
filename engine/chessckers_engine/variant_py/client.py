@@ -1,19 +1,9 @@
-"""`PyVariantClient` — drop-in replacement for `ServerClient`.
+"""`PyVariantClient` — the engine's in-process game API.
 
-Surface mirrors `chessckers_engine.server_client.ServerClient`: every public
-method takes the same arguments and returns the same JSON-shaped dicts that
-scalachess returns over HTTP. This lets the engine swap between scalachess
-(via `ServerClient`) and pure-Python (via `PyVariantClient`) without any
-caller changes.
-
-Implementation is incremental:
-- new_game(fen) returns the right shape (fen/turn/check/status/winner) but
-  with an empty `legalMoves` list until the move generators land.
-- make_move / moves_at / chain_step / chain_end still raise NotImplementedError.
-
-The differential test harness in `tests/test_pyvariant_diff.py` exercises
-each method against scalachess on identical FENs and asserts identical
-outputs.
+Every method returns the JSON-shaped dicts the rest of the engine is written
+against (`fen`/`turn`/`check`/`status`/`winner`/`legalMoves`/`stacks`); that
+dict shape is the stable contract for MCTS, self-play, and rendering. The
+engine is stateless — each call carries the full FEN.
 """
 from __future__ import annotations
 
@@ -121,11 +111,9 @@ def _state_to_dict(state: State, fen_override: str | None = None) -> GameState:
 
 
 class PyVariantClient:
-    """Same surface as `ServerClient` but evaluates positions in-process.
-
-    Constructor takes optional kwargs for parity with `ServerClient` so the
-    same construction sites work; `base_url`/`timeout` are accepted and
-    ignored."""
+    """Evaluates positions in-process; the engine is stateless (each call
+    carries the full FEN). `base_url`/`timeout` are vestigial kwargs, accepted
+    and ignored so older construction sites still work."""
 
     def __init__(self, base_url: str | None = None, timeout: float | None = None) -> None:
         del base_url, timeout
