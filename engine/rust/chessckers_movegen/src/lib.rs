@@ -177,6 +177,12 @@ struct CaptureHop {
     waypoints: Vec<String>,
     is_suicide: bool,
     crossed_rank1: bool,
+    // §3B: landing distance k (= waypoints.len() for on-grid landings; one past
+    // the last on-grid step for an off-grid overshoot, so it can exceed it).
+    cadence: usize,
+    // True when the cadence landing fell off the 10x10 grid: captured its path
+    // Whites, can't land, settles on the last on-board square and ends the chain.
+    is_overshoot: bool,
 }
 
 fn find_capture_hops(
@@ -195,6 +201,7 @@ fn find_capture_hops(
     let mut waypoints_so_far: Vec<String> = Vec::new();
 
     let mut crossed_rank1 = false;
+    let mut friendly_blocked = false;
 
     let path = match capture_paths().get(&(f0, r0, df0, dr0)) {
         Some(p) => p,
@@ -211,7 +218,7 @@ fn find_capture_hops(
         if step.r == 0 {
             crossed_rank1 = true;
         }
-        let _step_num = step_idx + 1; // 1-based, matches Python `step`
+        let step_num = step_idx + 1; // 1-based landing distance k
 
         if step.sq >= 0 {
             let sq = step.sq as u8;
@@ -227,6 +234,8 @@ fn find_capture_hops(
                         waypoints: waypoints_so_far.clone(),
                         is_suicide: false,
                         crossed_rank1,
+                        cadence: step_num,
+                        is_overshoot: false,
                     });
                 }
             } else {
@@ -242,20 +251,20 @@ fn find_capture_hops(
                                 waypoints: waypoints_so_far.clone(),
                                 is_suicide: false,
                                 crossed_rank1,
+                                cadence: step_num,
+                                is_overshoot: false,
                             });
                         }
                     }
                     SQ_BLACK if stacks.contains_key(&sq) => {
-                        // Friendly tower terminates the trace.
+                        // Friendly tower blocks the trace (NOT an off-grid exit).
+                        friendly_blocked = true;
                         break;
                     }
                     _ => {
-                        // White piece (or defensive black-without-stack).
-                        // Per §3B step 2: rams require k > d (path capture
-                        // exists). Landing on the first enemy (captures_so_far
-                        // empty) is no longer a legal hop. Emit ram BEFORE
-                        // adding this white to captures_so_far so the landing
-                        // White isn't double-counted.
+                        // White piece. Rams require k > d (a path capture must
+                        // already exist). Emit ram BEFORE adding this white to
+                        // captures so the landing White isn't double-counted.
                         if !captures_so_far.is_empty() {
                             options.push(CaptureHop {
                                 direction: (step.df, step.dr),
@@ -265,6 +274,8 @@ fn find_capture_hops(
                                 waypoints: waypoints_so_far.clone(),
                                 is_suicide: true,
                                 crossed_rank1,
+                                cadence: step_num,
+                                is_overshoot: false,
                             });
                         }
                         captures_so_far.push(sq);
@@ -283,9 +294,31 @@ fn find_capture_hops(
                     waypoints: waypoints_so_far.clone(),
                     is_suicide: false,
                     crossed_rank1,
+                    cadence: step_num,
+                    is_overshoot: false,
                 });
             }
         }
+    }
+
+    // §3B off-grid overshoot: the straight path left the 10x10 grid before the
+    // cadence limit (path shorter than n+1, not friendly-blocked) AND >= 1 White
+    // was captured. The hop can't land off-grid, so it settles on the last
+    // on-board square (resolved in build_final_move) and ends the chain. Cadence
+    // is one past the last on-grid square; distinct from the rim landing at the
+    // same key, so dedup must keep both.
+    if !friendly_blocked && !captures_so_far.is_empty() && path.len() < max_step {
+        options.push(CaptureHop {
+            direction: (df0, dr0),
+            landing_key: waypoints_so_far.last().unwrap().clone(),
+            landing_square: None,
+            captures: captures_so_far.clone(),
+            waypoints: waypoints_so_far.clone(),
+            is_suicide: false,
+            crossed_rank1,
+            cadence: path.len() + 1,
+            is_overshoot: true,
+        });
     }
     options
 }
@@ -330,10 +363,12 @@ fn next_capture_options(
         options.retain(|h| !h.is_suicide);
     }
     if let Some(c) = cadence {
-        options.retain(|h| h.waypoints.len() == c);
+        options.retain(|h| h.cadence == c);
     }
-    // Dedup by (direction, landing_key, captures, is_suicide).
-    let mut seen: std::collections::HashSet<(i8, i8, String, Vec<u8>, bool)> =
+    // Dedup by (direction, landing_key, captures, is_suicide, is_overshoot,
+    // cadence) — a rim landing and an off-grid overshoot can share the first
+    // four but are distinct moves, so cadence/is_overshoot are part of identity.
+    let mut seen: std::collections::HashSet<(i8, i8, String, Vec<u8>, bool, bool, usize)> =
         std::collections::HashSet::new();
     let mut deduped: Vec<CaptureHop> = Vec::with_capacity(options.len());
     for h in options {
@@ -343,6 +378,8 @@ fn next_capture_options(
             h.landing_key.clone(),
             h.captures.clone(),
             h.is_suicide,
+            h.is_overshoot,
+            h.cadence,
         );
         if seen.insert(key) {
             deduped.push(h);
@@ -385,6 +422,7 @@ struct ChainMove {
     chain_all_captures: Vec<String>,
     is_suicide: bool,
     chain_promotes: bool,
+    cadence: usize,
 }
 
 fn build_final_move(
@@ -446,12 +484,12 @@ fn build_final_move(
         None
     };
 
-    let (uci, waypoints_field) = if hops.len() > 1 {
-        let mid = all_waypoints.join("~");
-        (format!("{}~{}~{}", from_name, mid, dest_name), Some(all_waypoints.clone()))
-    } else {
-        (format!("{}{}", from_name, dest_name), None)
-    };
+    // §3B notation: c<N>:<from>~<hop landings>-><rest>. Cadence (the first
+    // hop's k) leads; <rest> (always on-board) always shown; hop keys are the
+    // on-grid landing keys (for an overshoot, the last on-grid square reached).
+    let cadence = hops[0].cadence;
+    let uci = format!("c{}:{}~{}->{}", cadence, from_name, hop_keys.join("~"), dest_name);
+    let waypoints_field = if hops.len() > 1 { Some(all_waypoints.clone()) } else { None };
 
     let all_cap_names: Vec<String> = all_captures
         .iter()
@@ -470,6 +508,7 @@ fn build_final_move(
         chain_all_captures: all_cap_names,
         is_suicide: is_suicide_chain,
         chain_promotes: chain_promotes_any,
+        cadence,
     }
 }
 
@@ -517,6 +556,7 @@ fn apply_hop(
 fn enumerate_chains_recursive(
     occupied: u64,
     occupied_white: u64,
+    king_sq: i64,
     stacks: &HashMap<u8, Vec<u8>>,
     chain_start: u8,
     cf: i8,
@@ -529,14 +569,12 @@ fn enumerate_chains_recursive(
     orig_stack: &[u8],
     results: &mut Vec<ChainMove>,
 ) {
-    // White-king-captured short-circuit. The only way occupied_white loses
-    // its king is if we've already captured it on the chain. We'd need to
-    // know which white pieces are kings — but for the diagonal-capture path
-    // the `_first_hop_suicides` handles single-hop king kills, and within
-    // chain DFS we can detect "no white king left" by checking occupied_white
-    // bit-pop count vs initial; simpler: just keep enumerating, the hops will
-    // fail to find more white pieces naturally. Python special-cases this for
-    // efficiency; we omit for simplicity (tested to give same results).
+    // White-king-captured short-circuit: if a prior hop already captured the
+    // White king, the game is over — stop the chain (mirrors Python explore).
+    // Required for correctness once chains can continue past a king capture.
+    if king_sq >= 0 && (occupied_white & (1u64 << king_sq)) == 0 {
+        return;
+    }
     let options = next_capture_options(
         occupied,
         occupied_white,
@@ -550,12 +588,20 @@ fn enumerate_chains_recursive(
         false,
     );
     if options.is_empty() {
-        if !hops_so_far.is_empty() {
-            results.push(build_final_move(chain_start, orig_stack, &hops_so_far));
-        }
+        // Nothing further; whatever chain reached here was already emitted as a
+        // "stop" by the parent loop below (every hop emits its stop-move).
         return;
     }
     for hop in &options {
+        let mut hops_next = hops_so_far.clone();
+        hops_next.push(hop.clone());
+        // Emit the chain ending at this hop. For an off-grid overshoot this is
+        // the settle move and the chain ENDS. Otherwise it's the optional stop
+        // (§3B: continuing is optional) and we also recurse to extend it.
+        results.push(build_final_move(chain_start, orig_stack, &hops_next));
+        if hop.is_overshoot {
+            continue;
+        }
         let (new_occ, new_occ_w, new_stacks, land_stack) = apply_hop(
             occupied,
             occupied_white,
@@ -569,12 +615,11 @@ fn enumerate_chains_recursive(
             Some(sq) => ((sq & 7) as i8, (sq >> 3) as i8),
             None => parse_waypoint_key(&hop.landing_key).unwrap_or((cf, cr)),
         };
-        let next_cadence = cadence.or(Some(hop.waypoints.len()));
-        let mut hops_next = hops_so_far.clone();
-        hops_next.push(hop.clone());
+        let next_cadence = cadence.or(Some(hop.cadence));
         enumerate_chains_recursive(
             new_occ,
             new_occ_w,
+            king_sq,
             &new_stacks,
             chain_start,
             nf,
@@ -593,6 +638,7 @@ fn enumerate_chains_recursive(
 fn enumerate_chains(
     occupied: u64,
     occupied_white: u64,
+    king_sq: i64,
     stacks: &HashMap<u8, Vec<u8>>,
     chain_start: u8,
 ) -> Vec<ChainMove> {
@@ -607,6 +653,7 @@ fn enumerate_chains(
     enumerate_chains_recursive(
         occupied,
         occupied_white,
+        king_sq,
         stacks,
         chain_start,
         cf0,
@@ -650,6 +697,7 @@ fn first_hop_suicides(
 fn black_diagonal_capture_moves_native(
     occupied: u64,
     occupied_white: u64,
+    king_sq: i64,
     stacks: &HashMap<u8, Vec<u8>>,
 ) -> Vec<ChainMove> {
     let mut moves: Vec<ChainMove> = Vec::new();
@@ -661,11 +709,135 @@ fn black_diagonal_capture_moves_native(
             if pieces.is_empty() {
                 continue;
             }
-            moves.extend(enumerate_chains(occupied, occupied_white, stacks, sq));
+            moves.extend(enumerate_chains(occupied, occupied_white, king_sq, stacks, sq));
             moves.extend(first_hop_suicides(occupied, occupied_white, stacks, sq));
         }
     }
     moves
+}
+
+// -------- King-capture detection (bool early-exit) --------
+//
+// Used by white check detection (_is_white_in_chessckers_check), which only
+// needs to know whether ANY Black diagonal hop/chain/overshoot/ram captures the
+// White king — not the full move list. Mirrors black_diagonal_capture_moves_native
+// exactly (same chain enumeration + first-hop suicides), but returns true on the
+// first hop whose path-captures include `king`, builds no ChainMove/strings, and
+// prunes the search. This is the hot path in self-play (one call per White
+// candidate move); avoiding the per-move dict marshalling is a large win.
+
+fn chain_captures_king_rec(
+    occupied: u64,
+    occupied_white: u64,
+    stacks: &HashMap<u8, Vec<u8>>,
+    cf: i8,
+    cr: i8,
+    cur_stack: &[u8],
+    last_dir: Option<(i8, i8)>,
+    cadence: Option<usize>,
+    n: usize,
+    king: u8,
+) -> bool {
+    // King already gone (a prior hop captured it): caller returns true before
+    // recursing, so this only guards against a stale state — stop the chain.
+    if (occupied_white & (1u64 << king)) == 0 {
+        return false;
+    }
+    let options = next_capture_options(
+        occupied,
+        occupied_white,
+        stacks,
+        cf,
+        cr,
+        cur_stack,
+        last_dir,
+        n,
+        cadence,
+        false,
+    );
+    for hop in &options {
+        if hop.captures.contains(&king) {
+            return true;
+        }
+        if hop.is_overshoot {
+            continue;
+        }
+        let (new_occ, new_occ_w, new_stacks, land_stack) = apply_hop(
+            occupied,
+            occupied_white,
+            stacks.clone(),
+            cf,
+            cr,
+            cur_stack,
+            hop,
+        );
+        let (nf, nr) = match hop.landing_square {
+            Some(sq) => ((sq & 7) as i8, (sq >> 3) as i8),
+            None => parse_waypoint_key(&hop.landing_key).unwrap_or((cf, cr)),
+        };
+        let next_cadence = cadence.or(Some(hop.cadence));
+        if chain_captures_king_rec(
+            new_occ,
+            new_occ_w,
+            &new_stacks,
+            nf,
+            nr,
+            &land_stack,
+            Some(hop.direction),
+            next_cadence,
+            n,
+            king,
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn black_can_capture_white_king_native(
+    occupied: u64,
+    occupied_white: u64,
+    king_sq: i64,
+    stacks: &HashMap<u8, Vec<u8>>,
+) -> bool {
+    if king_sq < 0 || (occupied_white & (1u64 << (king_sq as u8))) == 0 {
+        return false;
+    }
+    let king = king_sq as u8;
+    for (sq, pieces) in stacks.iter() {
+        if pieces.is_empty() {
+            continue;
+        }
+        let n = pieces.len();
+        let cf = (sq & 7) as i8;
+        let cr = (sq >> 3) as i8;
+        // Non-suicide chains.
+        if chain_captures_king_rec(
+            occupied,
+            occupied_white,
+            stacks,
+            cf,
+            cr,
+            pieces,
+            None,
+            None,
+            n,
+            king,
+        ) {
+            return true;
+        }
+        // First-hop suicides (rams) — a ram captures its path Whites in transit,
+        // which may include the king.
+        let dirs = dirs_for_top(*pieces.last().unwrap());
+        for &(df, dr) in dirs {
+            for hop in find_capture_hops(occupied, occupied_white, stacks, cf, cr, df, dr, n) {
+                if hop.is_suicide && hop.captures.contains(&king) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // -------- Quiet moves (Phase 2A + sprint) --------
@@ -1132,6 +1304,7 @@ fn any_to_pydict<'py>(py: Python<'py>, m: &AnyMove) -> PyResult<Bound<'py, PyDic
             d.set_item("sourceKingPositions", py.None())?;
             d.set_item("deployCount", py.None())?;
             d.set_item("_chain_all_captures", &cm.chain_all_captures)?;
+            d.set_item("cadence", cm.cadence)?;
             d.set_item("_is_suicide", cm.is_suicide)?;
             d.set_item("_chain_promotes", cm.chain_promotes)?;
         }
@@ -1145,12 +1318,13 @@ fn any_to_pydict<'py>(py: Python<'py>, m: &AnyMove) -> PyResult<Bound<'py, PyDic
 fn all_black_legal_moves_native(
     occupied: u64,
     occupied_white: u64,
+    king_sq: i64,
     stacks: &HashMap<u8, Vec<u8>>,
 ) -> Vec<AnyMove> {
     let mut quiet = black_diagonal_quiet_moves_native(occupied, occupied_white, stacks);
     let mut deploy = black_deploy_moves_native(occupied, occupied_white, stacks);
     let mut charge = black_charge_moves_native(occupied, occupied_white, stacks);
-    let chain = black_diagonal_capture_moves_native(occupied, occupied_white, stacks);
+    let chain = black_diagonal_capture_moves_native(occupied, occupied_white, king_sq, stacks);
 
     let mandate = black_mandatory_capture_active_native(occupied, occupied_white, stacks);
 
@@ -1330,6 +1504,7 @@ fn chain_move_to_pydict<'py>(py: Python<'py>, m: &ChainMove) -> PyResult<Bound<'
     d.set_item("sourceKingPositions", py.None())?;
     d.set_item("deployCount", py.None())?;
     d.set_item("_chain_all_captures", &m.chain_all_captures)?;
+    d.set_item("cadence", m.cadence)?;
     d.set_item("_is_suicide", m.is_suicide)?;
     d.set_item("_chain_promotes", m.chain_promotes)?;
     Ok(d)
@@ -1345,10 +1520,11 @@ fn black_diagonal_capture_moves<'py>(
     py: Python<'py>,
     occupied: u64,
     occupied_white: u64,
+    king_sq: i64,
     stacks: &Bound<'_, PyDict>,
 ) -> PyResult<Bound<'py, PyList>> {
     let stacks_rs = parse_stacks(stacks)?;
-    let moves = black_diagonal_capture_moves_native(occupied, occupied_white, &stacks_rs);
+    let moves = black_diagonal_capture_moves_native(occupied, occupied_white, king_sq, &stacks_rs);
     let out = PyList::empty_bound(py);
     for m in &moves {
         out.append(chain_move_to_pydict(py, m)?)?;
@@ -1375,10 +1551,11 @@ fn all_black_legal_moves<'py>(
     py: Python<'py>,
     occupied: u64,
     occupied_white: u64,
+    king_sq: i64,
     stacks: &Bound<'_, PyDict>,
 ) -> PyResult<Bound<'py, PyList>> {
     let stacks_rs = parse_stacks(stacks)?;
-    let moves = all_black_legal_moves_native(occupied, occupied_white, &stacks_rs);
+    let moves = all_black_legal_moves_native(occupied, occupied_white, king_sq, &stacks_rs);
     let out = PyList::empty_bound(py);
     for m in &moves {
         out.append(any_to_pydict(py, m)?)?;
@@ -1402,6 +1579,22 @@ fn square_attacked_by_black_chessckers(
     ))
 }
 
+#[pyfunction]
+fn black_can_capture_white_king(
+    occupied: u64,
+    occupied_white: u64,
+    king_sq: i64,
+    stacks: &Bound<'_, PyDict>,
+) -> PyResult<bool> {
+    let stacks_rs = parse_stacks(stacks)?;
+    Ok(black_can_capture_white_king_native(
+        occupied,
+        occupied_white,
+        king_sq,
+        &stacks_rs,
+    ))
+}
+
 #[pymodule]
 fn chessckers_movegen(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ping, m)?)?;
@@ -1409,5 +1602,6 @@ fn chessckers_movegen(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(black_mandatory_capture_active, m)?)?;
     m.add_function(wrap_pyfunction!(all_black_legal_moves, m)?)?;
     m.add_function(wrap_pyfunction!(square_attacked_by_black_chessckers, m)?)?;
+    m.add_function(wrap_pyfunction!(black_can_capture_white_king, m)?)?;
     Ok(())
 }

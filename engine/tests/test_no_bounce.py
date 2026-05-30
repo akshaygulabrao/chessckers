@@ -37,7 +37,7 @@ def test_chain_terminates_at_g0_rim_with_fallback_to_f1():
     c = PyVariantClient()
     parsed = c.parse(SCREENSHOT_FEN)
     _, _, moves = c.status_and_legal(parsed)
-    target = [m for m in moves if m["uci"] == "a6~b5~c4~d3~e2~f1~g0~f1"]
+    target = [m for m in moves if m["uci"] == "c3:a6~d3~g0->f1"]
     assert target, "expected chain a6~...~g0~f1 (rim-terminate + fallback)"
     m = target[0]
     assert m["to"] == "f1", f"effective dest should be f1, got {m['to']}"

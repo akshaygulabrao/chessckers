@@ -153,6 +153,14 @@ class CaptureHop:
     waypoints: list[str] = field(default_factory=list)
     is_suicide: bool = False
     crossed_rank1: bool = False
+    # `cadence` is the hop's landing distance k. For an on-grid landing it
+    # equals len(waypoints); for an off-grid overshoot it is one past the last
+    # on-grid step, so it can exceed len(waypoints) — hence stored explicitly.
+    cadence: int = 0
+    # True when the cadence landing fell off the 10×10 grid: the hop captured
+    # its path Whites but cannot land, so it settles on the last on-board
+    # square (computed in _build_final_move) and ENDS the chain.
+    is_overshoot: bool = False
 
 
 def _piece_name(top_char: str) -> str:
@@ -355,6 +363,7 @@ def _find_capture_hops(
     # Walk only the steps we actually need: max n+1 steps; precomputed path
     # may end earlier when it would have left the grid.
     max_step = n + 1
+    friendly_blocked = False
     for step_idx, step_data in enumerate(path):
         if step_idx >= max_step:
             break
@@ -362,7 +371,7 @@ def _find_capture_hops(
         waypoints_so_far.append(cur_key)
         if r == 0:
             crossed_rank1 = True
-        step = step_idx + 1  # 1-based step number, matching the original loop
+        step = step_idx + 1  # 1-based step number = the landing distance k
 
         if sq != -1:
             if sq in captured_set:
@@ -375,6 +384,7 @@ def _find_capture_hops(
                         captures=list(captures_so_far),
                         waypoints=list(waypoints_so_far),
                         crossed_rank1=crossed_rank1,
+                        cadence=step,
                     ))
             else:
                 # Bitboard fast path — board.piece_at would allocate a Piece
@@ -395,9 +405,12 @@ def _find_capture_hops(
                             captures=list(captures_so_far),
                             waypoints=list(waypoints_so_far),
                             crossed_rank1=crossed_rank1,
+                            cadence=step,
                         ))
                 elif owner == SQ_BLACK and sq in stacks:
-                    # Friendly tower terminates the trace.
+                    # Friendly tower terminates the trace (a block, NOT an
+                    # off-grid exit — so no overshoot is emitted past it).
+                    friendly_blocked = True
                     break
                 else:
                     # White piece (or Black-piece-without-stack, defensive).
@@ -413,6 +426,7 @@ def _find_capture_hops(
                             waypoints=list(waypoints_so_far),
                             is_suicide=True,
                             crossed_rank1=crossed_rank1,
+                            cadence=step,
                         )
                         options.append(ram_hop)
                     captures_so_far.append(sq)
@@ -427,7 +441,28 @@ def _find_capture_hops(
                     captures=list(captures_so_far),
                     waypoints=list(waypoints_so_far),
                     crossed_rank1=crossed_rank1,
+                    cadence=step,
                 ))
+
+    # §3B off-grid overshoot. The straight path left the 10×10 grid before
+    # reaching the cadence limit (the precomputed path is shorter than n+1,
+    # and we weren't stopped by a friendly tower) AND at least one White was
+    # captured on the way. The hop cannot land off-grid, so it settles on the
+    # last on-board square (resolved in _build_final_move) and ends the turn.
+    # Cadence is one step past the last on-grid square. It is a candidate
+    # DISTINCT from the rim landing at the same key (different cadence), so
+    # the dedup in _next_capture_options must keep both.
+    if (not friendly_blocked) and captures_so_far and len(path) < max_step:
+        options.append(CaptureHop(
+            direction=(df0, dr0),
+            landing_key=waypoints_so_far[-1],
+            landing_square=None,
+            captures=list(captures_so_far),
+            waypoints=list(waypoints_so_far),
+            crossed_rank1=crossed_rank1,
+            cadence=len(path) + 1,
+            is_overshoot=True,
+        ))
 
     return options
 
@@ -478,11 +513,15 @@ def _next_capture_options(
     if not include_suicide:
         options = [h for h in options if not h.is_suicide]
     if cadence is not None:
-        options = [h for h in options if len(h.waypoints) == cadence]
+        options = [h for h in options if h.cadence == cadence]
     seen: set[tuple[Any, ...]] = set()
     deduped: list[CaptureHop] = []
     for h in options:
-        key = (h.direction, h.landing_key, tuple(h.captures), h.is_suicide)
+        # is_overshoot + cadence are part of identity: a rim landing and an
+        # off-grid overshoot can share direction/landing_key/captures but are
+        # distinct moves (§3B), so they must not dedup into one.
+        key = (h.direction, h.landing_key, tuple(h.captures), h.is_suicide,
+               h.is_overshoot, h.cadence)
         if key in seen:
             continue
         seen.add(key)
@@ -521,10 +560,22 @@ def _enumerate_chains(state: State, chain_start: chess.Square) -> list[dict[str,
                 board, stacks, cf, cr, cur_stack, last_dir, n, cadence
             )
         if not options:
-            if hops_so_far:
-                results.append(_build_final_move(state, chain_start, hops_so_far))
+            # No further capture available. Whatever chain reached here was
+            # already emitted as a "stop" by the parent loop below (every hop
+            # emits its stop-move), so there's nothing to add — just unwind.
             return
         for hop in options:
+            if hop.is_overshoot:
+                # Off-grid overshoot: captured its path Whites, can't land, so
+                # it settles on the last on-board square (computed in
+                # _build_final_move) and ENDS the chain — no continuation.
+                results.append(_build_final_move(state, chain_start, hops_so_far + [hop]))
+                continue
+            # §3B: continuing is optional — stopping after this capture is a
+            # legal move. Emit the chain ending here, then ALSO recurse to
+            # extend it (the recursion emits the longer variants). Each chain
+            # prefix is emitted exactly once, by the hop that produces it.
+            results.append(_build_final_move(state, chain_start, hops_so_far + [hop]))
             new_board = board.copy(stack=False)
             new_stacks = dict(stacks)
             # Remove moving tower from current square if on B (mid-chain rim has none).
@@ -556,7 +607,7 @@ def _enumerate_chains(state: State, chain_start: chess.Square) -> list[dict[str,
             else:
                 parsed = _parse_waypoint_key(hop.landing_key)
                 nf, nr = parsed if parsed else (cf, cr)
-            next_cadence = cadence if cadence is not None else len(hop.waypoints)
+            next_cadence = cadence if cadence is not None else hop.cadence
             explore(
                 new_board, new_stacks, nf, nr, land_stack,
                 hop.direction, hops_so_far + [hop], next_cadence,
@@ -625,21 +676,16 @@ def _build_final_move(
 
     from_name = _SQ_NAME[chain_start]
     dest_name = _SQ_NAME[final_landing]
-    if len(hops) > 1:
-        # UCI shows ONLY hop landings (each chainHop), not the in-between
-        # squares each hop traverses. For chains that bounced off the rim,
-        # the dest is the end-of-turn-fallback square and differs from the
-        # last hop landing — include it. For chains that don't bounce, the
-        # last hop landing IS dest, so don't duplicate it.
-        landings = [hop.landing_key for hop in hops]
-        if landings[-1] != dest_name:
-            uci = f"{from_name}~{'~'.join(landings)}~{dest_name}"
-        else:
-            uci = f"{from_name}~{'~'.join(landings)}"
-        waypoints_field: list[str] | None = list(all_waypoints)
-    else:
-        uci = f"{from_name}{dest_name}"
-        waypoints_field = None
+    # §3B notation: c<N>:<from>~<hop landings>-><rest>. The cadence (the first
+    # hop's k) leads; <rest> is always shown and always on-board. The hop keys
+    # are on-grid landing keys — for an overshoot the final key is the last
+    # on-grid square that hop reached, never an off-grid coordinate. Cadence is
+    # the discriminator: a rim landing and an off-grid overshoot can share the
+    # same keys and rest, and only the leading c<N> tells them apart.
+    cadence = hops[0].cadence
+    hop_key_list = [hop.landing_key for hop in hops]
+    uci = f"c{cadence}:{from_name}~{'~'.join(hop_key_list)}->{dest_name}"
+    waypoints_field: list[str] | None = list(all_waypoints) if len(hops) > 1 else None
 
     # Internal fields used by _apply_chain_move; not exposed to callers.
     all_cap_names = [_SQ_NAME[sq] for sq in all_captures]
@@ -655,6 +701,7 @@ def _build_final_move(
         "capture": capture_field,
         "waypoints": waypoints_field,
         "chainHops": list(hop_keys),
+        "cadence": cadence,
         "promotion": None,
         "demotedKings": None,
         "demotionsRequired": None,
@@ -692,6 +739,12 @@ try:
 except ImportError:
     _rs_movegen = None
 
+# Bypass the native extension (force the pure-Python path) when set. The Rust
+# port lags the Python rules during the §3B off-grid-overshoot work; set this
+# so changes here take effect. Remove once the Rust mirror is back in sync.
+if __import__("os").environ.get("CHESSCKERS_NO_RUST"):
+    _rs_movegen = None
+
 
 def _black_diagonal_capture_moves_py(state: State) -> list[dict[str, Any]]:
     """Pure-Python implementation. Kept around as a correctness reference and
@@ -723,9 +776,11 @@ def black_diagonal_capture_moves(state: State) -> list[dict[str, Any]]:
     if state.board.turn != chess.BLACK:
         return []
     if _rs_movegen is not None:
+        wk = state.board.king(chess.WHITE)
         return _rs_movegen.black_diagonal_capture_moves(
             state.board.occupied,
             state.board.occupied_co[chess.WHITE],
+            -1 if wk is None else wk,
             state.stacks,
         )
     return _black_diagonal_capture_moves_py(state)

@@ -39,6 +39,9 @@ try:
     import chessckers_movegen as _rs_movegen  # type: ignore[import-not-found]
 except ImportError:
     _rs_movegen = None
+# See moves_black.py: bypass the native extension during the §3B rule work.
+if __import__("os").environ.get("CHESSCKERS_NO_RUST"):
+    _rs_movegen = None
 from chessckers_engine.variant_py.state import STARTING_FEN, State, parse_fen, serialize_fen
 
 GameState = dict[str, Any]
@@ -75,12 +78,13 @@ def _state_to_dict(state: State, fen_override: str | None = None) -> GameState:
     python-chess canonicalize."""
     fen = fen_override if fen_override is not None else serialize_fen(state)
     turn = "white" if state.board.turn == chess.WHITE else "black"
-    try:
-        check = bool(state.board.is_check())
-    except Exception:  # noqa: BLE001
-        # python-chess can throw on positions without a king of one color;
-        # Black-to-move positions in Chessckers don't have a chess king at
-        # all, so check is meaningless there.
+    # `check` = is the side-to-move in check. White-to-move uses the Chessckers
+    # check (NOT python-chess is_check(), which can't see Black's diagonal/chain/
+    # charge king-captures). Black-to-move has no chess king to be checked.
+    if state.board.turn == chess.WHITE:
+        from chessckers_engine.variant_py.moves_white import _is_white_in_chessckers_check
+        check = _is_white_in_chessckers_check(state)
+    else:
         check = False
     status, winner = _detect_status(state)
     if state.board.turn == chess.WHITE:
@@ -236,9 +240,11 @@ class PyVariantClient:
             # Native fast path: one Rust call returns the post-mandate-filter
             # legal-move list. ~75% of the pre-Rust `status_and_legal` cost
             # collapses into this single call.
+            wk = state.board.king(chess.WHITE)
             legal_moves = _rs_movegen.all_black_legal_moves(
                 state.board.occupied,
                 state.board.occupied_co[chess.WHITE],
+                -1 if wk is None else wk,
                 state.stacks,
             )
         else:

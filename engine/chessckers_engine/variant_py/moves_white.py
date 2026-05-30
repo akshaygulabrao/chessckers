@@ -195,12 +195,53 @@ def _square_attacked_by_black_chessckers_py(state: State, target_sq: int) -> boo
 
 
 def _is_white_in_chessckers_check(state: State) -> bool:
-    """White king is in Chessckers check iff some Black stack can capture
-    its square next turn via the rules above."""
+    """White king is in Chessckers check iff Black, to move, has a capture that
+    captures the white king's square.
+
+    The targeted attack model (`_square_attacked_by_black_chessckers`) only
+    covers single diagonals and orthogonal charges — NOT multi-hop diagonal
+    chains or off-grid overshoots (§3B), where Black turns a chain around to
+    reach the king. So we additionally scan the real diagonal capture
+    generator, which models chains/overshoots correctly. A hit means the king
+    is among a move's *path* captures — a ram landing on the king does NOT
+    capture it, so path captures are exactly the right test. Defining check via
+    the generator keeps it consistent with move-gen by construction; the
+    charge case stays on the targeted model (charges don't chain, so it's
+    complete there)."""
     king_sq = state.board.king(chess.WHITE)
     if king_sq is None:
         # King already captured — game-over status handled elsewhere.
         return False
+    # Diagonal hops / chains / overshoots — reuse the correct generator. Probe
+    # as if it were Black to move (this is asked on both white- and black-to-
+    # move states).
+    from chessckers_engine.variant_py import moves_black as _mb
+    if state.board.turn == chess.BLACK:
+        probe = state
+    else:
+        probe = state.copy()
+        probe.board.turn = chess.BLACK
+    # Hot path: a native bool early-exit that runs the same chain search but
+    # stops at the first king-capturing hop and builds no move dicts. This is
+    # called once per White candidate move in white_legal_moves, so avoiding the
+    # full black_diagonal_capture_moves list (and its PyO3 marshalling) is the
+    # difference between ~92µs and a few µs per call. Falls back to scanning the
+    # generated list when the native extension is bypassed (gated on the same
+    # _mb._rs_movegen the tests monkeypatch).
+    if _mb._rs_movegen is not None:
+        if _mb._rs_movegen.black_can_capture_white_king(
+            probe.board.occupied,
+            probe.board.occupied_co[chess.WHITE],
+            king_sq,
+            probe.stacks,
+        ):
+            return True
+    else:
+        king_name = _SQ_NAME[king_sq]
+        for m in _mb.black_diagonal_capture_moves(probe):
+            if king_name in (m.get("_chain_all_captures") or ()):
+                return True
+    # Single diagonals + orthogonal charges (charges don't chain).
     return _square_attacked_by_black_chessckers(state, king_sq)
 
 
