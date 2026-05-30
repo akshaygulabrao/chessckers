@@ -83,7 +83,7 @@ The server is stateless — each request carries the full FEN. `GameApi.toGameSt
 
 ## Game Rules Reference
 
-The formal spec is in `scalachess/chessckers.md`. Key points:
+The formal spec is in `chessckers.md` (monorepo root). Key points:
 - White plays standard FIDE chess (ranks 1-2)
 - Black has 24 checker pieces on ranks 6-8 (Stones on 6+8, Kings on 7), organized as stacks
 - Black moves: diagonal movement (range = stack height), stacking/unstacking, back rank sprint, diagonal capture chains (with T-boundary bounces), orthogonal capture (King-top stacks, costs King demotions)
