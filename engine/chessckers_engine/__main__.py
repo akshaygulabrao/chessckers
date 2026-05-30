@@ -9,6 +9,7 @@ from chessckers_engine.checkpoints import latest_checkpoint
 from chessckers_engine.http_server import make_server
 from chessckers_engine.runtime import build_pickers
 from chessckers_engine.server_client import ServerClient
+from chessckers_engine.variant_py import PyVariantClient
 
 DEFAULT_GAMES_PATH = Path(__file__).resolve().parent.parent / "games" / "games.jsonl"
 
@@ -44,12 +45,15 @@ def main() -> int:
             log.info("auto-selected latest checkpoint: %s", model_path)
     model_path = model_path or None
 
-    client = ServerClient(base_url=api_url)
-    try:
-        client.new_game()
-    except httpx.ConnectError:
-        log.error("cannot reach API at %s (start the server first)", api_url)
-        return 1
+    if os.environ.get("ENGINE_USE_SERVER"):
+        client = ServerClient(base_url=api_url)
+        try:
+            client.new_game()
+        except httpx.ConnectError:
+            log.error("cannot reach API at %s (start the server first)", api_url)
+            return 1
+    else:
+        client = PyVariantClient()
 
     pickers = build_pickers(client, model_path, log, mcts_sims=mcts_sims,
                              puct_sims=puct_sims, **arch_overrides)

@@ -28,6 +28,7 @@ from typing import Any, Callable
 from chessckers_engine.checkpoints import latest_checkpoint
 from chessckers_engine.runtime import build_pickers
 from chessckers_engine.server_client import ServerClient
+from chessckers_engine.variant_py import PyVariantClient
 
 log = logging.getLogger("chessckers_engine.evaluate")
 
@@ -130,6 +131,8 @@ def main() -> int:
     p.add_argument("--max-plies", type=int, default=400)
     p.add_argument("--model", default=None, help="Path to .pt weights for nn (default: auto-discovery)")
     p.add_argument("--api-url", default=os.environ.get("API_URL", "http://localhost:8080"))
+    p.add_argument("--use-server", action="store_true",
+                   help="use the scalachess HTTP server instead of the in-process Python variant")
     args = p.parse_args()
 
     model_path = args.model
@@ -139,12 +142,15 @@ def main() -> int:
             model_path = str(latest)
             log.info("auto-selected latest checkpoint: %s", model_path)
 
-    client = ServerClient(base_url=args.api_url)
-    try:
-        client.new_game()
-    except Exception as e:  # noqa: BLE001
-        log.error("cannot reach API at %s: %s", args.api_url, e)
-        return 1
+    if args.use_server:
+        client = ServerClient(base_url=args.api_url)
+        try:
+            client.new_game()
+        except Exception as e:  # noqa: BLE001
+            log.error("cannot reach API at %s: %s", args.api_url, e)
+            return 1
+    else:
+        client = PyVariantClient()
 
     pickers = build_pickers(client, model_path, log, mcts_sims=args.mcts_sims)
     if args.white not in pickers or args.black not in pickers:

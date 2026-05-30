@@ -26,6 +26,7 @@ from chessckers_engine.evaluate import play_game
 from chessckers_engine.mcts_puct import pick_puct
 from chessckers_engine.model import ChesskersScorer
 from chessckers_engine.server_client import ServerClient
+from chessckers_engine.variant_py import PyVariantClient
 
 log = logging.getLogger("chessckers_engine.gauntlet")
 
@@ -177,6 +178,8 @@ def main() -> int:
     p.add_argument("--c-puct", type=float, default=1.5)
     p.add_argument("--max-plies", type=int, default=400)
     p.add_argument("--api-url", default="http://localhost:8080")
+    p.add_argument("--use-server", action="store_true",
+                   help="use the scalachess HTTP server instead of the in-process Python variant")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -184,12 +187,15 @@ def main() -> int:
         p.error("must provide either --ladder-dir or both --challenger and --champion")
 
     torch.manual_seed(args.seed)
-    client = ServerClient(base_url=args.api_url)
-    try:
-        client.new_game()
-    except Exception as e:  # noqa: BLE001
-        log.error("cannot reach API at %s: %s", args.api_url, e)
-        return 1
+    if args.use_server:
+        client = ServerClient(base_url=args.api_url)
+        try:
+            client.new_game()
+        except Exception as e:  # noqa: BLE001
+            log.error("cannot reach API at %s: %s", args.api_url, e)
+            return 1
+    else:
+        client = PyVariantClient()
 
     if args.ladder_dir:
         rows = run_ladder(Path(args.ladder_dir), client,
