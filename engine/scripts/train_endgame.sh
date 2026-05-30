@@ -1,28 +1,30 @@
 #!/usr/bin/env bash
-# Train AlphaZero self-play from the "4-stone tower vs lone White king" endgame
-# instead of the full starting position. This is a Black-competence detector:
-# with best play Black (the e6 tower) should hunt down and capture the lone king,
-# so a genuinely strong Black net should win ~100% of these games. Watch the
-# per-iteration eval (net-as-black vs random-white) climb toward all-wins.
+# Single entry point for endgame curriculum self-play training.
 #
-# The custom start position + short ply cap are injected via env vars read by
-# PyVariantClient.new_game() and play_az_game() — every self-play/eval game
-# (which all go through new_game()) starts from this FEN.
+# One trainer (chessckers_engine.selfplay_az_loop), one output dir
+# (engine/weights/run), one log (/tmp/chessckers_train.log). The validated
+# config is baked in so there are no ad-hoc invocations:
+#   - start from the mate-in-1 seed (the position self-play can bootstrap from)
+#   - --sims 400          (enough to concentrate over the ~45-move branching)
+#   - --eval-games 0      (eval off; the self-play W/B/D column is the signal)
+#   - value/backup length discount γ=0.9 (incentive to win faster)
 #
-# Usage:
-#   scripts/train_endgame.sh                 # sensible defaults
-#   scripts/train_endgame.sh --iterations 50 # override / add any loop flag
+# Everything is overridable via env or pass-through flags, e.g.:
+#   CHESSCKERS_START_FEN='<deeper seed>' OUT=weights/run scripts/train_endgame.sh --resume
+#   scripts/train_endgame.sh --iterations 50
 set -euo pipefail
 cd "$(dirname "$0")/.."   # -> engine/
 
-export CHESSCKERS_START_FEN="${CHESSCKERS_START_FEN:-8/8/4p3/8/8/8/8/4K3[e6:ssss] b - - 0 1}"
-export CHESSCKERS_MAX_PLIES="${CHESSCKERS_MAX_PLIES:-80}"
+export CHESSCKERS_START_FEN="${CHESSCKERS_START_FEN:-8/8/8/8/8/3kk3/8/4K3[d3:kk,e3:kk] b - - 0 1}"
+export CHESSCKERS_MAX_PLIES="${CHESSCKERS_MAX_PLIES:-40}"
+export CHESSCKERS_VALUE_DISCOUNT="${CHESSCKERS_VALUE_DISCOUNT:-0.9}"
+OUT="${OUT:-weights/run}"
 
 echo "start FEN : $CHESSCKERS_START_FEN"
-echo "max plies : $CHESSCKERS_MAX_PLIES"
+echo "max plies : $CHESSCKERS_MAX_PLIES | discount γ: $CHESSCKERS_VALUE_DISCOUNT | out: $OUT"
 
 exec .venv/bin/python -m chessckers_engine.selfplay_az_loop \
-    --iterations 30 --games-per-iter 16 --sims 400 --epochs 3 \
+    --iterations 30 --games-per-iter 8 --sims 400 --epochs 3 \
     --eval-games 0 --workers 1 --worker-mode threads --device auto \
-    --weights-dir weights/endgame \
+    --weights-dir "$OUT" \
     "$@"
