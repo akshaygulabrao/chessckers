@@ -22,7 +22,7 @@ echo "start FEN : $CHESSCKERS_START_FEN"
 echo "max plies : $CHESSCKERS_MAX_PLIES"
 
 exec .venv/bin/python -m chessckers_engine.selfplay_az_loop \
-    --iterations 30 --games-per-iter 16 --sims 50 --epochs 3 \
+    --iterations 30 --games-per-iter 16 --sims 400 --epochs 3 \
     --eval-games 0 --workers 1 --worker-mode threads --device auto \
     --weights-dir weights/endgame \
     "$@"
