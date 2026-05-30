@@ -17,6 +17,7 @@ outputs.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import chess
@@ -43,6 +44,14 @@ except ImportError:
 if __import__("os").environ.get("CHESSCKERS_NO_RUST"):
     _rs_movegen = None
 from chessckers_engine.variant_py.state import STARTING_FEN, State, parse_fen, serialize_fen
+
+
+def _default_start_fen() -> str:
+    """Start FEN used by `new_game()` when no `fen` is passed. Overridable via
+    the `CHESSCKERS_START_FEN` env var so experiments can pin a custom start
+    position (e.g. an endgame) without threading a start_fen through every call
+    site (self-play, eval, workers all go through `new_game()`)."""
+    return os.environ.get("CHESSCKERS_START_FEN", STARTING_FEN)
 
 GameState = dict[str, Any]
 HopDTO = dict[str, Any]
@@ -138,7 +147,7 @@ class PyVariantClient:
         verbatim (matching scalachess's parse-time behavior — useful for
         positions where canonicalization would diverge, e.g. `KQkq` →
         `KQ`)."""
-        input_fen = fen if fen is not None else STARTING_FEN
+        input_fen = fen if fen is not None else _default_start_fen()
         state = parse_fen(input_fen)
         return _state_to_dict(state, fen_override=input_fen)
 

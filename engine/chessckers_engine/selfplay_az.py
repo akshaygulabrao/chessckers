@@ -155,7 +155,7 @@ def play_az_game(
     n_sims: int = 100,
     c_puct: float = 1.5,
     temperature: float = 1.0,
-    max_plies: int = 400,
+    max_plies: int | None = None,
     rng: torch.Generator | None = None,
     dirichlet_alpha: float | None = 0.3,
     dirichlet_eps: float = 0.25,
@@ -173,6 +173,10 @@ def play_az_game(
     event so a spectator UI can follow training. `sink_context` is merged
     into every snapshot/log emitted (e.g. {iter, game_idx, total_games}).
     """
+    if max_plies is None:
+        # Env-overridable so experiments (e.g. a tiny endgame) can cap drawn
+        # games short without threading a flag through every call site.
+        max_plies = int(os.environ.get("CHESSCKERS_MAX_PLIES", "400"))
     state = client.new_game()
     records: list[AZRecord] = []
     history: list[dict[str, str]] = []  # [{fen, uci}], same schema as games.jsonl
