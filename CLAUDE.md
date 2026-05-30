@@ -46,7 +46,8 @@ The `slow` marker tags end-to-end tests that spawn subprocess workers (self-play
 
 - `python -m chessckers_engine.selfplay_az_loop [...]` — AlphaZero self-play + training loop.
 - Operational scripts live in `scripts/` (`launch_workers.sh`, `train_cloud*.sh`, `watchdog.sh`, `status.sh`, the launchd plist, remote-fleet sync). These drive multi-worker / cloud self-play.
-- `python -m chessckers_engine` still launches a legacy HTTP engine server (port 8082) that talked to the old Scala API; it is vestigial now that the browser UI is gone (see *Known dead code* below).
+
+The legacy HTTP layer is gone: there is no Scala server, no `ServerClient`, and no `python -m chessckers_engine` HTTP server. All game logic runs in-process via `PyVariantClient`. Some launch scripts still pass `--use-pyvariant`/`--use-server`; those flags are accepted as no-ops.
 
 ## Architecture
 
@@ -91,9 +92,5 @@ The formal spec is in `chessckers.md` (monorepo root). Key points (v3 terms):
 
 ## Code Style
 
-- **Python**: type hints throughout, Scala-style dict shapes preserved at the API boundary for parity with the engine's history. Keep changes surgical.
+- **Python**: type hints throughout, dict shapes preserved at the `PyVariantClient` boundary (these mirror what the old Scala server returned). Keep changes surgical.
 - **Rust**: `rustfmt`; the crate mirrors PyVariant and must stay equivalent — any rule change goes in both, with the equivalence verified before committing.
-
-## Known dead code (post-fork-removal cleanup not yet done)
-
-Now that the browser UI and Scala server are gone, some engine modules are likely vestigial: `http_server.py` and the HTTP-serving mode of `__main__.py`, `server_client.py` (`ServerClient`, now opt-in only), and `spectate.py` / `make_spectate_html.py` under `bench/`. Their tests still pass (the client tests exercise an in-process/mock server), so they were left in place; remove deliberately if/when you confirm nothing depends on them.
