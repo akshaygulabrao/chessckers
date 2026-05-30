@@ -614,7 +614,12 @@ def run_az_iterations(
         # eval vs random both ways (uses the latest trained model). Sims here
         # are decoupled from self-play sims — eval is the regression check, so
         # we want enough search depth to make the result trustworthy.
-        if effective_mode == "processes" and model_arch is not None:
+        if eval_games <= 0:
+            # Eval disabled (--eval-games 0): skip the per-iteration vs-random
+            # regression check entirely so long self-play runs aren't held up
+            # by it. The self-play W/B/D column still gives a per-iter signal.
+            as_white = as_black = {"white": 0, "black": 0, "draw": 0}
+        elif effective_mode == "processes" and model_arch is not None:
             # Parallel path: stage current model to disk, run both eval blocks in
             # subprocess pools. None for the random side.
             eval_state = weights_dir / "_eval_state.pt"
