@@ -55,6 +55,20 @@ def white_legal_moves(state: State) -> list[dict[str, Any]]:
     check predicate (defined below)."""
     if state.board.turn != chess.WHITE:
         return []
+    if _rs_movegen is not None:
+        # Native fast path: one Rust call generates + check-filters all White
+        # moves on its own bitboards, eliminating the per-pseudo-move
+        # python-chess apply/copy churn that dominated self-play (see the
+        # equivalence harness tests/test_white_rust_equiv.py for parity).
+        b = state.board
+        return _rs_movegen.white_legal_moves(
+            b.occupied,
+            b.occupied_co[chess.WHITE],
+            b.pawns, b.knights, b.bishops, b.rooks, b.queens, b.kings,
+            b.castling_rights,
+            -1 if b.ep_square is None else b.ep_square,
+            state.stacks,
+        )
     out: list[dict[str, Any]] = []
     for move in state.board.pseudo_legal_moves:
         # Apply tentatively and reject if it leaves white-king in

@@ -1473,6 +1473,641 @@ fn black_mandatory_capture_active_native(
     false
 }
 
+// -------- White move generation (FIDE chess + Chessckers check filter) --------
+//
+// Mirrors `chessckers_engine.variant_py.moves_white.white_legal_moves`. We
+// hand-roll python-chess's pseudo-legal White move set (pawn/knight/bishop/
+// rook/queen/king/castling, with promotions + en-passant) and filter each
+// candidate by the composite Chessckers check predicate on the post-move
+// position (`black_can_capture_white_king_native` OR
+// `square_attacked_by_black_chessckers_native`). Castling additionally rejects
+// when any square the king crosses (origin + intermediate) is attacked under
+// the Chessckers attack model — matching `_castling_path_attacked_chessckers`.
+
+const KNIGHT_DELTAS: [(i8, i8); 8] = [
+    (1, 2), (2, 1), (2, -1), (1, -2),
+    (-1, -2), (-2, -1), (-2, 1), (-1, 2),
+];
+const KING_DELTAS: [(i8, i8); 8] = [
+    (1, 0), (1, 1), (0, 1), (-1, 1),
+    (-1, 0), (-1, -1), (0, -1), (1, -1),
+];
+const BISHOP_DIRS: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+const ROOK_DIRS: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+
+#[inline(always)]
+fn bit(sq: u8) -> u64 {
+    1u64 << sq
+}
+
+/// FIDE attacker test (literal piece bitboards, python-chess `attackers_mask`
+/// semantics). True iff a Black piece attacks `target` given `occupied`.
+/// Used only to replicate python-chess's castling pseudo-legal conditions.
+#[allow(clippy::too_many_arguments)]
+fn black_attacks_square_fide(
+    occupied: u64,
+    occupied_white: u64,
+    pawns: u64,
+    knights: u64,
+    bishops: u64,
+    rooks: u64,
+    queens: u64,
+    kings: u64,
+    target: u8,
+    occupied_co_black: u64,
+) -> bool {
+    let tf = (target & 7) as i8;
+    let tr = (target >> 3) as i8;
+
+    // Knights.
+    for &(df, dr) in &KNIGHT_DELTAS {
+        let nf = tf + df;
+        let nr = tr + dr;
+        if on_board(nf, nr) {
+            let s = sq_idx(nf, nr);
+            if (knights & occupied_co_black) & bit(s) != 0 {
+                return true;
+            }
+        }
+    }
+    // King (adjacent).
+    for &(df, dr) in &KING_DELTAS {
+        let nf = tf + df;
+        let nr = tr + dr;
+        if on_board(nf, nr) {
+            let s = sq_idx(nf, nr);
+            if (kings & occupied_co_black) & bit(s) != 0 {
+                return true;
+            }
+        }
+    }
+    // Black pawns: a black pawn on (tf±1, tr-1) attacks `target` (black pawns
+    // capture toward decreasing rank). Matches BB_PAWN_ATTACKS[WHITE][target]
+    // & black pawns (python-chess: attackers of color BLACK use
+    // BB_PAWN_ATTACKS[not BLACK] = [WHITE]).
+    for &df in &[-1i8, 1] {
+        let nf = tf + df;
+        let nr = tr - 1;
+        if on_board(nf, nr) {
+            let s = sq_idx(nf, nr);
+            if (pawns & occupied_co_black) & bit(s) != 0 {
+                return true;
+            }
+        }
+    }
+    // Sliders: bishops/queens on diagonals, rooks/queens on orthogonals.
+    let bq = (bishops | queens) & occupied_co_black;
+    for &(df, dr) in &BISHOP_DIRS {
+        let mut nf = tf + df;
+        let mut nr = tr + dr;
+        while on_board(nf, nr) {
+            let s = sq_idx(nf, nr);
+            let m = bit(s);
+            if occupied & m != 0 {
+                if bq & m != 0 {
+                    return true;
+                }
+                break;
+            }
+            nf += df;
+            nr += dr;
+        }
+    }
+    let rq = (rooks | queens) & occupied_co_black;
+    for &(df, dr) in &ROOK_DIRS {
+        let mut nf = tf + df;
+        let mut nr = tr + dr;
+        while on_board(nf, nr) {
+            let s = sq_idx(nf, nr);
+            let m = bit(s);
+            if occupied & m != 0 {
+                if rq & m != 0 {
+                    return true;
+                }
+                break;
+            }
+            nf += df;
+            nr += dr;
+        }
+    }
+    false
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum WPiece {
+    Pawn,
+    Knight,
+    Bishop,
+    Rook,
+    Queen,
+    King,
+}
+
+impl WPiece {
+    fn name(self) -> &'static str {
+        match self {
+            WPiece::Pawn => "pawn",
+            WPiece::Knight => "knight",
+            WPiece::Bishop => "bishop",
+            WPiece::Rook => "rook",
+            WPiece::Queen => "queen",
+            WPiece::King => "king",
+        }
+    }
+}
+
+/// A pseudo-legal White candidate move (pre check-filter).
+struct WCandidate {
+    from_sq: u8,
+    to_sq: u8,
+    piece: WPiece,
+    promotion: Option<&'static str>,
+    /// Square whose stack/piece is captured (= to_sq for normal captures, the
+    /// captured-pawn square for en-passant), or None for a non-capture.
+    capture_sq: Option<u8>,
+    is_en_passant: bool,
+    /// Castling form: None = not castling. Some((kingside, rook_sq)).
+    castling: Option<(bool, u8)>,
+}
+
+/// Board-state inputs as a bundle (literal python-chess bitboards).
+#[derive(Clone, Copy)]
+struct WhiteBoard {
+    occupied: u64,
+    occupied_white: u64,
+    pawns: u64,
+    knights: u64,
+    bishops: u64,
+    rooks: u64,
+    queens: u64,
+    kings: u64,
+    castling_rights: u64,
+    ep_square: i64,
+}
+
+impl WhiteBoard {
+    #[inline]
+    fn occupied_black(&self) -> u64 {
+        self.occupied & !self.occupied_white
+    }
+    #[inline]
+    fn white_king_sq(&self) -> Option<u8> {
+        let wk = self.kings & self.occupied_white;
+        if wk == 0 {
+            None
+        } else {
+            Some(wk.trailing_zeros() as u8)
+        }
+    }
+}
+
+/// Generate python-chess's pseudo-legal White move set (no Chessckers filter).
+fn white_pseudo_legal(b: &WhiteBoard) -> Vec<WCandidate> {
+    let mut out: Vec<WCandidate> = Vec::new();
+    let occ = b.occupied;
+    let own = b.occupied_white;
+    let enemy = b.occupied_black();
+
+    // --- Non-pawn piece moves (knight/bishop/rook/queen/king). ---
+    let push_slider = |out: &mut Vec<WCandidate>, from: u8, piece: WPiece, dirs: &[(i8, i8)]| {
+        let ff = (from & 7) as i8;
+        let fr = (from >> 3) as i8;
+        for &(df, dr) in dirs {
+            let mut nf = ff + df;
+            let mut nr = fr + dr;
+            while on_board(nf, nr) {
+                let s = sq_idx(nf, nr);
+                let m = bit(s);
+                if own & m != 0 {
+                    break;
+                }
+                let cap = if enemy & m != 0 { Some(s) } else { None };
+                out.push(WCandidate {
+                    from_sq: from,
+                    to_sq: s,
+                    piece,
+                    promotion: None,
+                    capture_sq: cap,
+                    is_en_passant: false,
+                    castling: None,
+                });
+                if occ & m != 0 {
+                    break;
+                }
+                nf += df;
+                nr += dr;
+            }
+        }
+    };
+    let push_step = |out: &mut Vec<WCandidate>, from: u8, piece: WPiece, deltas: &[(i8, i8)]| {
+        let ff = (from & 7) as i8;
+        let fr = (from >> 3) as i8;
+        for &(df, dr) in deltas {
+            let nf = ff + df;
+            let nr = fr + dr;
+            if !on_board(nf, nr) {
+                continue;
+            }
+            let s = sq_idx(nf, nr);
+            let m = bit(s);
+            if own & m != 0 {
+                continue;
+            }
+            let cap = if enemy & m != 0 { Some(s) } else { None };
+            out.push(WCandidate {
+                from_sq: from,
+                to_sq: s,
+                piece,
+                promotion: None,
+                capture_sq: cap,
+                is_en_passant: false,
+                castling: None,
+            });
+        }
+    };
+
+    let mut bbw = (b.knights & own) | (b.bishops & own) | (b.rooks & own)
+        | (b.queens & own) | (b.kings & own);
+    while bbw != 0 {
+        let from = bbw.trailing_zeros() as u8;
+        bbw &= bbw - 1;
+        let m = bit(from);
+        if b.knights & m != 0 {
+            push_step(&mut out, from, WPiece::Knight, &KNIGHT_DELTAS);
+        } else if b.kings & m != 0 {
+            push_step(&mut out, from, WPiece::King, &KING_DELTAS);
+        } else if b.queens & m != 0 {
+            push_slider(&mut out, from, WPiece::Queen, &BISHOP_DIRS);
+            push_slider(&mut out, from, WPiece::Queen, &ROOK_DIRS);
+        } else if b.bishops & m != 0 {
+            push_slider(&mut out, from, WPiece::Bishop, &BISHOP_DIRS);
+        } else if b.rooks & m != 0 {
+            push_slider(&mut out, from, WPiece::Rook, &ROOK_DIRS);
+        }
+    }
+
+    // --- Castling (python-chess generate_castling_moves, non-chess960). ---
+    white_castling_pseudo(b, &mut out);
+
+    // --- Pawn moves. ---
+    let pawns_w = b.pawns & own;
+    // Captures (incl. promotions).
+    let mut pw = pawns_w;
+    while pw != 0 {
+        let from = pw.trailing_zeros() as u8;
+        pw &= pw - 1;
+        let ff = (from & 7) as i8;
+        let fr = (from >> 3) as i8;
+        for &df in &[-1i8, 1] {
+            let nf = ff + df;
+            let nr = fr + 1;
+            if !on_board(nf, nr) {
+                continue;
+            }
+            let s = sq_idx(nf, nr);
+            if enemy & bit(s) == 0 {
+                continue;
+            }
+            if nr == 7 {
+                for promo in ["queen", "rook", "bishop", "knight"] {
+                    out.push(WCandidate {
+                        from_sq: from, to_sq: s, piece: WPiece::Pawn,
+                        promotion: Some(promo), capture_sq: Some(s),
+                        is_en_passant: false, castling: None,
+                    });
+                }
+            } else {
+                out.push(WCandidate {
+                    from_sq: from, to_sq: s, piece: WPiece::Pawn,
+                    promotion: None, capture_sq: Some(s),
+                    is_en_passant: false, castling: None,
+                });
+            }
+        }
+    }
+    // Single + double pushes (incl. promotions).
+    let single = (pawns_w << 8) & !occ;
+    let double = (single << 8) & !occ & 0x0000_0000_FF00_0000u64; // BB_RANK_4
+    let mut sm = single;
+    while sm != 0 {
+        let to = sm.trailing_zeros() as u8;
+        sm &= sm - 1;
+        let from = to - 8;
+        let nr = (to >> 3) as i8;
+        if nr == 7 {
+            for promo in ["queen", "rook", "bishop", "knight"] {
+                out.push(WCandidate {
+                    from_sq: from, to_sq: to, piece: WPiece::Pawn,
+                    promotion: Some(promo), capture_sq: None,
+                    is_en_passant: false, castling: None,
+                });
+            }
+        } else {
+            out.push(WCandidate {
+                from_sq: from, to_sq: to, piece: WPiece::Pawn,
+                promotion: None, capture_sq: None,
+                is_en_passant: false, castling: None,
+            });
+        }
+    }
+    let mut dm = double;
+    while dm != 0 {
+        let to = dm.trailing_zeros() as u8;
+        dm &= dm - 1;
+        let from = to - 16;
+        out.push(WCandidate {
+            from_sq: from, to_sq: to, piece: WPiece::Pawn,
+            promotion: None, capture_sq: None,
+            is_en_passant: false, castling: None,
+        });
+    }
+    // En passant.
+    if b.ep_square >= 0 {
+        let ep = b.ep_square as u8;
+        if occ & bit(ep) == 0 {
+            let ef = (ep & 7) as i8;
+            let er = (ep >> 3) as i8;
+            // Capturers: white pawns on rank 5 (index 4) that attack ep_square,
+            // i.e. on (ef±1, er-1).
+            for &df in &[-1i8, 1] {
+                let cf = ef + df;
+                let cr = er - 1;
+                if !on_board(cf, cr) || cr != 4 {
+                    continue;
+                }
+                let cs = sq_idx(cf, cr);
+                if pawns_w & bit(cs) == 0 {
+                    continue;
+                }
+                // Captured pawn sits on (ef, er-1).
+                let cap_sq = sq_idx(ef, er - 1);
+                out.push(WCandidate {
+                    from_sq: cs, to_sq: ep, piece: WPiece::Pawn,
+                    promotion: None, capture_sq: Some(cap_sq),
+                    is_en_passant: true, castling: None,
+                });
+            }
+        }
+    }
+
+    out
+}
+
+/// python-chess castling pseudo-legal (non-chess960, White to move).
+fn white_castling_pseudo(b: &WhiteBoard, out: &mut Vec<WCandidate>) {
+    let own = b.occupied_white;
+    let king_bb = b.kings & own & 0x0000_0000_0000_00FFu64; // BB_RANK_1
+    // Non-chess960: king must be on e1.
+    let e1: u8 = 4;
+    if king_bb == 0 || (king_bb & bit(e1)) == 0 {
+        return;
+    }
+    let king = e1;
+    // clean_castling_rights: rights on a1/h1 with a white rook present.
+    let mut candidates = b.castling_rights & b.rooks & own & 0x0000_0000_0000_00FFu64;
+    candidates &= bit(0) | bit(7); // BB_A1 | BB_H1
+    let occ_black = b.occupied_black();
+    let mut cand = candidates;
+    while cand != 0 {
+        let rook = cand.trailing_zeros() as u8;
+        cand &= cand - 1;
+        let a_side = rook < king;
+        let (king_to, rook_to) = if a_side { (2u8, 3u8) } else { (6u8, 5u8) }; // c1/d1 or g1/f1
+        // Paths (exclusive between endpoints).
+        let king_path = between_mask(king, king_to);
+        let rook_path = between_mask(rook, rook_to);
+        let kingm = bit(king);
+        let rookm = bit(rook);
+        let to_kingm = bit(king_to);
+        let to_rookm = bit(rook_to);
+
+        // Square-occupancy check: (occupied ^ king ^ rook) must not intersect
+        // (king_path | rook_path | king_to | rook_to).
+        if (b.occupied ^ kingm ^ rookm) & (king_path | rook_path | to_kingm | to_rookm) != 0 {
+            continue;
+        }
+        // King not attacked along (king_path | king) with occ = occupied ^ king.
+        let occ1 = b.occupied ^ kingm;
+        if mask_attacked_by_black_fide(b, king_path | kingm, occ1, occ_black) {
+            continue;
+        }
+        // King destination not attacked with occ = occupied ^ king ^ rook ^ rook_to.
+        let occ2 = b.occupied ^ kingm ^ rookm ^ to_rookm;
+        if mask_attacked_by_black_fide(b, to_kingm, occ2, occ_black) {
+            continue;
+        }
+        out.push(WCandidate {
+            from_sq: king,
+            to_sq: king_to,
+            piece: WPiece::King,
+            promotion: None,
+            capture_sq: None,
+            is_en_passant: false,
+            castling: Some((!a_side, rook)),
+        });
+    }
+}
+
+/// FIDE attack test over a mask of squares (any square attacked by Black with
+/// the given hypothetical `occupied`). occupied_co_black is the static black
+/// occupancy (rooks/king moving during castling don't change which squares are
+/// black-owned, matching python-chess which only swaps the `occupied` arg).
+fn mask_attacked_by_black_fide(b: &WhiteBoard, mut path: u64, occupied: u64, occ_black: u64) -> bool {
+    while path != 0 {
+        let sq = path.trailing_zeros() as u8;
+        path &= path - 1;
+        if black_attacks_square_fide(
+            occupied, b.occupied_white, b.pawns, b.knights, b.bishops,
+            b.rooks, b.queens, b.kings, sq, occ_black,
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Inclusive-exclusive "between" mask: bits strictly between a and b along
+/// their shared rank (the only case castling needs). a,b on the same rank.
+fn between_mask(a: u8, b: u8) -> u64 {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let mut m = 0u64;
+    let mut s = lo + 1;
+    while s < hi {
+        m |= bit(s);
+        s += 1;
+    }
+    m
+}
+
+/// True iff the White king is in Chessckers check on this (post-move) position.
+/// Composite of `black_can_capture_white_king_native` (chains/overshoots) and
+/// `square_attacked_by_black_chessckers_native` (single diagonals + charges).
+fn white_in_chessckers_check(
+    occupied: u64,
+    occupied_white: u64,
+    white_king: Option<u8>,
+    stacks: &HashMap<u8, Vec<u8>>,
+) -> bool {
+    let king = match white_king {
+        Some(k) => k,
+        None => return false, // king already captured
+    };
+    if black_can_capture_white_king_native(occupied, occupied_white, king as i64, stacks) {
+        return true;
+    }
+    square_attacked_by_black_chessckers_native(occupied, occupied_white, stacks, king)
+}
+
+/// Apply a White candidate on bitboards; return (post occupied, post
+/// occupied_white, post white-king-sq, post stacks with captured square gone).
+fn apply_white_candidate(
+    b: &WhiteBoard,
+    c: &WCandidate,
+    stacks: &HashMap<u8, Vec<u8>>,
+) -> (u64, u64, Option<u8>, HashMap<u8, Vec<u8>>) {
+    let from_m = bit(c.from_sq);
+    let to_m = bit(c.to_sq);
+    let mut occ = b.occupied;
+    let mut own = b.occupied_white;
+    let mut white_king = b.white_king_sq();
+
+    // Captured square removal from occupancy + stacks overlay.
+    let mut new_stacks = stacks.clone();
+    if let Some(cap) = c.capture_sq {
+        let cap_m = bit(cap);
+        occ &= !cap_m;
+        own &= !cap_m; // cap is a black square, but clearing is harmless
+        new_stacks.remove(&cap);
+    }
+
+    // Move the white piece.
+    occ &= !from_m;
+    own &= !from_m;
+    occ |= to_m;
+    own |= to_m;
+
+    if c.piece == WPiece::King {
+        white_king = Some(c.to_sq);
+    }
+
+    // Castling: also relocate the rook.
+    if let Some((kingside, rook_sq)) = c.castling {
+        let rook_to = if kingside { 5u8 } else { 3u8 }; // f1 / d1
+        let rm = bit(rook_sq);
+        let rtm = bit(rook_to);
+        occ &= !rm;
+        own &= !rm;
+        occ |= rtm;
+        own |= rtm;
+    }
+
+    (occ, own, white_king, new_stacks)
+}
+
+/// Full White legal move list (Chessckers-filtered), as candidate structs +
+/// metadata for dict building. Mirrors `white_legal_moves` ordering semantics
+/// loosely (the test compares sets, so order is irrelevant).
+fn white_legal_moves_native(
+    b: &WhiteBoard,
+    stacks: &HashMap<u8, Vec<u8>>,
+) -> Vec<WCandidate> {
+    let mut out: Vec<WCandidate> = Vec::new();
+    for c in white_pseudo_legal(b) {
+        let (occ, own, wk, post_stacks) = apply_white_candidate(b, &c, stacks);
+        if white_in_chessckers_check(occ, own, wk, &post_stacks) {
+            continue;
+        }
+        if let Some((kingside, _)) = c.castling {
+            // Reject if any square the king crosses (origin + intermediate) is
+            // attacked under the Chessckers attack model. Kingside: e1,f1;
+            // queenside: e1,d1. (Destination handled by the post-move filter.)
+            let cross = if kingside { [4u8, 5u8] } else { [4u8, 3u8] };
+            let mut attacked = false;
+            for &sq in &cross {
+                if square_attacked_by_black_chessckers_native(
+                    b.occupied, b.occupied_white, stacks, sq,
+                ) {
+                    attacked = true;
+                    break;
+                }
+            }
+            if attacked {
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// UCI for a White candidate (standard form; castling uses e1g1/e1c1).
+fn white_uci(c: &WCandidate) -> String {
+    let names = sq_names();
+    let mut s = format!("{}{}", names[c.from_sq as usize], names[c.to_sq as usize]);
+    if let Some(p) = c.promotion {
+        s.push(match p {
+            "queen" => 'q',
+            "rook" => 'r',
+            "bishop" => 'b',
+            "knight" => 'n',
+            _ => '?',
+        });
+    }
+    s
+}
+
+fn white_move_to_pydict<'py>(
+    py: Python<'py>,
+    c: &WCandidate,
+) -> PyResult<Bound<'py, PyDict>> {
+    let names = sq_names();
+    let d = PyDict::new_bound(py);
+    d.set_item("uci", white_uci(c))?;
+    d.set_item("from", &names[c.from_sq as usize])?;
+    d.set_item("to", &names[c.to_sq as usize])?;
+    d.set_item("piece", c.piece.name())?;
+    d.set_item("color", "white")?;
+    match c.capture_sq {
+        Some(cap) => d.set_item("capture", &names[cap as usize])?,
+        None => d.set_item("capture", py.None())?,
+    }
+    d.set_item("waypoints", py.None())?;
+    d.set_item("chainHops", py.None())?;
+    match c.promotion {
+        Some(p) => d.set_item("promotion", p)?,
+        None => d.set_item("promotion", py.None())?,
+    }
+    d.set_item("demotedKings", py.None())?;
+    d.set_item("demotionsRequired", py.None())?;
+    d.set_item("sourceKingPositions", py.None())?;
+    d.set_item("deployCount", py.None())?;
+    Ok(d)
+}
+
+/// Build the king-to-rook castling alt form dict (e1h1 / e1a1).
+fn white_castling_alt_to_pydict<'py>(
+    py: Python<'py>,
+    c: &WCandidate,
+    rook_sq: u8,
+) -> PyResult<Bound<'py, PyDict>> {
+    let names = sq_names();
+    let d = PyDict::new_bound(py);
+    d.set_item("uci", format!("{}{}", names[c.from_sq as usize], names[rook_sq as usize]))?;
+    d.set_item("from", &names[c.from_sq as usize])?;
+    d.set_item("to", &names[rook_sq as usize])?;
+    d.set_item("piece", "king")?;
+    d.set_item("color", "white")?;
+    d.set_item("capture", py.None())?;
+    d.set_item("waypoints", py.None())?;
+    d.set_item("chainHops", py.None())?;
+    d.set_item("promotion", py.None())?;
+    d.set_item("demotedKings", py.None())?;
+    d.set_item("demotionsRequired", py.None())?;
+    d.set_item("sourceKingPositions", py.None())?;
+    d.set_item("deployCount", py.None())?;
+    Ok(d)
+}
+
 // -------- Python boundary --------
 
 fn parse_stacks(py_stacks: &Bound<'_, PyDict>) -> PyResult<HashMap<u8, Vec<u8>>> {
@@ -1595,6 +2230,46 @@ fn black_can_capture_white_king(
     ))
 }
 
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn white_legal_moves<'py>(
+    py: Python<'py>,
+    occupied: u64,
+    occupied_white: u64,
+    pawns: u64,
+    knights: u64,
+    bishops: u64,
+    rooks: u64,
+    queens: u64,
+    kings: u64,
+    castling_rights: u64,
+    ep_square: i64,
+    stacks: &Bound<'_, PyDict>,
+) -> PyResult<Bound<'py, PyList>> {
+    let stacks_rs = parse_stacks(stacks)?;
+    let b = WhiteBoard {
+        occupied,
+        occupied_white,
+        pawns,
+        knights,
+        bishops,
+        rooks,
+        queens,
+        kings,
+        castling_rights,
+        ep_square,
+    };
+    let moves = white_legal_moves_native(&b, &stacks_rs);
+    let out = PyList::empty_bound(py);
+    for c in &moves {
+        out.append(white_move_to_pydict(py, c)?)?;
+        if let Some((_, rook_sq)) = c.castling {
+            out.append(white_castling_alt_to_pydict(py, c, rook_sq)?)?;
+        }
+    }
+    Ok(out)
+}
+
 #[pymodule]
 fn chessckers_movegen(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ping, m)?)?;
@@ -1603,5 +2278,6 @@ fn chessckers_movegen(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(all_black_legal_moves, m)?)?;
     m.add_function(wrap_pyfunction!(square_attacked_by_black_chessckers, m)?)?;
     m.add_function(wrap_pyfunction!(black_can_capture_white_king, m)?)?;
+    m.add_function(wrap_pyfunction!(white_legal_moves, m)?)?;
     Ok(())
 }
