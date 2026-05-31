@@ -159,7 +159,11 @@ def _eval_game_subprocess(payload: dict) -> str:
     vs-random eval, one side is a path and the other is None.
 
     Top-level so it can be pickled for spawn() workers."""
+    import os as _os
+
     import torch as _torch
+
+    _torch.set_num_threads(int(_os.environ.get("CHESSCKERS_TORCH_THREADS", "1")))
 
     from chessckers_engine.checkpoints import load_checkpoint
     from chessckers_engine.evaluate import play_game as _play_game
@@ -201,7 +205,15 @@ def _play_game_subprocess(payload: dict):
     Top-level so it can be pickled for spawn() workers (closures can't)."""
     # Imports here so the worker doesn't pay them at fork time, and so any
     # import errors surface inside the worker rather than during pool setup.
+    import os as _os
+
     import torch as _torch
+
+    # One torch thread per worker process. With N process workers, the default
+    # (≈num_cores intra-op threads × N processes) oversubscribes the CPU — which
+    # both slows self-play AND destabilizes the spawn pool (the broken-pipe
+    # crash). Measured: threads=1 gives clean ~linear scaling to the core count.
+    _torch.set_num_threads(int(_os.environ.get("CHESSCKERS_TORCH_THREADS", "1")))
 
     from chessckers_engine.checkpoints import load_checkpoint
     from chessckers_engine.inference_server import InferenceServer as _IS
