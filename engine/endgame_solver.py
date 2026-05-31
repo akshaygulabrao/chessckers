@@ -17,9 +17,13 @@ CLI:
 """
 from __future__ import annotations
 
+import os
 import sys
 
 from chessckers_engine.variant_py import PyVariantClient
+
+# Default tablebase root (overridable via CHESSCKERS_TB_ROOT or the `root` arg).
+_DEFAULT_TB_ROOT = os.environ.get("CHESSCKERS_TB_ROOT", "/Volumes/hd0/chessckers_tb")
 
 _client = PyVariantClient()
 _memo: dict[tuple, int | None] = {}
@@ -78,9 +82,58 @@ def _dtm_white(fen: str, depth: int) -> int | None:
     return 1 + worst
 
 
-def distance_to_mate(fen: str, max_plies: int = 9) -> int | None:
-    """Plies to forced Black mate under optimal play, or None if not forced
-    within `max_plies`. Assumes Black to move (the curriculum convention)."""
+def _tb_black_mate_distance(fen: str, root: str | os.PathLike) -> int | None | object:
+    """Try the tablebase. Returns the exact Black-forced-mate ply count (or None
+    if the table proves no Black mate). Returns the sentinel `_TB_MISS` if the
+    table cannot answer (class not generated, drive not mounted, or any error),
+    so the caller falls back to minimax.
+
+    The probe value `(wdl, dtm)` is from the *side-to-move* perspective. A Black
+    forced mate exists exactly when Black is the winning side:
+      - Black to move and wdl > 0  -> Black mates in dtm
+      - White to move and wdl < 0  -> Black mates in dtm
+    Otherwise (draw, or White wins) there is no Black mate -> None.
+    """
+    try:
+        from tb.model import side_to_move
+        from tb.probe import probe
+    except Exception:
+        return _TB_MISS
+    try:
+        val = probe(root, fen)
+    except Exception:
+        return _TB_MISS
+    if val is None:
+        return _TB_MISS  # class not solved / VOID -> fall back to minimax
+    wdl, dtm = val
+    stm = side_to_move(fen)
+    if (stm == "black" and wdl > 0) or (stm == "white" and wdl < 0):
+        return dtm
+    return None  # draw or White wins -> no Black forced mate
+
+
+# Sentinel: the tablebase has no answer (distinct from a real None = "no mate").
+_TB_MISS: object = object()
+
+
+def distance_to_mate(
+    fen: str, max_plies: int = 9, root: str | os.PathLike | None = None
+) -> int | None:
+    """Plies to forced Black mate under optimal play, or None if not forced.
+    Assumes Black to move (the curriculum convention).
+
+    Fast path: if the position is covered by a generated tablebase under `root`
+    (defaults to $CHESSCKERS_TB_ROOT or /Volumes/hd0/chessckers_tb), return the
+    exact, *unbounded* Black-mate distance — `max_plies` is ignored on this path
+    because the table answer is complete (it equals what an unbounded minimax
+    would return). If the table cannot answer the position (class not generated,
+    drive absent, or any error), fall back to the bounded `max_plies` minimax.
+    """
+    if root is None:
+        root = _DEFAULT_TB_ROOT
+    tb = _tb_black_mate_distance(fen, root)
+    if tb is not _TB_MISS:
+        return tb  # exact tablebase answer (int dtm or None)
     _memo.clear()
     return _dtm_black(fen, max_plies)
 
