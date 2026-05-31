@@ -96,11 +96,9 @@ def solve_level(
         successors[fen] = succs
         table[fen] = (0, None)  # undetermined placeholder (treated as draw)
 
-    # Determined-set tracks which fens have a settled win/loss value this level.
-    determined: dict[str, Value] = {}
-
-    def succ_value(sf: str, st: int, tv: Value | None) -> Value | None:
-        """Settled value of a successor, or None if not yet determined."""
+    def succ_value(sf: str, st: int, tv: Value | None) -> Value:
+        """Current value of a successor. Same-level undetermined reads as the
+        draw placeholder (0, None) — equivalent to 'not yet proven'."""
         if tv is not None:
             return tv  # terminal successor, valued inline
         if st < total:
@@ -108,55 +106,41 @@ def solve_level(
             if v is None:
                 raise KeyError(f"successor {sf!r} (level {st}) missing from lower table")
             return v
-        return determined.get(sf)
+        return table[sf]
 
-    # Fixpoint sweeps over non-terminal, same-level positions.
-    pending = set(successors.keys())
+    # Bellman-Ford relaxation over non-terminal same-level positions. A WIN's
+    # dtm must be allowed to DECREASE as faster loss-children appear; settling a
+    # position at its first proof (and never revisiting) locks in a non-minimal
+    # dtm. Recompute every pass, apply improvements, converge when stable.
     changed = True
     while changed:
         changed = False
         newly: dict[str, Value] = {}
-        for fen in list(pending):
-            succs = successors[fen]
-            # WIN if any successor is a LOSS for the opponent (i.e. wdl == -1).
+        for fen, succs in successors.items():
             best_win_dtm: int | None = None
-            all_known_wins = True  # all successors are determined wins-for-opponent
+            all_wins = True
             for sf, st, tv in succs:
-                v = succ_value(sf, st, tv)
-                if v is None:
-                    all_known_wins = False
-                    continue
-                wdl, dtm = v
+                wdl, dtm = succ_value(sf, st, tv)
                 if wdl < 0:  # opponent loses from sf -> mover wins
                     cand = 1 + (dtm or 0)
                     if best_win_dtm is None or cand < best_win_dtm:
                         best_win_dtm = cand
                 elif wdl == 0:
-                    all_known_wins = False
-                # wdl > 0 (opponent wins) contributes to "all wins" check
+                    all_wins = False
             if best_win_dtm is not None:
-                newly[fen] = (1, best_win_dtm)
+                new = (1, best_win_dtm)
+            elif all_wins and succs:
+                worst = max(1 + (succ_value(sf, st, tv)[1] or 0) for sf, st, tv in succs)
+                new = (-1, worst)
+            else:
                 continue
-            if all_known_wins and succs:
-                # All successors determined and none is a loss-for-opponent;
-                # every successor is a win-for-opponent -> mover loses.
-                worst = 0
-                for sf, st, tv in succs:
-                    v = succ_value(sf, st, tv)
-                    assert v is not None and v[0] > 0
-                    worst = max(worst, 1 + (v[1] or 0))
-                newly[fen] = (-1, worst)
+            old = table[fen]
+            # newly decisive, or same result with a strictly smaller dtm
+            if old[0] == 0 or (old[0] == new[0] and new[1] < (old[1] or 0)):
+                newly[fen] = new
         if newly:
             changed = True
-            for fen, v in newly.items():
-                determined[fen] = v
-                pending.discard(fen)
-
-    # Anything still pending after convergence is a draw.
-    for fen in pending:
-        table[fen] = (0, None)
-    for fen, v in determined.items():
-        table[fen] = v
+            table.update(newly)
     return table
 
 

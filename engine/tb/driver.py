@@ -143,14 +143,17 @@ def solve_class(root, total: int, workers: int = 6, log=print) -> dict:
         j = e & _IDX_MASK
         return store.byte_decode(int(cur[j] if t == total else lowers[t][j]))
 
-    done = np.zeros(len(idx_arr), dtype=bool)
+    # Bellman-Ford relaxation: recompute every non-terminal position each sweep
+    # and APPLY an update when it is newly decisive OR its dtm improves
+    # (decreases). A WIN's dtm must be allowed to shrink as faster loss-children
+    # appear; marking a position done at first proof would lock in a non-minimal
+    # dtm. Converges when a sweep changes nothing; positions never made decisive
+    # stay 0x00 = draw.
     sweep = 0
     while True:
         sweep += 1
-        newly: list[tuple[int, int, int]] = []  # (pos, idx, byte)
+        updates: list[tuple[int, int]] = []  # (idx, byte)
         for i in range(len(idx_arr)):
-            if done[i]:
-                continue
             best_win: int | None = None
             all_wins = True
             saw = False
@@ -163,18 +166,23 @@ def solve_class(root, total: int, workers: int = 6, log=print) -> dict:
                 elif wdl == 0:
                     all_wins = False
             if best_win is not None:
-                newly.append((i, int(idx_arr[i]), store.byte_encode((1, best_win))))
+                new = (1, best_win)
             elif all_wins and saw:
-                worst = max(1 + (resolve(int(e))[1] or 0)
-                            for e in flat[offsets[i]:offsets[i + 1]])
-                newly.append((i, int(idx_arr[i]), store.byte_encode((-1, worst))))
-        if not newly:
+                new = (-1, max(1 + (resolve(int(e))[1] or 0)
+                               for e in flat[offsets[i]:offsets[i + 1]]))
+            else:
+                continue
+            idx = int(idx_arr[i])
+            old = store.byte_decode(int(cur[idx]))  # 0x00 -> (0, None)
+            # Apply if newly decisive, or same result with a strictly smaller dtm.
+            if old[0] == 0 or (old[0] == new[0] and new[1] < (old[1] or 0)):
+                updates.append((idx, store.byte_encode(new)))
+        if not updates:
             break
-        for pos, idx, byte in newly:
+        for idx, byte in updates:
             cur[idx] = byte
-            done[pos] = True
         cur.flush()
-        log(f"  N{total}: sweep {sweep} proved {len(newly)}")
+        log(f"  N{total}: sweep {sweep} updated {len(updates)}")
     del cur
 
     # Tally (vectorized over the byte histogram).
