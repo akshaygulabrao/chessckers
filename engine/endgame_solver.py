@@ -94,12 +94,11 @@ def best_black_moves(fen: str, max_plies: int = 9) -> list[str]:
     out = []
     for m in _legal(fen):
         s2 = _client.make_move(fen, m["uci"])
-        if s2.get("status") == "mate":
-            if target == 1:
+        st, win = s2.get("status"), s2.get("winner")
+        if st is not None:          # terminal right after Black's move
+            if win == "black" and target == 1:  # mate OR variantEnd (stuck) win
                 out.append(m["uci"])
-            continue
-        if s2.get("status") == "variantEnd":
-            continue
+            continue                # Black lost/drew this line; skip it
         d = _dtm_white(s2["fen"], max_plies - 1)
         if d is not None and 1 + d == target:
             out.append(m["uci"])
