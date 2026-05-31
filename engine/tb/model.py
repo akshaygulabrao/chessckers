@@ -40,21 +40,6 @@ def black_total(fen: str) -> int:
     return sum(len(t) for t in parse_fen(fen).stacks.values())
 
 
-def _rank_of(sq: int) -> int:
-    """1-based rank (1..8)."""
-    return chess.square_rank(sq) + 1
-
-
-def _tower_has_stone(tower: str) -> bool:
-    return "s" in tower or "S" in tower
-
-
-def rank1_legal(sq: int, tower: str) -> bool:
-    """A tower containing any stone may not sit on rank 1 (it would have had to
-    promote). King-only towers on rank 1 are legal."""
-    return not (_rank_of(sq) == 1 and _tower_has_stone(tower))
-
-
 def terminal_value(status: str, winner: str | None, mover: str) -> Value:
     """Map a terminal status/winner to (wdl, dtm) from the `mover`'s view."""
     if status == "stalemate" or winner is None:

@@ -44,6 +44,19 @@ TB_DIR = Path(__file__).resolve().parent / "weights" / "tablebase"
 # package — imported above.
 
 
+def _norm(fen: str) -> str:
+    """Clock-normalized serialize key (halfmove 0, fullmove 1), no mirror.
+
+    `enumerate_level` keys are clock-0 serialized FENs, but `make_move`
+    successors carry a bumped move clock. Without normalizing, a successor would
+    miss the table and be (wrongly) treated as an undetermined draw — which
+    silently mislabels forced White wins as draws."""
+    st = parse_fen(fen)
+    st.board.halfmove_clock = 0
+    st.board.fullmove_number = 1
+    return serialize_fen(st)
+
+
 def solve_level(
     total: int, lower: dict[str, Value]
 ) -> dict[str, Value]:
@@ -70,7 +83,7 @@ def solve_level(
         succs: list[tuple[str, int, Value | None]] = []
         for m in g["legalMoves"]:
             s2 = _client.make_move(fen, m["uci"])
-            sf = s2["fen"]
+            sf = _norm(s2["fen"])
             st = black_total(sf)
             s2_status = s2.get("status")
             if s2_status is not None:

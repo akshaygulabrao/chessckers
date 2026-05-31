@@ -10,7 +10,6 @@ from tb.model import (
     MaterialClass,
     side_to_move,
     black_total,
-    rank1_legal,
     terminal_value,
 )
 from tb.enumerate import (
@@ -28,7 +27,6 @@ __all__ = [
     "MaterialClass",
     "side_to_move",
     "black_total",
-    "rank1_legal",
     "terminal_value",
     "tower_compositions",
     "integer_partitions",

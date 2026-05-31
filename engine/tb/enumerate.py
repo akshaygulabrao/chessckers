@@ -12,7 +12,6 @@ import itertools
 import chess
 
 from chessckers_engine.variant_py.state import State, parse_fen, serialize_fen
-from tb.model import rank1_legal
 
 
 # --------------------------------------------------------------------------- #
@@ -69,12 +68,15 @@ def build_fen(
 
     `placements` is a list of (square, tower-string); White king on `wk`.
     Returns the `serialize_fen` canonical key, or None if `parse_fen` rejects
-    it or a legality constraint (rank-1 stone) is violated.
-    """
-    for sq, tower in placements:
-        if not rank1_legal(sq, tower):
-            return None
+    the position.
 
+    There is intentionally no rank-1 filter: a Black stone CAN sit on rank 1
+    (a King that charges onto rank 1 demotes to a Stone there — charges never
+    promote, §3D/§5). Excluding such placements would leave the enumerated set
+    *not closed* under legal moves. Over-including a few unreachable placements
+    (e.g. an unmoved stone on rank 1) is harmless: they are never probed via
+    legal play, and `parse_fen` is the only real legality gate.
+    """
     # Board grid: index by square. Top piece -> 'k' (king-top) or 'p' (stone-top).
     top: dict[int, str] = {wk: "K"}
     overlay: dict[int, str] = {}
@@ -155,8 +157,21 @@ def _mirror_square(sq: int) -> int:
     return chess.square(7 - chess.square_file(sq), chess.square_rank(sq))
 
 
+def _clockless(state: State) -> str:
+    """Serialize a state with the move clocks zeroed (halfmove 0, fullmove 1).
+
+    A position's tablebase value is clock-independent — Chessckers' win
+    conditions have no 50-move / repetition rule — so the clocks must NOT be
+    part of the canonical key. Successors from `make_move` carry a bumped clock;
+    without this, equal positions would key differently."""
+    state.board.halfmove_clock = 0
+    state.board.fullmove_number = 1
+    return serialize_fen(state)
+
+
 def mirror_fen(fen: str) -> str:
-    """The left-right file mirror of a position, as a canonical FEN.
+    """The left-right file mirror of a position, as a clock-normalized canonical
+    FEN.
 
     `Board.transform(flip_horizontal)` mirrors the bitboards (and castling/ep);
     we mirror the stack overlay squares to match. Turn is preserved.
@@ -164,13 +179,13 @@ def mirror_fen(fen: str) -> str:
     st = parse_fen(fen)
     mb = st.board.transform(chess.flip_horizontal)
     ms = {_mirror_square(sq): pieces for sq, pieces in st.stacks.items()}
-    return serialize_fen(State(board=mb, stacks=ms))
+    return _clockless(State(board=mb, stacks=ms))
 
 
 def canonical_fen(fen: str) -> str:
-    """The mirror-canonical representative of a position: the lexicographically
-    smaller of the position and its file mirror (both as canonical FENs). Mirror
-    twins collapse to one key."""
-    a = serialize_fen(parse_fen(fen))
+    """The mirror-canonical, clock-normalized representative of a position: the
+    lexicographically smaller of the position and its file mirror. Mirror twins
+    and clock variants collapse to one key."""
+    a = _clockless(parse_fen(fen))
     b = mirror_fen(fen)
     return a if a <= b else b
