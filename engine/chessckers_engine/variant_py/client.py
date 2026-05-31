@@ -8,6 +8,7 @@ engine is stateless — each call carries the full FEN.
 from __future__ import annotations
 
 import os
+import random
 from typing import Any
 
 import chess
@@ -40,8 +41,18 @@ def _default_start_fen() -> str:
     """Start FEN used by `new_game()` when no `fen` is passed. Overridable via
     the `CHESSCKERS_START_FEN` env var so experiments can pin a custom start
     position (e.g. an endgame) without threading a start_fen through every call
-    site (self-play, eval, workers all go through `new_game()`)."""
-    return os.environ.get("CHESSCKERS_START_FEN", STARTING_FEN)
+    site (self-play, eval, workers all go through `new_game()`).
+
+    The env var may hold several FENs separated by `;` (which never occurs in a
+    FEN); each `new_game()` then samples one uniformly. This interleaves a
+    curriculum across games — mixing solved shallow mates with the deep target
+    keeps the easy lessons in the replay buffer (anti-forgetting). Repeat a FEN
+    in the list to weight it (e.g. list the hard position twice for 2× odds)."""
+    raw = os.environ.get("CHESSCKERS_START_FEN", STARTING_FEN)
+    if ";" not in raw:
+        return raw
+    choices = [f.strip() for f in raw.split(";") if f.strip()]
+    return random.choice(choices) if choices else STARTING_FEN
 
 GameState = dict[str, Any]
 HopDTO = dict[str, Any]
