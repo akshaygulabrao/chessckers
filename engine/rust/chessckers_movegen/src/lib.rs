@@ -29,6 +29,12 @@ fn on_board(f: i8, r: i8) -> bool {
 }
 
 #[inline(always)]
+fn on_grid(f: i8, r: i8) -> bool {
+    // 8×8 board plus the one-square rim ring.
+    (-1..=8).contains(&f) && (-1..=8).contains(&r)
+}
+
+#[inline(always)]
 fn sq_idx(f: i8, r: i8) -> u8 {
     ((r as u8) << 3) | (f as u8)
 }
@@ -1015,6 +1021,10 @@ struct ChargeMove {
     to_name: String,
     piece: &'static str,
     capture: Option<String>,
+    // Some([rim_key]) for an overshoot charge (rim landing, fall back to
+    // to_name); None for an on-board landing. Mirrors the Python charge dict:
+    // both the apply flag and the policy-encoding key.
+    waypoints: Option<Vec<String>>,
     demoted_kings: Option<Vec<usize>>,
     demotions_required: Option<usize>,
     source_king_positions: Option<Vec<usize>>,
@@ -1123,24 +1133,35 @@ fn black_charge_moves_native(
                     break; // off-grid landing
                 }
                 // Landing classification: on-board or rim-with-fallback.
-                let (to_sq, to_name, towner, is_ram, is_friendly_merge) =
+                // `rim_landing_key` = the on-grid key of the actual rim landing
+                // for an overshoot charge (None for an on-board land).
+                let (to_sq, to_name, towner, is_ram, is_friendly_merge, rim_landing_key) =
                     if (0..=7).contains(&tf) && (0..=7).contains(&tr) {
                         let s = sq_idx(tf, tr);
                         let n = sq_n[s as usize].clone();
                         let o = owner(occupied, occupied_white, s);
                         let r = o == SQ_WHITE;
                         let m = o == SQ_BLACK && stacks.contains_key(&s);
-                        (s, n, o, r, m)
+                        (s, n, o, r, m, None)
                     } else {
                         // Rim landing → fallback to last on-board square.
                         // If no on-board path step exists (d=1 rim), skip.
                         match last_on_board_sq {
                             Some(s) => {
                                 let n = sq_n[s as usize].clone();
-                                (s, n, SQ_EMPTY, false, false)
+                                (s, n, SQ_EMPTY, false, false, Some(coord_key(tf, tr)))
                             }
                             None => continue,
                         }
+                    };
+
+                // Notation: an overshoot charge spells out the rim landing it
+                // aimed at, then `->` its resting square (`e2e0->e1`), so the
+                // intent never reads as a ram. `waypoints` carries the rim key.
+                let (landing_repr, charge_waypoints): (String, Option<Vec<String>>) =
+                    match &rim_landing_key {
+                        None => (to_name.clone(), None),
+                        Some(k) => (format!("{}->{}", k, to_name), Some(vec![k.clone()])),
                     };
 
                 let capture_field: Option<String> = if !path_captures.is_empty() {
@@ -1163,6 +1184,7 @@ fn black_charge_moves_native(
                             to_name,
                             piece: "king",
                             capture: capture_field,
+                            waypoints: None,
                             demoted_kings: None,
                             demotions_required: None,
                             source_king_positions: None,
@@ -1179,11 +1201,12 @@ fn black_charge_moves_native(
                     }
                     let resulting_top = *new_pieces.last().unwrap();
                     moves.push(ChargeMove {
-                        uci: format!("{}{}", from_name, to_name),
+                        uci: format!("{}{}", from_name, landing_repr),
                         from_name: from_name.clone(),
                         to_name,
                         piece: if resulting_top == b'k' { "king" } else { "pawn" },
                         capture: capture_field,
+                        waypoints: charge_waypoints,
                         demoted_kings: None,
                         demotions_required: None,
                         source_king_positions: None,
@@ -1201,11 +1224,12 @@ fn black_charge_moves_native(
                             .collect::<Vec<_>>()
                             .join(",");
                         moves.push(ChargeMove {
-                            uci: format!("{}{}{{{}}}", from_name, to_name, choice_str),
+                            uci: format!("{}{}{{{}}}", from_name, landing_repr, choice_str),
                             from_name: from_name.clone(),
                             to_name: to_name.clone(),
                             piece: if resulting_top == b'k' { "king" } else { "pawn" },
                             capture: capture_field.clone(),
+                            waypoints: charge_waypoints.clone(),
                             demoted_kings: Some(choice),
                             demotions_required: Some(d),
                             source_king_positions: Some(king_positions.clone()),
@@ -1270,7 +1294,10 @@ fn any_to_pydict<'py>(py: Python<'py>, m: &AnyMove) -> PyResult<Bound<'py, PyDic
             d.set_item("to", &c.to_name)?;
             d.set_item("piece", c.piece)?;
             d.set_item("capture", c.capture.as_ref())?;
-            d.set_item("waypoints", py.None())?;
+            match &c.waypoints {
+                Some(v) => d.set_item("waypoints", v)?,
+                None => d.set_item("waypoints", py.None())?,
+            }
             d.set_item("chainHops", py.None())?;
             d.set_item("promotion", py.None())?;
             match &c.demoted_kings {
@@ -1418,11 +1445,15 @@ fn square_attacked_by_black_chessckers_native(
                     }
                     let nsq = sq_idx(nf, nr);
                     if nsq == target_sq {
-                        // Charge to k+1 must land on-board to be a legal
-                        // charge target.
+                        // Charge to k+1 must land on the grid (board OR rim).
+                        // A rim landing means the charge overshoots, captures
+                        // the target in transit, and falls back — so the
+                        // target is still attacked (e.g. a King-top tower
+                        // checking a White king on a board edge ahead of it).
+                        // Only an off-grid landing (past the rim) is illegal.
                         let nf2 = sf + (k + 1) * df;
                         let nr2 = sr + (k + 1) * dr;
-                        if on_board(nf2, nr2) {
+                        if on_grid(nf2, nr2) {
                             return true;
                         }
                         break;

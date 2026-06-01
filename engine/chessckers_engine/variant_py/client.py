@@ -94,11 +94,14 @@ def _state_to_dict(state: State, fen_override: str | None = None) -> GameState:
     status, winner = _detect_status(state)
     if state.board.turn == chess.WHITE:
         legal_moves = white_legal_moves(state)
-        # White checkmate / stalemate (Chessckers, not FIDE): no legal move →
-        # Black wins. "mate" if the king is in Chessckers-check, else White is
-        # simply stuck — being stuck loses, mirroring the Black rule below.
+        # White with no legal move (Chessckers, not FIDE):
+        #   * in Chessckers-check  → "mate"      → Black wins (king is trapped);
+        #   * not in check         → "stalemate" → DRAW (White is stuck but its
+        #     king cannot be captured). Stalemate is asymmetric: White stalemate
+        #     draws, Black stalemate (below) is a White win.
+        # (Matches the status_and_legal fast path; the two must agree.)
         if not legal_moves and status is None:
-            status, winner = ("mate" if check else "variantEnd"), "black"
+            status, winner = ("mate", "black") if check else ("stalemate", None)
     else:
         all_moves = (
             black_diagonal_quiet_moves(state)
