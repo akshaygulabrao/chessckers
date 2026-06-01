@@ -433,6 +433,7 @@ def run_az_iterations(
     resume: bool = False,
     model_arch: dict | None = None,
     worker_mode: str = "auto",
+    worker_device: torch.device | None = None,
 ) -> list[dict]:
     # Eval-vs-random uses MCTS on the trained model with no exploration noise;
     # too few sims and random can stumble into wins our model misjudges. Default
@@ -456,12 +457,28 @@ def run_az_iterations(
     # work. MPS/CPU stay on threads (less startup overhead, no CUDA-context
     # cost). 'auto' applies this rule; explicit values override.
     model_device = next(model.parameters()).device
+    # Device split: the trainer (this process, SGD) runs on model_device; self-play
+    # workers can run on a different device. On a tiny net the optimum is to train
+    # on the accelerator (big-batch fwd+bwd is ~13-31x faster on MPS) while self-play
+    # stays on CPU (batch-1 inference is faster there). worker_device defaults to
+    # model_device (no split) for backward compatibility. Self-play fully completes
+    # before train_az runs each iter, so the two devices are never used concurrently.
+    wdev = worker_device if worker_device is not None else model_device
+    split = wdev != model_device
     if worker_mode == "auto":
-        effective_mode = "processes" if model_device.type == "cuda" else "threads"
+        # A split needs processes — threads share the single trainer-device model.
+        effective_mode = "processes" if (model_device.type == "cuda" or split) else "threads"
     else:
         effective_mode = worker_mode
+    if split and effective_mode != "processes":
+        log.warning(
+            "device split (train=%s, workers=%s) needs worker-mode 'processes'; in "
+            "'threads' mode workers share the trainer's model, so self-play runs on %s",
+            model_device, wdev, model_device,
+        )
     if parallel:
-        log.info("worker mode: %s (device=%s)", effective_mode, model_device.type)
+        log.info("worker mode: %s (train-device=%s, worker-device=%s)",
+                 effective_mode, model_device.type, wdev.type)
 
     # Best-vs-current gating. `best_model` shadows `model` and is used for
     # self-play data generation; `model` keeps training each iter and only
@@ -544,7 +561,7 @@ def run_az_iterations(
                 {
                     "state_path": str(worker_state),
                     "model_arch": model_arch,
-                    "device": str(model_device),
+                    "device": str(wdev),
                     "mcts_batch_size": mcts_batch_size,
                     "n_sims": n_sims,
                     "c_puct": c_puct,
@@ -671,7 +688,7 @@ def run_az_iterations(
             # subprocess pools. None for the random side.
             eval_state = weights_dir / "_eval_state.pt"
             torch.save(model.state_dict(), eval_state)
-            device_str = str(model_device)
+            device_str = str(wdev)
             as_white = _run_eval_parallel(str(eval_state), None, eval_games,
                                           eval_sims_effective, model_arch, device_str, workers)
             as_black = _run_eval_parallel(None, str(eval_state), eval_games,
@@ -800,9 +817,19 @@ def main() -> int:
                    help="auto: processes for CUDA, threads for CPU/MPS. processes: always "
                         "spawn subprocesses (true GIL-free parallelism, required for CUDA "
                         "to drive the GPU). threads: legacy ThreadPoolExecutor.")
+    p.add_argument("--train-device", default="",
+                   help="Device for the TRAINER (SGD) only; self-play workers use --device. "
+                        "Empty = same as --device (no split). 'auto'/'mps'/'cuda' trains on "
+                        "the accelerator while self-play stays on CPU — optimal for tiny nets "
+                        "(big-batch fwd+bwd is ~13-31x faster on MPS; batch-1 inference is "
+                        "faster on CPU). Requires --worker-mode processes.")
     args = p.parse_args()
 
-    device = pick_device(args.device)
+    device = pick_device(args.device)                      # self-play / worker device
+    train_device = pick_device(args.train_device) if args.train_device else device
+    if train_device != device:
+        log.info("device split: trainer (SGD) on %s, self-play workers on %s",
+                 train_device, device)
 
     # PyVariant is the only client now — the scalachess HTTP server was removed.
     # --use-pyvariant is accepted for backward compat (some launch scripts still
@@ -815,7 +842,7 @@ def main() -> int:
         d_hidden=args.model_hidden,
         c_filters=args.model_filters,
         n_blocks=args.model_blocks,
-    ).to(device)
+    ).to(train_device)
     n_params = sum(p.numel() for p in model.parameters())
     log.info(
         "model: %d blocks × %d filters, hidden=%d → %d params (%.2fM)",
@@ -859,6 +886,7 @@ def main() -> int:
         keep_best_games=args.keep_best_games,
         resume=args.resume,
         worker_mode=args.worker_mode,
+        worker_device=device,
         model_arch={
             "d_hidden": args.model_hidden,
             "c_filters": args.model_filters,
