@@ -155,6 +155,7 @@ def play_az_game(
     n_sims: int = 100,
     c_puct: float = 1.5,
     temperature: float = 1.0,
+    temp_cutoff_plies: int = 30,
     max_plies: int | None = None,
     rng: torch.Generator | None = None,
     dirichlet_alpha: float | None = 0.3,
@@ -168,6 +169,14 @@ def play_az_game(
     `dirichlet_alpha=0.3` (AlphaZero-chess default) injects Dirichlet noise
     into root priors at every move, ensuring exploration of low-prior moves.
     Set to None to disable (e.g., for deterministic eval-style games).
+
+    `temp_cutoff_plies` (AlphaZero behaviour): for the first `temp_cutoff_plies`
+    plies the move is sampled at `temperature` (exploration / opening
+    diversity); from then on it is played greedily (argmax of visit counts, i.e.
+    τ→0). This keeps self-play games sharp after the opening so a won position
+    is actually converted — a constant non-zero τ all game long lets the winner
+    wander and the loser stall, which mislabels won positions as draws. Set very
+    large to disable the cutoff (constant τ for the whole game).
 
     `sink` (optional) receives per-move snapshots and a per-game completion
     event so a spectator UI can follow training. `sink_context` is merged
@@ -207,7 +216,9 @@ def play_az_game(
                 side_to_move=state["turn"],
             )
         )
-        idx = _sample_move_index_from_visits(visits, temperature, rng)
+        # AlphaZero per-ply temperature: explore the opening, then play sharp.
+        eff_temp = temperature if ply < temp_cutoff_plies else 0.0
+        idx = _sample_move_index_from_visits(visits, eff_temp, rng)
         chosen = legal[idx]
         prev_fen = state["fen"]
         history.append({"fen": prev_fen, "uci": chosen["uci"]})

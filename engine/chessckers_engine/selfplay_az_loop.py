@@ -124,6 +124,7 @@ def _play_one_game(
     sink, sink_context: dict | None,
     client_class=None,
     vloss_batch: int = 1,
+    temp_cutoff_plies: int = 30,
 ):
     """Worker: build a fresh client and rng, play one self-play game.
     Each thread keeps its own connection pool (or in-process state for
@@ -140,7 +141,7 @@ def _play_one_game(
         return play_az_game(
             evaluator, client,
             n_sims=n_sims, c_puct=c_puct,
-            temperature=temperature, rng=rng,
+            temperature=temperature, temp_cutoff_plies=temp_cutoff_plies, rng=rng,
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_eps=dirichlet_eps,
             sink=sink, sink_context=sink_context,
@@ -237,6 +238,7 @@ def _play_game_subprocess(payload: dict):
             evaluator, client,
             n_sims=payload["n_sims"], c_puct=payload["c_puct"],
             temperature=payload["temperature"], rng=rng,
+            temp_cutoff_plies=payload.get("temp_cutoff_plies", 30),
             dirichlet_alpha=payload["dirichlet_alpha"],
             dirichlet_eps=payload["dirichlet_eps"],
             vloss_batch=payload["vloss_batch"],
@@ -380,6 +382,25 @@ def _load_resume_state(
     return start_iter, rb
 
 
+def _seed_tag(fen: str) -> str:
+    """Compact label for a start FEN in per-seed logs: the overlay square keys
+    (e.g. '[d3:kk,e3:kk]' -> 'd3+e3'), else a short prefix of the board field."""
+    lb, rb = fen.find("["), fen.find("]")
+    if 0 <= lb < rb:
+        squares = [e.split(":")[0] for e in fen[lb + 1:rb].split(",") if ":" in e]
+        if squares:
+            return "+".join(squares)
+    return fen.split(" ")[0][:16]
+
+
+def _tally_seed(seed_outcomes: dict[str, dict[str, int]], game) -> None:
+    """Bucket a finished game's outcome by its start FEN (curriculum seed), so
+    a mixed-seed run can report per-seed W/B/D. The user grades/advances off
+    this — it does NOT gate the curriculum."""
+    sf = game.records[0].fen if game.records else "?"
+    seed_outcomes.setdefault(sf, {"white": 0, "black": 0, "draw": 0})[game.outcome] += 1
+
+
 def run_az_iterations(
     model: ChesskersScorer,
     client: PyVariantClient,
@@ -404,6 +425,7 @@ def run_az_iterations(
     mcts_batch_size: int = 1,
     train_batch_size: int = 1,
     vloss_batch: int = 1,
+    temp_cutoff_plies: int = 30,
     keep_best: bool = False,
     keep_best_threshold: float = 0.55,
     keep_best_games: int = 10,
@@ -468,6 +490,7 @@ def run_az_iterations(
         log.info("iter %d/%d: playing %d games (sims=%d, τ=%.3f, workers=%d)",
                  it + 1, n_iters, games_per_iter, n_sims, temp, max(1, workers))
         outcomes = {"white": 0, "black": 0, "draw": 0}
+        seed_outcomes: dict[str, dict[str, int]] = {}
         examples = []
         ply_counts: list[int] = []
 
@@ -494,6 +517,7 @@ def run_az_iterations(
             for gi in range(games_per_iter):
                 game = _play_one_game(
                     evaluator, n_sims=n_sims, c_puct=c_puct, temperature=temp,
+                    temp_cutoff_plies=temp_cutoff_plies,
                     seed=game_seeds[gi],
                     dirichlet_alpha=dirichlet_alpha, dirichlet_eps=dirichlet_eps,
                     sink=sink, sink_context=sink_ctx_factory(gi),
@@ -501,6 +525,7 @@ def run_az_iterations(
                     vloss_batch=vloss_batch,
                 )
                 outcomes[game.outcome] += 1
+                _tally_seed(seed_outcomes, game)
                 examples.extend(az_game_to_examples(game))
                 ply_counts.append(len(game.records))
                 log.info("  game %d/%d: %s in %d plies", gi + 1, games_per_iter, game.outcome, len(game.records))
@@ -524,6 +549,7 @@ def run_az_iterations(
                     "n_sims": n_sims,
                     "c_puct": c_puct,
                     "temperature": temp,
+                    "temp_cutoff_plies": temp_cutoff_plies,
                     "seed": game_seeds[gi],
                     "dirichlet_alpha": dirichlet_alpha,
                     "dirichlet_eps": dirichlet_eps,
@@ -538,6 +564,7 @@ def run_az_iterations(
                 # interleaved log lines instead of waiting for all to complete.
                 for gi, game in enumerate(pool.imap_unordered(_play_game_subprocess, payloads)):
                     outcomes[game.outcome] += 1
+                    _tally_seed(seed_outcomes, game)
                     examples.extend(az_game_to_examples(game))
                     ply_counts.append(len(game.records))
                     log.info("  game %d/%d: %s in %d plies", gi + 1, games_per_iter,
@@ -551,6 +578,7 @@ def run_az_iterations(
                     pool.submit(
                         _play_one_game, evaluator,
                         n_sims=n_sims, c_puct=c_puct, temperature=temp,
+                        temp_cutoff_plies=temp_cutoff_plies,
                         seed=game_seeds[gi],
                         dirichlet_alpha=dirichlet_alpha, dirichlet_eps=dirichlet_eps,
                         sink=None,  # spectator sink fully disabled in parallel mode
@@ -563,6 +591,7 @@ def run_az_iterations(
                     gi = futures[fut]
                     game = fut.result()
                     outcomes[game.outcome] += 1
+                    _tally_seed(seed_outcomes, game)
                     examples.extend(az_game_to_examples(game))
                     ply_counts.append(len(game.records))
                     log.info("  game %d/%d: %s in %d plies", gi + 1, games_per_iter, game.outcome, len(game.records))
@@ -580,6 +609,12 @@ def run_az_iterations(
             outcomes["white"], outcomes["black"], outcomes["draw"],
             mean_plies, len(examples),
         )
+        if len(seed_outcomes) > 1:           # per-seed dashboard for mixed curricula
+            for sf in sorted(seed_outcomes):
+                so = seed_outcomes[sf]
+                n = so["white"] + so["black"] + so["draw"]
+                log.info("    seed %-9s: %dW/%dB/%dD (n=%d)",
+                         _seed_tag(sf), so["white"], so["black"], so["draw"], n)
         replay_buffer.append(examples)
         train_examples = [ex for batch in replay_buffer for ex in batch]
         if buffer_iters > 1:
@@ -689,6 +724,10 @@ def main() -> int:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--temperature-final", type=float, default=0.3)
+    p.add_argument("--temp-cutoff-plies", type=int, default=30,
+                   help="AlphaZero per-ply temperature: sample at τ for the first "
+                        "N plies, then play greedily (argmax). 30 = AZ-chess default; "
+                        "use a small value (~4) for short endgames so wins convert.")
     p.add_argument("--eval-games", type=int, default=5)
     p.add_argument("--eval-sims", type=int, default=None,
                    help="MCTS sims for eval-vs-random. Defaults to --sims; bump higher "
@@ -800,6 +839,7 @@ def main() -> int:
         lr=args.lr,
         t_initial=args.temperature,
         t_final=args.temperature_final,
+        temp_cutoff_plies=args.temp_cutoff_plies,
         eval_games=args.eval_games,
         eval_sims=args.eval_sims,
         weights_dir=Path(args.weights_dir),
