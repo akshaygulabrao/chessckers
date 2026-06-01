@@ -587,13 +587,6 @@ def run_az_iterations(
             weights_dir, model, best_model, buffer_iters
         )
 
-    # Reset the shared game counter so streamed `game #N` restart at 1 for this
-    # run (the leena sync increments the same file).
-    try:
-        Path(_GAME_COUNTER).write_text("0")
-    except OSError:
-        pass
-
     for it in range(start_iter, n_iters):
         temp = _temperature_for(it, n_iters, t_initial, t_final)
         log.info("iter %d/%d: playing %d games (sims=%d, τ=%.3f, workers=%d)",
