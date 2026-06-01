@@ -589,7 +589,7 @@ def run_az_iterations(
 
     for it in range(start_iter, n_iters):
         temp = _temperature_for(it, n_iters, t_initial, t_final)
-        log.info("iter %d/%d: playing %d games (sims=%d, τ=%.3f, workers=%d)",
+        log.info("iter %d/%d: collecting %d games (local + leena combined; sims=%d, τ=%.3f, workers=%d)",
                  it + 1, n_iters, games_per_iter, n_sims, temp, max(1, workers))
         outcomes = {"white": 0, "black": 0, "draw": 0}
         seed_outcomes: dict[str, dict[str, int]] = {}
@@ -597,8 +597,8 @@ def run_az_iterations(
         ply_counts: list[int] = []
         machine_counts: dict[str, int] = {}
 
-        # Each game gets a unique seed so per-thread rngs don't correlate.
-        game_seeds = [seed + it * games_per_iter + gi for gi in range(games_per_iter)]
+        # Each game gets a unique seed (computed inline below) so per-thread
+        # rngs don't correlate: seed + it*games_per_iter + gi.
         sink_ctx_factory = lambda gi: ({
             "iter": it + 1, "total_iters": n_iters,
             "game_idx": gi + 1, "total_games": games_per_iter,
@@ -616,88 +616,109 @@ def run_az_iterations(
         else:
             evaluator = play_model
 
-        if not parallel:
-            for gi in range(games_per_iter):
-                game = _play_one_game(
-                    evaluator, n_sims=n_sims, c_puct=c_puct, temperature=temp,
-                    temp_cutoff_plies=temp_cutoff_plies,
-                    seed=game_seeds[gi],
-                    dirichlet_alpha=dirichlet_alpha, dirichlet_eps=dirichlet_eps,
-                    sink=sink, sink_context=sink_ctx_factory(gi),
-                    client_class=client_class,
-                    vloss_batch=vloss_batch,
-                )
-                outcomes[game.outcome] += 1
-                _tally_seed(seed_outcomes, game)
-                examples.extend(az_game_to_examples(game))
-                ply_counts.append(len(game.records))
-                log.info("  game #%d [local]: %s in %d plies (seed %s)", _next_game_num(), game.outcome, len(game.records), _seed_tag(game.records[0].fen))
-        elif effective_mode == "processes":
-            # Save model state to disk so worker subprocesses can load it.
-            # Each worker rebuilds the model in its own CUDA context.
-            if model_arch is None:
-                raise ValueError(
-                    "worker_mode='processes' requires model_arch to be passed "
-                    "(d_hidden, c_filters, n_blocks). Pass it from main() or use "
-                    "worker_mode='threads'."
-                )
-            worker_state = weights_dir / "_worker_state.pt"
-            torch.save(play_model.state_dict(), worker_state)
-            payloads = [
-                {
-                    "state_path": str(worker_state),
-                    "model_arch": model_arch,
-                    "device": str(wdev),
-                    "mcts_batch_size": mcts_batch_size,
-                    "n_sims": n_sims,
-                    "c_puct": c_puct,
-                    "temperature": temp,
-                    "temp_cutoff_plies": temp_cutoff_plies,
-                    "seed": game_seeds[gi],
-                    "dirichlet_alpha": dirichlet_alpha,
-                    "dirichlet_eps": dirichlet_eps,
-                    "vloss_batch": vloss_batch,
-                }
-                for gi in range(games_per_iter)
-            ]
-            import multiprocessing as _mp
-            ctx = _mp.get_context("spawn")  # required for CUDA
-            with ctx.Pool(processes=workers) as pool:
-                # imap_unordered streams results as workers finish — we get
-                # interleaved log lines instead of waiting for all to complete.
-                for gi, game in enumerate(pool.imap_unordered(_play_game_subprocess, payloads)):
-                    outcomes[game.outcome] += 1
-                    _tally_seed(seed_outcomes, game)
-                    examples.extend(az_game_to_examples(game))
-                    ply_counts.append(len(game.records))
-                    log.info("  game #%d [local]: %s in %d plies (seed %s)", _next_game_num(),
-                             game.outcome, len(game.records), _seed_tag(game.records[0].fen))
-            # Skip the as_completed-based result loop below (only used by threads).
-            pass  # noqa: PIE790
-        else:  # effective_mode == "threads"
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(
-                        _play_one_game, evaluator,
-                        n_sims=n_sims, c_puct=c_puct, temperature=temp,
+        # --- Collect games_per_iter total, COUNTING leena/remote games ---
+        # Block-until-target: local self-play AND leena's streamed games both
+        # count toward games_per_iter. Absorb whatever leena has staged, then
+        # run local self-play to fill the rest, re-draining leena after each
+        # local game so games that stream in DURING the iteration also count
+        # here (not deferred to the next iter). Local always makes progress, so
+        # the iteration can't deadlock if leena stalls/dies — it just ends up
+        # mostly-local. (Previously remote games were folded in AFTER a full
+        # local batch, i.e. pure extras on top of games_per_iter.)
+        def _drain_remote() -> None:
+            if ingest_dir is not None:
+                examples.extend(_ingest_remote(
+                    Path(ingest_dir), outcomes, seed_outcomes, ply_counts, machine_counts))
+
+        def _local_game_stream(budget: int):
+            """Yield up to `budget` finished local AZGames per the effective
+            worker mode; cleans up the pool/executor on early close()."""
+            if not parallel:
+                for gi in range(budget):
+                    yield _play_one_game(
+                        evaluator, n_sims=n_sims, c_puct=c_puct, temperature=temp,
                         temp_cutoff_plies=temp_cutoff_plies,
-                        seed=game_seeds[gi],
+                        seed=seed + it * games_per_iter + gi,
                         dirichlet_alpha=dirichlet_alpha, dirichlet_eps=dirichlet_eps,
-                        sink=None,  # spectator sink fully disabled in parallel mode
-                        sink_context=None,
-                        client_class=client_class,
-                        vloss_batch=vloss_batch,
-                    ): gi for gi in range(games_per_iter)
-                }
-                for fut in as_completed(futures):
-                    gi = futures[fut]
-                    game = fut.result()
+                        sink=sink, sink_context=sink_ctx_factory(gi),
+                        client_class=client_class, vloss_batch=vloss_batch,
+                    )
+            elif effective_mode == "processes":
+                # Workers rebuild the model from this state file in their own
+                # process (own CUDA context). Saved once per iter, lazily on
+                # first pull (skipped entirely if leena already filled target).
+                if model_arch is None:
+                    raise ValueError(
+                        "worker_mode='processes' requires model_arch to be passed "
+                        "(d_hidden, c_filters, n_blocks). Pass it from main() or use "
+                        "worker_mode='threads'.")
+                worker_state = weights_dir / "_worker_state.pt"
+                torch.save(play_model.state_dict(), worker_state)
+                payloads = (
+                    {
+                        "state_path": str(worker_state), "model_arch": model_arch,
+                        "device": str(wdev), "mcts_batch_size": mcts_batch_size,
+                        "n_sims": n_sims, "c_puct": c_puct, "temperature": temp,
+                        "temp_cutoff_plies": temp_cutoff_plies,
+                        "seed": seed + it * games_per_iter + gi,
+                        "dirichlet_alpha": dirichlet_alpha, "dirichlet_eps": dirichlet_eps,
+                        "vloss_batch": vloss_batch,
+                    }
+                    for gi in range(budget)
+                )
+                import multiprocessing as _mp
+                ctx = _mp.get_context("spawn")  # required for CUDA
+                pool = ctx.Pool(processes=workers)
+                try:
+                    for game in pool.imap_unordered(_play_game_subprocess, payloads):
+                        yield game
+                finally:
+                    pool.terminate()
+                    pool.join()
+            else:  # effective_mode == "threads"
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                pool = ThreadPoolExecutor(max_workers=workers)
+                try:
+                    futures = [
+                        pool.submit(
+                            _play_one_game, evaluator,
+                            n_sims=n_sims, c_puct=c_puct, temperature=temp,
+                            temp_cutoff_plies=temp_cutoff_plies,
+                            seed=seed + it * games_per_iter + gi,
+                            dirichlet_alpha=dirichlet_alpha, dirichlet_eps=dirichlet_eps,
+                            sink=None,  # spectator sink disabled in parallel mode
+                            sink_context=None,
+                            client_class=client_class, vloss_batch=vloss_batch,
+                        )
+                        for gi in range(budget)
+                    ]
+                    for fut in as_completed(futures):
+                        yield fut.result()
+                finally:
+                    pool.shutdown(wait=False, cancel_futures=True)
+
+        _drain_remote()  # count leena games staged before this iter started
+        n_local = 0
+        # combined = remote (leena/vast) games drained so far + local games played;
+        # exclude any pre-existing "local" key so the count can't double up.
+        combined = lambda: sum(v for k, v in machine_counts.items() if k != "local") + n_local
+        if combined() < games_per_iter:
+            stream = _local_game_stream(games_per_iter)
+            try:
+                for game in stream:
                     outcomes[game.outcome] += 1
                     _tally_seed(seed_outcomes, game)
                     examples.extend(az_game_to_examples(game))
                     ply_counts.append(len(game.records))
-                    log.info("  game #%d [local]: %s in %d plies (seed %s)", _next_game_num(), game.outcome, len(game.records), _seed_tag(game.records[0].fen))
+                    n_local += 1
+                    log.info("  game #%d [local]: %s in %d plies (seed %s)",
+                             _next_game_num(), game.outcome, len(game.records),
+                             _seed_tag(game.records[0].fen))
+                    _drain_remote()
+                    if combined() >= games_per_iter:
+                        break
+            finally:
+                stream.close()  # terminate pool / cancel pending futures
 
         # Self-play done — stop the inference thread before training mutates
         # the model. (Eval after training uses the model directly; eval is
@@ -705,13 +726,7 @@ def run_az_iterations(
         if use_server:
             evaluator.shutdown()
 
-        # Fold in machine-tagged games from remote workers (e.g. leena) synced
-        # into ingest_dir, so the W/B/D + per-seed + mean-plies dashboards
-        # include them; count games per machine for the by-machine line.
-        machine_counts["local"] = sum(outcomes.values())
-        if ingest_dir is not None:
-            examples.extend(_ingest_remote(
-                Path(ingest_dir), outcomes, seed_outcomes, ply_counts, machine_counts))
+        machine_counts["local"] = n_local
 
         mean_plies = sum(ply_counts) / max(len(ply_counts), 1)
         log.info(
