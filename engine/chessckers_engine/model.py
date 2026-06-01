@@ -134,8 +134,13 @@ class ChesskersScorer(nn.Module):
         self, positions: torch.Tensor, moves_list: list[torch.Tensor | None]
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Evaluate B positions and their (ragged) move lists in one batched
-        trunk pass. The trunk + value-head are batched (the expensive part);
-        the policy head runs per-position because each has a different N moves.
+        pass — both the trunk+value-head AND the policy head are batched. The
+        ragged move lists are padded to the longest (B, n_max, D), the policy
+        head (row-wise: Linear/LayerNorm/ReLU over the feature dim only) runs
+        over all B*n_max slots at once, and the padded logits are masked to
+        -inf before the per-position softmax. Because the head is row-wise,
+        padding never contaminates real moves, so each position's prior
+        distribution is bit-for-bit identical to the per-position computation.
 
         positions:  (B, C, 8, 8)
         moves_list: list of B items; each is a (N_i, D) tensor or None/(0, D)
@@ -150,22 +155,49 @@ class ChesskersScorer(nn.Module):
                 f"batch size mismatch: positions B={positions.shape[0]}, "
                 f"moves_list len={len(moves_list)}"
             )
-        # One trunk pass for all positions.
+        # One trunk pass for all positions (the expensive part).
         pos_emb = self.position_trunk(positions)             # (B, d_hidden)
         values = self.value_head(pos_emb).squeeze(-1)        # (B,)
-        # Policy head runs per-position because moves are ragged.
-        priors_list: list[torch.Tensor] = []
+
+        B = positions.shape[0]
+        device = positions.device
+        lengths = [
+            0 if (m is None or m.shape[0] == 0) else int(m.shape[0])
+            for m in moves_list
+        ]
+        n_max = max(lengths, default=0)
+        if n_max == 0:
+            # Value-only batch: no candidate moves anywhere.
+            return values, [torch.empty(0, device=device) for _ in range(B)]
+
+        d_hidden = pos_emb.shape[1]
+        d_move = next(
+            m.shape[1] for m in moves_list if m is not None and m.shape[0] > 0
+        )
+        # Pad ragged move lists to (B, n_max, D) + a validity mask.
+        padded = positions.new_zeros((B, n_max, d_move))
+        mask = torch.zeros((B, n_max), dtype=torch.bool, device=device)
         for i, moves in enumerate(moves_list):
-            if moves is None or moves.shape[0] == 0:
-                priors_list.append(torch.empty(0, device=positions.device))
-                continue
-            n = moves.shape[0]
-            pe = pos_emb[i:i + 1].expand(n, -1)              # (N_i, d_hidden)
-            me = self.move_encoder(moves)                    # (N_i, d_hidden)
-            combined = torch.cat([pe, me], dim=1)            # (N_i, 2*d_hidden)
-            logits = self.head(combined).squeeze(-1)         # (N_i,)
-            priors_list.append(torch.softmax(logits, dim=0))
-        return values, priors_list
+            if lengths[i]:
+                padded[i, : lengths[i]] = moves
+                mask[i, : lengths[i]] = True
+
+        move_emb = self.move_encoder(
+            padded.reshape(B * n_max, d_move)
+        ).reshape(B, n_max, d_hidden)                        # (B, n_max, d_hidden)
+        pos_emb_b = pos_emb.unsqueeze(1).expand(B, n_max, d_hidden)
+        combined = torch.cat([pos_emb_b, move_emb], dim=2)   # (B, n_max, 2*d_hidden)
+        logits = self.head(
+            combined.reshape(B * n_max, 2 * d_hidden)
+        ).reshape(B, n_max)                                  # (B, n_max)
+        logits = logits.masked_fill(~mask, float("-inf"))
+        priors = torch.softmax(logits, dim=1)                # (B, n_max); padding → 0
+        # Rows with no moves softmax to NaN (all -inf) but are sliced to empty
+        # below and never read.
+        return values, [
+            priors[i, : lengths[i]] if lengths[i] else torch.empty(0, device=device)
+            for i in range(B)
+        ]
 
     def policy_and_value(
         self, position: torch.Tensor, moves: torch.Tensor
