@@ -401,6 +401,90 @@ def _tally_seed(seed_outcomes: dict[str, dict[str, int]], game) -> None:
     seed_outcomes.setdefault(sf, {"white": 0, "black": 0, "draw": 0})[game.outcome] += 1
 
 
+def _machine_for_worker(worker_id: int) -> str:
+    """Worker-id ranges (see reference_leena_macbook_worker): local 0-199,
+    vast 200-299, leena 300+."""
+    if worker_id >= 300:
+        return "leena"
+    if worker_id >= 200:
+        return "vast"
+    return "local"
+
+
+def _ingest_remote(
+    ingest_dir: Path, outcomes: dict, seed_outcomes: dict,
+    ply_counts: list, machine_counts: dict,
+) -> list:
+    """Drain machine-tagged remote game pkls (+ '<pkl>.meta' JSON sidecars)
+    synced into ingest_dir, folding each game's outcome/seed/plies into the
+    iteration tallies (so the W/B/D + per-seed + mean-plies dashboards include
+    remote games) and counting games per machine for the by-machine line.
+    Returns the loaded AZExamples; consumes (unlinks) processed files; skips
+    partial/mid-rsync files (retried next iter)."""
+    import json
+    import pickle
+    out: list = []
+    if ingest_dir is None or not ingest_dir.exists():
+        return out
+    for pkl in sorted(ingest_dir.glob("*.pkl")):
+        try:
+            with open(pkl, "rb") as f:
+                exs = pickle.load(f)
+        except (EOFError, pickle.UnpicklingError, OSError, ValueError):
+            continue  # mid-rsync / partial; retry next iter
+        meta: dict = {}
+        meta_path = Path(str(pkl) + ".meta")
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, ValueError):
+            pass
+        try:
+            wid = int(pkl.name.split("_", 1)[0])
+        except ValueError:
+            wid = -1
+        machine = meta.get("machine") or _machine_for_worker(wid)
+        machine_counts[machine] = machine_counts.get(machine, 0) + 1
+        outcome = meta.get("outcome")
+        if outcome in ("white", "black", "draw"):
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            sf = meta.get("seed_fen")
+            if sf:
+                seed_outcomes.setdefault(
+                    sf, {"white": 0, "black": 0, "draw": 0})[outcome] += 1
+        if meta.get("plies"):
+            ply_counts.append(int(meta["plies"]))
+        out.extend(exs)
+        for fp in (pkl, meta_path):
+            try:
+                fp.unlink()
+            except OSError:
+                pass
+    return out
+
+
+_GAME_COUNTER = "/tmp/cc_gamecount"
+
+
+def _next_game_num() -> int:
+    """Atomically bump + return the shared game counter. The trainer (local
+    games) and the leena sync both increment this one flock'd file, so the
+    streamed `game #N` numbers form one monotonic sequence across machines."""
+    import fcntl
+    try:
+        with open(_GAME_COUNTER, "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            cur = f.read().strip()
+            n = (int(cur) if cur.isdigit() else 0) + 1
+            f.seek(0)
+            f.truncate()
+            f.write(str(n))
+            fcntl.flock(f, fcntl.LOCK_UN)
+        return n
+    except (OSError, ValueError):
+        return -1
+
+
 def run_az_iterations(
     model: ChesskersScorer,
     client: PyVariantClient,
@@ -434,6 +518,7 @@ def run_az_iterations(
     model_arch: dict | None = None,
     worker_mode: str = "auto",
     worker_device: torch.device | None = None,
+    ingest_dir: Path | None = None,
 ) -> list[dict]:
     # Eval-vs-random uses MCTS on the trained model with no exploration noise;
     # too few sims and random can stumble into wins our model misjudges. Default
@@ -502,6 +587,13 @@ def run_az_iterations(
             weights_dir, model, best_model, buffer_iters
         )
 
+    # Reset the shared game counter so streamed `game #N` restart at 1 for this
+    # run (the leena sync increments the same file).
+    try:
+        Path(_GAME_COUNTER).write_text("0")
+    except OSError:
+        pass
+
     for it in range(start_iter, n_iters):
         temp = _temperature_for(it, n_iters, t_initial, t_final)
         log.info("iter %d/%d: playing %d games (sims=%d, τ=%.3f, workers=%d)",
@@ -510,6 +602,7 @@ def run_az_iterations(
         seed_outcomes: dict[str, dict[str, int]] = {}
         examples = []
         ply_counts: list[int] = []
+        machine_counts: dict[str, int] = {}
 
         # Each game gets a unique seed so per-thread rngs don't correlate.
         game_seeds = [seed + it * games_per_iter + gi for gi in range(games_per_iter)]
@@ -545,7 +638,7 @@ def run_az_iterations(
                 _tally_seed(seed_outcomes, game)
                 examples.extend(az_game_to_examples(game))
                 ply_counts.append(len(game.records))
-                log.info("  game %d/%d: %s in %d plies", gi + 1, games_per_iter, game.outcome, len(game.records))
+                log.info("  game #%d [local]: %s in %d plies (seed %s)", _next_game_num(), game.outcome, len(game.records), _seed_tag(game.records[0].fen))
         elif effective_mode == "processes":
             # Save model state to disk so worker subprocesses can load it.
             # Each worker rebuilds the model in its own CUDA context.
@@ -584,8 +677,8 @@ def run_az_iterations(
                     _tally_seed(seed_outcomes, game)
                     examples.extend(az_game_to_examples(game))
                     ply_counts.append(len(game.records))
-                    log.info("  game %d/%d: %s in %d plies", gi + 1, games_per_iter,
-                             game.outcome, len(game.records))
+                    log.info("  game #%d [local]: %s in %d plies (seed %s)", _next_game_num(),
+                             game.outcome, len(game.records), _seed_tag(game.records[0].fen))
             # Skip the as_completed-based result loop below (only used by threads).
             pass  # noqa: PIE790
         else:  # effective_mode == "threads"
@@ -611,13 +704,21 @@ def run_az_iterations(
                     _tally_seed(seed_outcomes, game)
                     examples.extend(az_game_to_examples(game))
                     ply_counts.append(len(game.records))
-                    log.info("  game %d/%d: %s in %d plies", gi + 1, games_per_iter, game.outcome, len(game.records))
+                    log.info("  game #%d [local]: %s in %d plies (seed %s)", _next_game_num(), game.outcome, len(game.records), _seed_tag(game.records[0].fen))
 
         # Self-play done — stop the inference thread before training mutates
         # the model. (Eval after training uses the model directly; eval is
         # sequential so batching wouldn't help anyway.)
         if use_server:
             evaluator.shutdown()
+
+        # Fold in machine-tagged games from remote workers (e.g. leena) synced
+        # into ingest_dir, so the W/B/D + per-seed + mean-plies dashboards
+        # include them; count games per machine for the by-machine line.
+        machine_counts["local"] = sum(outcomes.values())
+        if ingest_dir is not None:
+            examples.extend(_ingest_remote(
+                Path(ingest_dir), outcomes, seed_outcomes, ply_counts, machine_counts))
 
         mean_plies = sum(ply_counts) / max(len(ply_counts), 1)
         log.info(
@@ -626,6 +727,9 @@ def run_az_iterations(
             outcomes["white"], outcomes["black"], outcomes["draw"],
             mean_plies, len(examples),
         )
+        if machine_counts and (len(machine_counts) > 1 or ingest_dir is not None):
+            log.info("    by machine: %s",
+                     ", ".join(f"{m}={machine_counts[m]}" for m in sorted(machine_counts)))
         if len(seed_outcomes) > 1:           # per-seed dashboard for mixed curricula
             for sf in sorted(seed_outcomes):
                 so = seed_outcomes[sf]
@@ -647,6 +751,7 @@ def run_az_iterations(
         )
         ckpt = weights_dir / f"iter-az-{it + 1:03d}.pt"
         save_checkpoint(model, ckpt)
+        save_checkpoint(model, weights_dir / "weights.pt")  # stable name for the sidecar to push to remote workers
 
         # Best-vs-current gating: only promote `model` to `best` if it scores
         # ≥ threshold against the current best in head-to-head play. Self-play
@@ -823,6 +928,10 @@ def main() -> int:
                         "the accelerator while self-play stays on CPU — optimal for tiny nets "
                         "(big-batch fwd+bwd is ~13-31x faster on MPS; batch-1 inference is "
                         "faster on CPU). Requires --worker-mode processes.")
+    p.add_argument("--ingest-dir", default="",
+                   help="Dir of synced remote-worker game pkls (+ '<pkl>.meta' JSON) to fold "
+                        "into each iteration's training + dashboards (by-machine + per-seed). "
+                        "Empty = local self-play only.")
     args = p.parse_args()
 
     device = pick_device(args.device)                      # self-play / worker device
@@ -887,6 +996,7 @@ def main() -> int:
         resume=args.resume,
         worker_mode=args.worker_mode,
         worker_device=device,
+        ingest_dir=Path(args.ingest_dir) if args.ingest_dir else None,
         model_arch={
             "d_hidden": args.model_hidden,
             "c_filters": args.model_filters,

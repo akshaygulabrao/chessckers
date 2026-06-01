@@ -20,7 +20,7 @@ def setup_logging(level: int = logging.INFO) -> None:
     """Configure root logging."""
     logging.basicConfig(
         level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format="%(asctime)s %(message)s",
     )
 from chessckers_engine.material_player import pick_material
 from chessckers_engine.mcts import pick_mcts

@@ -202,9 +202,21 @@ def play_forever(payload: dict) -> int:
             )
             games_played += 1
             examples = az_game_to_examples(game)
-            buffer.append_game(
+            _game_path = buffer.append_game(
                 worker_id=worker_id, game_id=games_played, examples=examples
             )
+            # Sidecar metadata so the trainer can fold this game into its
+            # per-machine + per-seed + W/B/D dashboards (examples alone carry no
+            # outcome/machine). Synced alongside the pkl; consumed on ingest.
+            try:
+                import json as _json
+                Path(str(_game_path) + ".meta").write_text(_json.dumps({
+                    "worker_id": worker_id, "machine": machine,
+                    "outcome": game.outcome, "plies": len(game.records),
+                    "seed_fen": game.records[0].fen if game.records else None,
+                }))
+            except (OSError, AttributeError, TypeError):
+                pass
             try:
                 _hb.write(run_dir, machine=machine, worker_id=worker_id,
                           role="worker", games_played=games_played,
