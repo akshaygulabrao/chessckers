@@ -14,6 +14,8 @@ WEIGHTS="$ENG/weights/run/weights.pt"
 LOG=/tmp/cc_train.log
 PY="$ENG/.venv/bin/python"
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10"
+PAUSE="$ENG/weights/run/PAUSE_LEENA"        # trainer touches this across its train+save phase
+paused=0; pause_started=0; MAX_PAUSE=600    # SIGSTOP leena while present; force-resume after MAX_PAUSE (stale-marker guard)
 mkdir -p "$INGEST"
 while true; do
   out=$(rsync -ai --remove-source-files -e "$SSH" "$LEENA:chessckers/run/buffer/" "$INGEST/" 2>/dev/null || true)
@@ -32,8 +34,12 @@ try:
         cf.seek(0); cf.truncate(); cf.write(str(n))
         fcntl.flock(cf, fcntl.LOCK_UN)
     fen = m.get("seed_fen") or ""
+    board = fen.split(" ")[0]
+    n_wp = board.split("[")[0].count("P")            # White pawns (match _seed_tag)
     mt = re.search(r"\[([^\]]*)\]", fen)
     st = "+".join(s.split(":")[0] for s in mt.group(1).split(",")) if mt else "?"
+    if mt and n_wp:
+        st = f"{st}+{n_wp}P"
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]   # millisecond, matches local
     print(f"{ts}   game #{n} [leena]: {m.get('outcome','?')} in {m.get('plies','?')} plies (seed {st})")
 except Exception:
@@ -41,5 +47,24 @@ except Exception:
 PYEOF
   done
   [ -f "$WEIGHTS" ] && rsync -az -e "$SSH" "$WEIGHTS" "$LEENA:chessckers/run/weights.pt" 2>/dev/null || true
+  # Pause leena across the trainer's train+save phase (PAUSE_LEENA marker) so it
+  # resumes on the fresh weights just pushed above — SIGSTOP/SIGCONT the workers,
+  # no leena-side code. Safety: force-resume if the marker goes stale (trainer died).
+  now=$(date +%s)
+  if [ -f "$PAUSE" ]; then
+    if [ "$paused" = "0" ]; then
+      $SSH "$LEENA" 'pkill -STOP -f selfplay_workers_only; pkill -STOP -f multiprocessing.spawn' 2>/dev/null || true
+      paused=1; pause_started=$now
+      echo "$(date '+%Y-%m-%d %H:%M:%S,000')   [sync] leena paused (trainer training)" >> "$LOG"
+    elif [ $((now - pause_started)) -gt "$MAX_PAUSE" ]; then
+      $SSH "$LEENA" 'pkill -CONT -f selfplay_workers_only; pkill -CONT -f multiprocessing.spawn' 2>/dev/null || true
+      paused=0
+      echo "$(date '+%Y-%m-%d %H:%M:%S,000')   [sync] leena force-resumed (pause > ${MAX_PAUSE}s — stale marker?)" >> "$LOG"
+    fi
+  elif [ "$paused" = "1" ]; then
+    $SSH "$LEENA" 'pkill -CONT -f selfplay_workers_only; pkill -CONT -f multiprocessing.spawn' 2>/dev/null || true
+    paused=0
+    echo "$(date '+%Y-%m-%d %H:%M:%S,000')   [sync] leena resumed (fresh weights)" >> "$LOG"
+  fi
   sleep 15
 done

@@ -384,13 +384,19 @@ def _load_resume_state(
 
 def _seed_tag(fen: str) -> str:
     """Compact label for a start FEN in per-seed logs: the overlay square keys
-    (e.g. '[d3:kk,e3:kk]' -> 'd3+e3'), else a short prefix of the board field."""
+    (e.g. '[d3:kk,e3:kk]' -> 'd3+e3'), plus the White-pawn count when present so
+    seeds that differ only in White pawns are distinguishable (the d6/e6/f6
+    towers vs 3/6/8 White pawns -> 'd6+e6+f6+3P' / '+6P' / '+8P'); else a short
+    prefix of the board field."""
+    board = fen.split(" ")[0]
+    n_wp = board.split("[")[0].count("P")  # White pawns live in the board field, not the overlay
     lb, rb = fen.find("["), fen.find("]")
     if 0 <= lb < rb:
         squares = [e.split(":")[0] for e in fen[lb + 1:rb].split(",") if ":" in e]
         if squares:
-            return "+".join(squares)
-    return fen.split(" ")[0][:16]
+            tag = "+".join(squares)
+            return f"{tag}+{n_wp}P" if n_wp else tag
+    return board[:16]
 
 
 def _tally_seed(seed_outcomes: dict[str, dict[str, int]], game) -> None:
@@ -751,15 +757,25 @@ def run_az_iterations(
                 "  training on replay buffer: %d examples from last %d iter(s)",
                 len(train_examples), len(replay_buffer),
             )
-        result = train_az(
-            model, train_examples,
-            epochs=epochs, lr=lr, seed=seed + it, log_every=0,
-            grad_clip=grad_clip,
-            batch_size=train_batch_size,
-        )
-        ckpt = weights_dir / f"iter-az-{it + 1:03d}.pt"
-        save_checkpoint(model, ckpt)
-        save_checkpoint(model, weights_dir / "weights.pt")  # stable name for the sidecar to push to remote workers
+        # Pause remote (leena) self-play across the train+save phase so it
+        # resumes generating with the FRESH weights rather than the
+        # about-to-be-stale network. leena_sync.sh watches this marker and
+        # SIGSTOPs/SIGCONTs leena's workers (no leena-side code change needed).
+        # try/finally so a training error can't leave leena frozen forever.
+        pause_marker = weights_dir / "PAUSE_LEENA"
+        pause_marker.touch()
+        try:
+            result = train_az(
+                model, train_examples,
+                epochs=epochs, lr=lr, seed=seed + it, log_every=0,
+                grad_clip=grad_clip,
+                batch_size=train_batch_size,
+            )
+            ckpt = weights_dir / f"iter-az-{it + 1:03d}.pt"
+            save_checkpoint(model, ckpt)
+            save_checkpoint(model, weights_dir / "weights.pt")  # stable name for the sidecar to push to remote workers
+        finally:
+            pause_marker.unlink(missing_ok=True)
 
         # Best-vs-current gating: only promote `model` to `best` if it scores
         # ≥ threshold against the current best in head-to-head play. Self-play
