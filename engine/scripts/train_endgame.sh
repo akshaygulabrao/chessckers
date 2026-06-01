@@ -29,7 +29,7 @@ echo "start FEN : $CHESSCKERS_START_FEN"
 echo "max plies : $CHESSCKERS_MAX_PLIES | discount γ: $CHESSCKERS_VALUE_DISCOUNT | out: $OUT | workers: $WORKERS"
 
 exec .venv/bin/python -m chessckers_engine.selfplay_az_loop \
-    --iterations 30 --games-per-iter 8 --sims 400 --epochs 3 \
+    --iterations 30 --games-per-iter 100 --sims 400 --epochs 3 \
     --eval-games 0 --workers "$WORKERS" --worker-mode processes --device cpu \
     --weights-dir "$OUT" \
     "$@"
