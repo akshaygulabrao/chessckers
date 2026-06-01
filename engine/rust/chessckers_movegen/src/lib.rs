@@ -14,7 +14,7 @@
 //! `stacks` is a Python dict from chess.Square (0..63) to a pieces string
 //! (e.g. "ssk", bottom-to-top, alphabet {s, S, k}).
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -2301,6 +2301,320 @@ fn white_legal_moves<'py>(
     Ok(out)
 }
 
+// -------- Position / move tensor encodings --------
+// Byte-for-byte equivalent to chessckers_engine.encoding.encode_position(fen)
+// and encode_move(dict). The Python versions build the (14,8,8)/(240,) tensors
+// with per-element assignment; these build a flat Vec<f32> the caller wraps
+// with torch.tensor(...).view(...). See encoding.py for the channel/dim spec.
+
+const ENC_POS_C: usize = 14;
+const ENC_MOVE_D: usize = 240;
+
+#[inline(always)]
+fn pos_idx(ch: usize, y: usize, x: usize) -> usize {
+    ch * 64 + y * 8 + x
+}
+
+fn white_piece_ch(c: u8) -> Option<usize> {
+    match c {
+        b'P' => Some(0),
+        b'N' => Some(1),
+        b'B' => Some(2),
+        b'R' => Some(3),
+        b'Q' => Some(4),
+        b'K' => Some(5),
+        _ => None,
+    }
+}
+
+// 10x10 grid file/rank chars -> 0..9 (rim 'z'/'i' and '0'/'9'). Mirrors
+// encoding._FILE10 / _RANK10.
+fn file10(c: u8) -> Option<usize> {
+    match c {
+        b'z' => Some(0),
+        b'a'..=b'h' => Some((c - b'a' + 1) as usize),
+        b'i' => Some(9),
+        _ => None,
+    }
+}
+
+fn rank10(c: u8) -> Option<usize> {
+    if c.is_ascii_digit() {
+        Some((c - b'0') as usize)
+    } else {
+        None
+    }
+}
+
+fn sq_index(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.len() < 2 {
+        return None;
+    }
+    let file = b[0].wrapping_sub(b'a') as usize;
+    let rank = b[1].wrapping_sub(b'1') as usize;
+    if file >= 8 || rank >= 8 {
+        return None;
+    }
+    Some(rank * 8 + file)
+}
+
+fn promo_index(p: &str) -> usize {
+    match p {
+        "q" => 1,
+        "r" => 2,
+        "b" => 3,
+        "n" => 4,
+        _ => 0,
+    }
+}
+
+// Dict lookup that returns Some only when the key is present AND not None
+// (mirrors `move.get(key) is not None` / `move.get(key) or default`).
+fn dget<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
+    match d.get_item(key)? {
+        Some(v) if !v.is_none() => Ok(Some(v)),
+        _ => Ok(None),
+    }
+}
+
+// Set channels 8-12 for one tower at (x,y) from its pieces (bottom-to-top bytes
+// in {s,S,k}). f64-divide-then-cast matches Python's float division + float32
+// tensor-assignment double-rounding (bit-exact). Shared by both encoders.
+fn apply_tower_channels(out: &mut [f32], x: usize, y: usize, pieces: &[u8]) {
+    let height = pieces.len();
+    if height == 0 {
+        return;
+    }
+    let kings = pieces.iter().filter(|&&p| p == b'k').count();
+    let stones = pieces.iter().filter(|&&p| p == b's' || p == b'S').count();
+    out[pos_idx(8, y, x)] = (height as f64 / 24.0) as f32;
+    out[pos_idx(9, y, x)] = (stones as f64 / 24.0) as f32;
+    out[pos_idx(10, y, x)] = (kings as f64 / 24.0) as f32;
+    if pieces[height - 1] == b's' {
+        out[pos_idx(11, y, x)] = 1.0;
+    }
+    if height >= 2 && pieces[height - 2] == b'k' {
+        out[pos_idx(12, y, x)] = 1.0;
+    }
+}
+
+// Set channel `ch` to 1.0 at every square in the bitboard.
+fn set_bits_channel(out: &mut [f32], mut bb: u64, ch: usize) {
+    while bb != 0 {
+        let sq = bb.trailing_zeros() as usize;
+        out[pos_idx(ch, sq >> 3, sq & 7)] = 1.0;
+        bb &= bb - 1;
+    }
+}
+
+fn encode_position_native(fen: &str) -> Result<Vec<f32>, String> {
+    let bytes = fen.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] != b'[' && bytes[i] != b' ' {
+        i += 1;
+    }
+    let board = &fen[..i];
+    let mut overlay: &str = "";
+    if i < bytes.len() && bytes[i] == b'[' {
+        let start = i + 1;
+        let mut j = start;
+        while j < bytes.len() && bytes[j] != b']' {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            return Err(format!("unrecognized Chessckers FEN: {:?}", fen));
+        }
+        overlay = &fen[start..j];
+        i = j + 1;
+    }
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    if i >= bytes.len() || (bytes[i] != b'w' && bytes[i] != b'b') {
+        return Err(format!("unrecognized Chessckers FEN: {:?}", fen));
+    }
+    let turn = bytes[i];
+
+    let mut out = vec![0.0f32; ENC_POS_C * 64];
+
+    let ranks: Vec<&str> = board.split('/').collect();
+    if ranks.len() != 8 {
+        return Err(format!("FEN board must have 8 ranks: {:?}", board));
+    }
+    for (fen_rank_idx, rank_str) in ranks.iter().enumerate() {
+        let y = 7 - fen_rank_idx;
+        let mut x = 0usize;
+        for &ch in rank_str.as_bytes() {
+            if ch.is_ascii_digit() {
+                x += (ch - b'0') as usize;
+                continue;
+            }
+            if let Some(c) = white_piece_ch(ch) {
+                if x < 8 {
+                    out[pos_idx(c, y, x)] = 1.0;
+                }
+            } else if ch == b'p' {
+                if x < 8 {
+                    out[pos_idx(6, y, x)] = 1.0;
+                }
+            } else if ch == b'k' {
+                if x < 8 {
+                    out[pos_idx(7, y, x)] = 1.0;
+                }
+            }
+            x += 1;
+        }
+    }
+
+    for entry in overlay.split(',') {
+        let mut it = entry.splitn(2, ':');
+        let sq = match it.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let pieces = match it.next() {
+            Some(p) => p,
+            None => continue,
+        };
+        if pieces.is_empty() {
+            continue;
+        }
+        let sb = sq.as_bytes();
+        if sb.len() < 2 {
+            continue;
+        }
+        let x = sb[0].wrapping_sub(b'a') as usize;
+        let y = sb[1].wrapping_sub(b'1') as usize;
+        if x >= 8 || y >= 8 {
+            continue;
+        }
+        apply_tower_channels(&mut out, x, y, pieces.as_bytes());
+    }
+
+    if turn == b'b' {
+        for v in out[13 * 64..14 * 64].iter_mut() {
+            *v = 1.0;
+        }
+    }
+    Ok(out)
+}
+
+// Return raw f32 bytes (native-endian) so Python wraps them with
+// torch.frombuffer (one buffer) instead of materializing N PyFloats — the dense
+// list return was ~0.7-0.85x Python; bytes makes the Rust path a real win.
+fn f32_to_pybytes<'py>(py: Python<'py>, v: &[f32]) -> Bound<'py, PyBytes> {
+    let buf: Vec<u8> = v.iter().flat_map(|x| x.to_ne_bytes()).collect();
+    PyBytes::new_bound(py, &buf)
+}
+
+#[pyfunction]
+fn encode_position<'py>(py: Python<'py>, fen: &str) -> PyResult<Bound<'py, PyBytes>> {
+    let out = encode_position_native(fen).map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Ok(f32_to_pybytes(py, &out))
+}
+
+#[pyfunction]
+fn encode_move<'py>(py: Python<'py>, mv: &Bound<'_, PyDict>) -> PyResult<Bound<'py, PyBytes>> {
+    let mut out = vec![0.0f32; ENC_MOVE_D];
+
+    let from: String = mv
+        .get_item("from")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("from"))?
+        .extract()?;
+    let to: String = mv
+        .get_item("to")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("to"))?
+        .extract()?;
+    if let Some(idx) = sq_index(&from) {
+        out[idx] = 1.0;
+    }
+    if let Some(idx) = sq_index(&to) {
+        out[64 + idx] = 1.0;
+    }
+
+    if dget(mv, "capture")?.is_some() {
+        out[128] = 1.0;
+    }
+    let waypoints: Vec<String> = match dget(mv, "waypoints")? {
+        Some(v) => v.extract().unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if !waypoints.is_empty() {
+        out[129] = 1.0;
+    }
+    let deploy_count: Option<i64> = match dget(mv, "deployCount")? {
+        Some(v) => Some(v.extract()?),
+        None => None,
+    };
+    if deploy_count.is_some() {
+        out[130] = 1.0;
+    }
+    let demotions: Option<i64> = match dget(mv, "demotionsRequired")? {
+        Some(v) => Some(v.extract()?),
+        None => None,
+    };
+    if demotions.is_some() {
+        out[131] = 1.0;
+    }
+
+    out[132] = (waypoints.len() as f64 / 8.0) as f32;
+    out[133] = (deploy_count.unwrap_or(0) as f64 / 24.0) as f32;
+    out[134] = (demotions.unwrap_or(0) as f64 / 8.0) as f32;
+
+    let promo: Option<String> = match dget(mv, "promotion")? {
+        Some(v) => Some(v.extract()?),
+        None => None,
+    };
+    out[135 + promo.as_deref().map(promo_index).unwrap_or(0)] = 1.0;
+
+    for w in &waypoints {
+        let wb = w.as_bytes();
+        if wb.len() != 2 {
+            continue;
+        }
+        if let (Some(f10), Some(r10)) = (file10(wb[0]), rank10(wb[1])) {
+            out[140 + r10 * 10 + f10] = 1.0;
+        }
+    }
+    Ok(f32_to_pybytes(py, &out))
+}
+
+// Hot-path leaf encoder: same (14,8,8) output as encode_position(fen), but
+// straight from the State's piece bitboards (mirrors encode_position_state,
+// which the MCTS uses per leaf). White P/N/B/R/Q/K -> ch 0-5, Black Stone-top
+// (pawn bb) -> ch6, King-top (king bb) -> ch7; stacks -> ch 8-12; side -> ch13.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn encode_position_bb<'py>(
+    py: Python<'py>,
+    wp: u64,
+    wn: u64,
+    wb: u64,
+    wr: u64,
+    wq: u64,
+    wk: u64,
+    bp: u64,
+    bk: u64,
+    stacks: &Bound<'_, PyDict>,
+    turn_is_black: bool,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let mut out = vec![0.0f32; ENC_POS_C * 64];
+    for (bb, ch) in [(wp, 0), (wn, 1), (wb, 2), (wr, 3), (wq, 4), (wk, 5), (bp, 6), (bk, 7)] {
+        set_bits_channel(&mut out, bb, ch);
+    }
+    let stacks_rs = parse_stacks(stacks)?;
+    for (sq, pieces) in &stacks_rs {
+        apply_tower_channels(&mut out, (*sq & 7) as usize, (*sq >> 3) as usize, pieces);
+    }
+    if turn_is_black {
+        for v in out[13 * 64..14 * 64].iter_mut() {
+            *v = 1.0;
+        }
+    }
+    Ok(f32_to_pybytes(py, &out))
+}
+
 #[pymodule]
 fn chessckers_movegen(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ping, m)?)?;
@@ -2310,5 +2624,8 @@ fn chessckers_movegen(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(square_attacked_by_black_chessckers, m)?)?;
     m.add_function(wrap_pyfunction!(black_can_capture_white_king, m)?)?;
     m.add_function(wrap_pyfunction!(white_legal_moves, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_position, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_move, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_position_bb, m)?)?;
     Ok(())
 }
