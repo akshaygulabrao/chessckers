@@ -167,9 +167,16 @@ def distance_to_mate(fen: str, max_plies: int = 9) -> int | None:
     return None
 
 
-def best_black_moves(fen: str, max_plies: int = 9) -> list[str]:
-    """UCIs of the optimal (shortest-mate) Black moves from `fen`."""
-    target = distance_to_mate(fen, max_plies)  # iterative deepening; clears _memo
+def best_black_moves(fen: str, max_plies: int = 9, target: int | None = None) -> list[str]:
+    """UCIs of the optimal (shortest-mate) Black moves from `fen`.
+
+    Pass `target` (a known distance-to-mate, e.g. from a prior
+    `distance_to_mate(fen, …)` call) to skip the internal iterative-deepening
+    re-search and reuse the warm `_memo` the caller already built — otherwise
+    the mate is solved twice. With `target=None` the distance is computed here
+    (which clears `_memo` first)."""
+    if target is None:
+        target = distance_to_mate(fen, max_plies)  # iterative deepening; clears _memo
     if target is None:
         return []
     out: list[str] = []
@@ -196,7 +203,8 @@ def main() -> int:
     d = distance_to_mate(args.fen, args.depth)
     print(f"distance-to-mate: {d}" + ("" if d is None else f"  ({(d + 1) // 2} move(s))"))
     if d is not None:
-        print("optimal Black move(s):", best_black_moves(args.fen, args.depth))
+        # Reuse the distance + warm _memo from the search above (don't re-solve).
+        print("optimal Black move(s):", best_black_moves(args.fen, args.depth, target=d))
     return 0
 
 
