@@ -26,6 +26,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -206,11 +207,19 @@ def _expand_with_priors(
 
 
 def _backup(path: list[PuctNode], leaf_value: float) -> None:
+    # Per-ply value discount (env CHESSCKERS_VALUE_DISCOUNT, default 1.0 = off,
+    # the same γ used for the training value target). The leaf keeps its full
+    # value; each step up toward the root multiplies by γ, so a win reached in
+    # fewer plies backs up a larger value at the root and the search prefers
+    # faster mates. `sign` flips per ply for the side-to-move perspective.
+    gamma = float(os.environ.get("CHESSCKERS_VALUE_DISCOUNT", "1.0"))
     sign = 1.0
+    discount = 1.0
     for node in reversed(path):
         node.visits += 1
-        node.total_value += sign * leaf_value
+        node.total_value += sign * discount * leaf_value
         sign = -sign
+        discount *= gamma
 
 
 def _select_to_leaf(root: PuctNode, c_puct: float) -> tuple[list[PuctNode], PuctNode]:

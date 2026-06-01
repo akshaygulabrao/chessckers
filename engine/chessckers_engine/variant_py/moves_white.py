@@ -55,6 +55,20 @@ def white_legal_moves(state: State) -> list[dict[str, Any]]:
     check predicate (defined below)."""
     if state.board.turn != chess.WHITE:
         return []
+    if _rs_movegen is not None:
+        # Native fast path: one Rust call generates + check-filters all White
+        # moves on its own bitboards, eliminating the per-pseudo-move
+        # python-chess apply/copy churn that dominated self-play (see the
+        # equivalence harness tests/test_white_rust_equiv.py for parity).
+        b = state.board
+        return _rs_movegen.white_legal_moves(
+            b.occupied,
+            b.occupied_co[chess.WHITE],
+            b.pawns, b.knights, b.bishops, b.rooks, b.queens, b.kings,
+            b.castling_rights,
+            -1 if b.ep_square is None else b.ep_square,
+            state.stacks,
+        )
     out: list[dict[str, Any]] = []
     for move in state.board.pseudo_legal_moves:
         # Apply tentatively and reject if it leaves white-king in
@@ -102,6 +116,11 @@ def _on_board(f: int, r: int) -> bool:
     return 0 <= f <= 7 and 0 <= r <= 7
 
 
+def _on_grid(f: int, r: int) -> bool:
+    """The 10×10 grid: the 8×8 board plus the one-square rim ring."""
+    return -1 <= f <= 8 and -1 <= r <= 8
+
+
 def _square_owner(board: chess.Board, sq: int) -> int:
     """0 = empty, 1 = white, 2 = black. Inline-equivalent of moves_black._owner."""
     mask = chess.BB_SQUARES[sq]
@@ -134,9 +153,12 @@ def _square_attacked_by_black_chessckers_py(state: State, target_sq: int) -> boo
         Black DOES block.
       - Orthogonal charge (king-top only, n_kings ≥ 2): path squares
         1..n_kings-1 in any orthogonal direction = capture if the charge
-        can extend at least one square past the target (so landing is
-        on-board). White path = free path-cap, doesn't block. Friendly
-        Black blocks.
+        can extend at least one square past the target. The landing past
+        the target may be a board square OR a rim square (an overshoot
+        charge that rim-lands and falls back still captures the target in
+        transit — this is how a King-top tower checks a White king sitting
+        on a board edge directly ahead of it). White path = free path-cap,
+        doesn't block. Friendly Black blocks.
 
     Doesn't model rim-bounce diagonals — those produce additional attack
     squares for tall towers in corner positions. Can be added later if
@@ -181,11 +203,14 @@ def _square_attacked_by_black_chessckers_py(state: State, target_sq: int) -> boo
                         break
                     nsq = chess.square(nf, nr)
                     if nsq == target_sq:
-                        # Need a legal landing past the target (charge to k+1
-                        # must reach an on-board square).
+                        # Need a legal landing past the target (charge to k+1).
+                        # The landing may be a board square or a rim square: an
+                        # overshoot charge that rim-lands then falls back still
+                        # captures the target in transit (§3C). Off-grid (beyond
+                        # the rim) is not a legal charge landing.
                         nf2 = sf + (k + 1) * df
                         nr2 = sr + (k + 1) * dr
-                        if _on_board(nf2, nr2):
+                        if _on_grid(nf2, nr2):
                             return True
                         break
                     o = _square_owner(board, nsq)

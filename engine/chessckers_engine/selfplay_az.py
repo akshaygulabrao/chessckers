@@ -155,7 +155,7 @@ def play_az_game(
     n_sims: int = 100,
     c_puct: float = 1.5,
     temperature: float = 1.0,
-    max_plies: int = 400,
+    max_plies: int | None = None,
     rng: torch.Generator | None = None,
     dirichlet_alpha: float | None = 0.3,
     dirichlet_eps: float = 0.25,
@@ -173,6 +173,10 @@ def play_az_game(
     event so a spectator UI can follow training. `sink_context` is merged
     into every snapshot/log emitted (e.g. {iter, game_idx, total_games}).
     """
+    if max_plies is None:
+        # Env-overridable so experiments (e.g. a tiny endgame) can cap drawn
+        # games short without threading a flag through every call site.
+        max_plies = int(os.environ.get("CHESSCKERS_MAX_PLIES", "400"))
     state = client.new_game()
     records: list[AZRecord] = []
     history: list[dict[str, str]] = []  # [{fen, uci}], same schema as games.jsonl
@@ -244,8 +248,18 @@ def _emit_game_end(
     })
 
 
-def az_game_to_examples(game: AZGame) -> list[AZExample]:
-    """Convert an AZGame to dual-target training examples."""
+def az_game_to_examples(game: AZGame, gamma: float | None = None) -> list[AZExample]:
+    """Convert an AZGame to dual-target training examples.
+
+    `gamma` is a per-ply value discount (env `CHESSCKERS_VALUE_DISCOUNT`,
+    default 1.0 = off). The value target is scaled by `gamma**(plies-to-end)`,
+    so the position one move before mate keeps the full ±1 while earlier
+    positions decay toward 0. This gives the value head — and hence MCTS and
+    the policy — an incentive to win *faster*: a mate-in-1 line scores higher
+    than a mate-in-3, which flat ±1 targets cannot distinguish. (Symmetric:
+    the losing side's target also decays, so it learns to delay the loss.)"""
+    if gamma is None:
+        gamma = float(os.environ.get("CHESSCKERS_VALUE_DISCOUNT", "1.0"))
     if game.outcome == "draw":
         v_white, v_black = 0.0, 0.0
     elif game.outcome == "white":
@@ -254,10 +268,12 @@ def az_game_to_examples(game: AZGame) -> list[AZExample]:
         v_white, v_black = -1.0, 1.0
 
     out: list[AZExample] = []
-    for rec in game.records:
+    n = len(game.records)
+    for i, rec in enumerate(game.records):
         total = sum(rec.visit_counts) or 1
         dist = [v / total for v in rec.visit_counts]
-        target_v = v_white if rec.side_to_move == "white" else v_black
+        base = v_white if rec.side_to_move == "white" else v_black
+        target_v = base * (gamma ** (n - 1 - i))
         out.append(
             AZExample(
                 fen=rec.fen,

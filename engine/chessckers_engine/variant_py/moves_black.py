@@ -918,15 +918,24 @@ def _apply_charge(state: State, move: dict[str, Any]) -> None:
     df_sign = (df // d) if d else 0
     dr_sign = (dr // d) if d else 0
 
-    # Capture path Whites at steps 1..d-1.
-    for k in range(1, d):
+    # An overshoot charge (`waypoints` carries the rim landing key) actually
+    # travels one square past `to`: it lands on the rim and falls back to `to`.
+    # Its true distance is d+1, and `to` (step d) was itself a path square — so
+    # any White there (e.g. a king on a board edge directly ahead) is a path
+    # capture, NOT a ram. A plain on-board charge captures steps 1..d-1 and may
+    # ram a White sitting on `to`.
+    is_rim_overshoot = bool(move.get("waypoints"))
+    last_step = d if is_rim_overshoot else d - 1
+
+    # Capture path Whites.
+    for k in range(1, last_step + 1):
         f = chess.square_file(from_sq) + k * df_sign
         r = chess.square_rank(from_sq) + k * dr_sign
         sq = chess.square(f, r)
         if _owner(state.board, sq) == SQ_WHITE:
             state.board.remove_piece_at(sq)
 
-    is_ram = _owner(state.board, to_sq) == SQ_WHITE
+    is_ram = (not is_rim_overshoot) and _owner(state.board, to_sq) == SQ_WHITE
     if is_ram:
         # Tower destroyed at landing; landing White stays.
         state.stacks.pop(from_sq, None)
@@ -1150,6 +1159,11 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
                 if tf < -1 or tf > 8 or tr < -1 or tr > 8:
                     break  # off-grid landing; higher d also off-grid
                 # Determine landing classification: board / rim-with-fallback.
+                # `rim_landing_key` is the on-grid key of the actual rim
+                # landing for an overshoot charge (None for an on-board land);
+                # it disambiguates the notation (`e2e0->e1` vs a ram `e2e1`)
+                # and flags the move for apply.
+                rim_landing_key: str | None = None
                 if 0 <= tf <= 7 and 0 <= tr <= 7:
                     to_sq = chess.square(tf, tr)
                     to_name = _SQ_NAME[to_sq]
@@ -1168,6 +1182,7 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
                         # one square from rim AND the only step IS rim;
                         # fallback square == origin, which is a no-op.
                         continue
+                    rim_landing_key = _coord_to_key(tf, tr)
                     to_sq = last_on_board_sq
                     to_name = _SQ_NAME[to_sq]
                     # The fallback square is always empty: either it was
@@ -1176,6 +1191,17 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
                     towner = SQ_EMPTY
                     is_ram = False
                     is_friendly_merge = False
+
+                # Notation: an overshoot charge spells out the rim landing it
+                # aimed at, then `->` its on-board resting square, so the
+                # intent (charge to the rim, capturing in transit) is explicit
+                # and never reads as a ram. `waypoints` carries the rim key —
+                # it is both the apply flag and the policy-encoding key.
+                landing_repr = (
+                    to_name if rim_landing_key is None
+                    else f"{rim_landing_key}->{to_name}"
+                )
+                charge_waypoints = None if rim_landing_key is None else [rim_landing_key]
 
                 # Capture-field convention (scalachess parity).
                 if path_captures:
@@ -1220,13 +1246,13 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
                         new_pieces[pos - 1] = "S"
                     resulting_top = new_pieces[-1]
                     moves.append({
-                        "uci": f"{from_name}{to_name}",
+                        "uci": f"{from_name}{landing_repr}",
                         "from": from_name,
                         "to": to_name,
                         "piece": _piece_name(resulting_top),
                         "color": "black",
                         "capture": capture_field,
-                        "waypoints": None,
+                        "waypoints": charge_waypoints,
                         "chainHops": None,
                         "promotion": None,
                         "demotedKings": None,
@@ -1244,13 +1270,13 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
                         resulting_top = new_pieces[-1]
                         choice_str = ",".join(str(x) for x in choice_sorted)
                         moves.append({
-                            "uci": f"{from_name}{to_name}{{{choice_str}}}",
+                            "uci": f"{from_name}{landing_repr}{{{choice_str}}}",
                             "from": from_name,
                             "to": to_name,
                             "piece": _piece_name(resulting_top),
                             "color": "black",
                             "capture": capture_field,
-                            "waypoints": None,
+                            "waypoints": charge_waypoints,
                             "chainHops": None,
                             "promotion": None,
                             "demotedKings": choice_sorted,

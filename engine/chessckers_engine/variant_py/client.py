@@ -1,22 +1,14 @@
-"""`PyVariantClient` — drop-in replacement for `ServerClient`.
+"""`PyVariantClient` — the engine's in-process game API.
 
-Surface mirrors `chessckers_engine.server_client.ServerClient`: every public
-method takes the same arguments and returns the same JSON-shaped dicts that
-scalachess returns over HTTP. This lets the engine swap between scalachess
-(via `ServerClient`) and pure-Python (via `PyVariantClient`) without any
-caller changes.
-
-Implementation is incremental:
-- new_game(fen) returns the right shape (fen/turn/check/status/winner) but
-  with an empty `legalMoves` list until the move generators land.
-- make_move / moves_at / chain_step / chain_end still raise NotImplementedError.
-
-The differential test harness in `tests/test_pyvariant_diff.py` exercises
-each method against scalachess on identical FENs and asserts identical
-outputs.
+Every method returns the JSON-shaped dicts the rest of the engine is written
+against (`fen`/`turn`/`check`/`status`/`winner`/`legalMoves`/`stacks`); that
+dict shape is the stable contract for MCTS, self-play, and rendering. The
+engine is stateless — each call carries the full FEN.
 """
 from __future__ import annotations
 
+import os
+import random
 from typing import Any
 
 import chess
@@ -44,6 +36,24 @@ if __import__("os").environ.get("CHESSCKERS_NO_RUST"):
     _rs_movegen = None
 from chessckers_engine.variant_py.state import STARTING_FEN, State, parse_fen, serialize_fen
 
+
+def _default_start_fen() -> str:
+    """Start FEN used by `new_game()` when no `fen` is passed. Overridable via
+    the `CHESSCKERS_START_FEN` env var so experiments can pin a custom start
+    position (e.g. an endgame) without threading a start_fen through every call
+    site (self-play, eval, workers all go through `new_game()`).
+
+    The env var may hold several FENs separated by `;` (which never occurs in a
+    FEN); each `new_game()` then samples one uniformly. This interleaves a
+    curriculum across games — mixing solved shallow mates with the deep target
+    keeps the easy lessons in the replay buffer (anti-forgetting). Repeat a FEN
+    in the list to weight it (e.g. list the hard position twice for 2× odds)."""
+    raw = os.environ.get("CHESSCKERS_START_FEN", STARTING_FEN)
+    if ";" not in raw:
+        return raw
+    choices = [f.strip() for f in raw.split(";") if f.strip()]
+    return random.choice(choices) if choices else STARTING_FEN
+
 GameState = dict[str, Any]
 HopDTO = dict[str, Any]
 ChainStepResponse = dict[str, Any]
@@ -52,22 +62,17 @@ ChainStepResponse = dict[str, Any]
 def _detect_status(state: State) -> tuple[str | None, str | None]:
     """Return (status, winner) for the given state.
 
-    Detection paths:
+    Detection paths handled here (cheap, no move-gen):
     - Black eliminated → variantEnd / winner=white.
-    - White's king is checkmated → mate / winner=black.
     - White's king captured during a Black chain → variantEnd / winner=black.
-    - Black stalemate (no legal moves) is detected in _state_to_dict after
-      move-gen, since it needs the full move list."""
+    White checkmate/stalemate and Black stalemate need the full legal-move
+    list, so they're detected in _state_to_dict after move generation. (Mate
+    uses the Chessckers check predicate, NOT python-chess's FIDE is_checkmate,
+    which wrongly treats an adjacent Black King as giving check.)"""
     if not state.stacks:
         return ("variantEnd", "white")
     if state.board.king(chess.WHITE) is None:
         return ("variantEnd", "black")
-    if state.board.turn == chess.WHITE:
-        try:
-            if state.board.is_checkmate():
-                return ("mate", "black")
-        except Exception:  # noqa: BLE001
-            pass
     return (None, None)
 
 
@@ -89,6 +94,14 @@ def _state_to_dict(state: State, fen_override: str | None = None) -> GameState:
     status, winner = _detect_status(state)
     if state.board.turn == chess.WHITE:
         legal_moves = white_legal_moves(state)
+        # White with no legal move (Chessckers, not FIDE):
+        #   * in Chessckers-check  → "mate"      → Black wins (king is trapped);
+        #   * not in check         → "stalemate" → DRAW (White is stuck but its
+        #     king cannot be captured). Stalemate is asymmetric: White stalemate
+        #     draws, Black stalemate (below) is a White win.
+        # (Matches the status_and_legal fast path; the two must agree.)
+        if not legal_moves and status is None:
+            status, winner = ("mate", "black") if check else ("stalemate", None)
     else:
         all_moves = (
             black_diagonal_quiet_moves(state)
@@ -112,11 +125,9 @@ def _state_to_dict(state: State, fen_override: str | None = None) -> GameState:
 
 
 class PyVariantClient:
-    """Same surface as `ServerClient` but evaluates positions in-process.
-
-    Constructor takes optional kwargs for parity with `ServerClient` so the
-    same construction sites work; `base_url`/`timeout` are accepted and
-    ignored."""
+    """Evaluates positions in-process; the engine is stateless (each call
+    carries the full FEN). `base_url`/`timeout` are vestigial kwargs, accepted
+    and ignored so older construction sites still work."""
 
     def __init__(self, base_url: str | None = None, timeout: float | None = None) -> None:
         del base_url, timeout
@@ -138,7 +149,7 @@ class PyVariantClient:
         verbatim (matching scalachess's parse-time behavior — useful for
         positions where canonicalization would diverge, e.g. `KQkq` →
         `KQ`)."""
-        input_fen = fen if fen is not None else STARTING_FEN
+        input_fen = fen if fen is not None else _default_start_fen()
         state = parse_fen(input_fen)
         return _state_to_dict(state, fen_override=input_fen)
 

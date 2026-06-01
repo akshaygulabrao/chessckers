@@ -159,7 +159,11 @@ def _eval_game_subprocess(payload: dict) -> str:
     vs-random eval, one side is a path and the other is None.
 
     Top-level so it can be pickled for spawn() workers."""
+    import os as _os
+
     import torch as _torch
+
+    _torch.set_num_threads(int(_os.environ.get("CHESSCKERS_TORCH_THREADS", "1")))
 
     from chessckers_engine.checkpoints import load_checkpoint
     from chessckers_engine.evaluate import play_game as _play_game
@@ -201,7 +205,15 @@ def _play_game_subprocess(payload: dict):
     Top-level so it can be pickled for spawn() workers (closures can't)."""
     # Imports here so the worker doesn't pay them at fork time, and so any
     # import errors surface inside the worker rather than during pool setup.
+    import os as _os
+
     import torch as _torch
+
+    # One torch thread per worker process. With N process workers, the default
+    # (≈num_cores intra-op threads × N processes) oversubscribes the CPU — which
+    # both slows self-play AND destabilizes the spawn pool (the broken-pipe
+    # crash). Measured: threads=1 gives clean ~linear scaling to the core count.
+    _torch.set_num_threads(int(_os.environ.get("CHESSCKERS_TORCH_THREADS", "1")))
 
     from chessckers_engine.checkpoints import load_checkpoint
     from chessckers_engine.inference_server import InferenceServer as _IS
@@ -614,7 +626,12 @@ def run_az_iterations(
         # eval vs random both ways (uses the latest trained model). Sims here
         # are decoupled from self-play sims — eval is the regression check, so
         # we want enough search depth to make the result trustworthy.
-        if effective_mode == "processes" and model_arch is not None:
+        if eval_games <= 0:
+            # Eval disabled (--eval-games 0): skip the per-iteration vs-random
+            # regression check entirely so long self-play runs aren't held up
+            # by it. The self-play W/B/D column still gives a per-iter signal.
+            as_white = as_black = {"white": 0, "black": 0, "draw": 0}
+        elif effective_mode == "processes" and model_arch is not None:
             # Parallel path: stage current model to disk, run both eval blocks in
             # subprocess pools. None for the random side.
             eval_state = weights_dir / "_eval_state.pt"
