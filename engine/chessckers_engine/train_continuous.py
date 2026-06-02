@@ -273,8 +273,11 @@ def main() -> int:
             ckpt_n += 1
             ckpt = run_dir / f"iter-async-{ckpt_n:04d}.pt"
             save_checkpoint(model, ckpt)
-            log.info("checkpoint saved -> %s | step %d games_seen=%d/%s buf=%d | policy=%.4f value=%.4f mlh=%.4f | %.1f steps/s",
-                     ckpt.name, steps, games_seen, (args.max_games or "inf"), len(buf),
+            arch_stat = (f" archived={archive.games_written}" if archive and archive.enabled
+                         else " archived=off" if not archive
+                         else " archived=DISABLED")  # best-effort archive dropped out mid-run
+            log.info("checkpoint saved -> %s | step %d games_seen=%d/%s buf=%d%s | policy=%.4f value=%.4f mlh=%.4f | %.1f steps/s",
+                     ckpt.name, steps, games_seen, (args.max_games or "inf"), len(buf), arch_stat,
                      win_p / max(win_steps, 1), win_v / max(win_steps, 1), win_m / max(win_steps, 1),
                      win_steps / max(now - last_ckpt, 1e-9))
             win_p = win_v = win_m = 0.0; win_steps = 0; last_ckpt = now
@@ -284,8 +287,9 @@ def main() -> int:
     stop_path.touch()  # signal local self-play workers (shared run-dir STOP) + the sidecar to tear down
     _publish(model, weights_path)
     save_checkpoint(model, run_dir / "iter-async-final.pt")
-    log.info("stopped: %d steps, %d games seen, %d positions ingested (STOP signaled)",
-             steps, games_seen, positions_ingested)
+    log.info("stopped: %d steps, %d games seen, %d positions ingested, %d games archived (STOP signaled)",
+             steps, games_seen, positions_ingested,
+             archive.games_written if archive else 0)
     return 0
 
 
