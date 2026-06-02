@@ -18,7 +18,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # -> engine/
 
 export CHESSCKERS_START_FEN="${CHESSCKERS_START_FEN:-8/8/8/8/8/3kk3/8/4K3[d3:kk,e3:kk] b - - 0 1}"
-export CHESSCKERS_MAX_PLIES="${CHESSCKERS_MAX_PLIES:-80}"
+export CHESSCKERS_MAX_PLIES="${CHESSCKERS_MAX_PLIES:-200}"
 export CHESSCKERS_VALUE_DISCOUNT="${CHESSCKERS_VALUE_DISCOUNT:-0.98}"
 OUT="${OUT:-weights/run}"
 # True-parallel self-play: multiprocess workers, one torch thread each (set in

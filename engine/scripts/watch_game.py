@@ -13,7 +13,7 @@ variation. Defaults to the latest ckpt.
 
   cd engine
   .venv/bin/python scripts/watch_game.py "8/8/8/8/3kk3/8/8/4K3[d4:kk,e4:kk] b - - 0 1"
-  # options: --weights X.pt  --sims 400  --max-plies 80  --device cpu|mps  --delay 0.5
+  # options: --weights X.pt  --sims 400  --max-plies 200  --device cpu|mps  --delay 0.5
 """
 from __future__ import annotations
 
@@ -123,7 +123,7 @@ def main() -> int:
                          "played move stays argmax of visits. 0 = pure greedy/deterministic.")
     ap.add_argument("--seed", type=int, default=-1,
                     help="rng seed (default: random each run, so games vary)")
-    ap.add_argument("--max-plies", type=int, default=80)
+    ap.add_argument("--max-plies", type=int, default=200)
     ap.add_argument("--device", default="cpu", help="cpu|mps|cuda (default cpu)")
     ap.add_argument("--delay", type=float, default=0.0, help="extra pause between plies, seconds")
     args = ap.parse_args()
