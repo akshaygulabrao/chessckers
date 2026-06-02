@@ -33,6 +33,7 @@ PY="$ENG/.venv/bin/python"
 # ---- run config (edit here) ----
 RUN_DIR="$ENG/weights/run"                          # reused across runs
 LOG=/tmp/cc_train.log                               # SINGLE unified log: trainer + workers + leena_sync
+COUNTER=/tmp/cc_gamecount                           # shared game counter; reset per launch so #N starts at 1
 ARCHIVE_DIR="/Volumes/hd0/chessckers_archive/run"   # reused -> primes the buffer from old games
 BUFFER_CAP=300000          # replay window (was 50000); RAM-resident, ~450 MB
 MIN_BUFFER=2000
@@ -60,8 +61,9 @@ fi
 log "next run (weights/run): $N_SEEDS seeds | buffer_cap=$BUFFER_CAP | max_plies=$MAX_PLIES | arch ${DHID}/${CFIL}/${NBLK}"
 log "seed mix: $SEED_MIX"
 run "mkdir -p '$RUN_DIR/buffer'"
-run ": > '$LOG'"   # fresh unified log for this run
-log "unified log -> $LOG"
+run ": > '$LOG'"        # fresh unified log for this run
+run ": > '$COUNTER'"    # restart the shared game counter (next game = #1)
+log "unified log -> $LOG | game counter reset"
 
 # ---- snapshot the finished run's net -> --base, preserve its checkpoints ----
 BASE="$ENG/weights/base_curriculum_v4.pt"
