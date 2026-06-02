@@ -18,6 +18,9 @@
 #      its workers and start the local leena_sync sidecar. If leena is asleep /
 #      off-network, warn and continue LOCAL-ONLY (never aborts the run).
 #
+# All three writers (trainer, workers, leena_sync) share ONE log: /tmp/cc_train.log
+# (truncated fresh at each launch). Follow the whole run with: tail -f /tmp/cc_train.log
+#
 #   scripts/launch_next.sh            # start the new run (local + leena)
 #   SKIP_LEENA=1 scripts/launch_next.sh   # local only
 #   DRY_RUN=1 scripts/launch_next.sh  # print the commands, change nothing
@@ -29,6 +32,7 @@ PY="$ENG/.venv/bin/python"
 
 # ---- run config (edit here) ----
 RUN_DIR="$ENG/weights/run"                          # reused across runs
+LOG=/tmp/cc_train.log                               # SINGLE unified log: trainer + workers + leena_sync
 ARCHIVE_DIR="/Volumes/hd0/chessckers_archive/run"   # reused -> primes the buffer from old games
 BUFFER_CAP=300000          # replay window (was 50000); RAM-resident, ~450 MB
 MIN_BUFFER=2000
@@ -56,6 +60,8 @@ fi
 log "next run (weights/run): $N_SEEDS seeds | buffer_cap=$BUFFER_CAP | max_plies=$MAX_PLIES | arch ${DHID}/${CFIL}/${NBLK}"
 log "seed mix: $SEED_MIX"
 run "mkdir -p '$RUN_DIR/buffer'"
+run ": > '$LOG'"   # fresh unified log for this run
+log "unified log -> $LOG"
 
 # ---- snapshot the finished run's net -> --base, preserve its checkpoints ----
 BASE="$ENG/weights/base_curriculum_v4.pt"
@@ -82,7 +88,7 @@ run "cd '$ENG' && nohup '$PY' -m chessckers_engine.train_continuous \
   --replay-factor 8 --batch-size 256 --lr 1e-3 \
   --publish-seconds 45 --ckpt-seconds 120 \
   --device auto --d-hidden $DHID --c-filters $CFIL --n-blocks $NBLK \
-  > '$RUN_DIR/trainer.log' 2>&1 & echo \$! > '$RUN_DIR/trainer.pid'"
+  >> '$LOG' 2>&1 & echo \$! > '$RUN_DIR/trainer.pid'"
 
 sleep 2  # let the trainer publish initial weights.pt before workers poll
 log "starting local workers (new seed mix, ${MAX_PLIES}-ply cap)…"
@@ -94,13 +100,13 @@ run "cd '$ENG' && CHESSCKERS_START_FEN='$SEED_MIX' CHESSCKERS_MAX_PLIES=$MAX_PLI
   --d-hidden $DHID --c-filters $CFIL --n-blocks $NBLK \
   --temperature 1.0 --dirichlet-alpha 0.5 --dirichlet-eps 0.40 \
   --max-plies $MAX_PLIES --weights-poll-seconds 20 --seed 1000 \
-  > '$RUN_DIR/workers.log' 2>&1 & echo \$! > '$RUN_DIR/workers.pid'"
+  >> '$LOG' 2>&1 & echo \$! > '$RUN_DIR/workers.pid'"
 
 # ---- leena (best-effort: never abort the local run) ----
 LEENA="${LEENA:-leenagulabrao@Leenas-MacBook-Air.local}"   # Bonjour — survives DHCP changes
 SSH_LEENA="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
 LSYNC="$ENG/scripts/leena_sync.sh"
-leena_manual="scp '$REPO_ROOT/scripts/seed_mix.txt' '$ENG/scripts/leena_launch.sh' '$LEENA:chessckers/' && $SSH_LEENA '$LEENA' 'bash ~/chessckers/leena_launch.sh' && nohup bash '$LSYNC' >/tmp/cc_leena_sync.log 2>&1 &"
+leena_manual="scp '$REPO_ROOT/scripts/seed_mix.txt' '$ENG/scripts/leena_launch.sh' '$LEENA:chessckers/' && $SSH_LEENA '$LEENA' 'bash ~/chessckers/leena_launch.sh' && nohup bash '$LSYNC' >>'$LOG' 2>&1 &"
 
 if [ "${SKIP_LEENA:-0}" = 1 ]; then
   log "leena: skipped (SKIP_LEENA=1)"
@@ -111,8 +117,8 @@ elif $SSH_LEENA "$LEENA" true 2>/dev/null; then
   if scp -q "$REPO_ROOT/scripts/seed_mix.txt" "$ENG/scripts/leena_launch.sh" "$LEENA:chessckers/" 2>/dev/null \
      && $SSH_LEENA "$LEENA" 'pkill -f selfplay_workers_only 2>/dev/null; pkill -f multiprocessing.spawn 2>/dev/null; sleep 1; bash ~/chessckers/leena_launch.sh'; then
     pkill -f "$LSYNC" 2>/dev/null || true              # drop any stale sidecar from the prior run
-    nohup bash "$LSYNC" >/tmp/cc_leena_sync.log 2>&1 &
-    log "leena: workers launched + sync sidecar started (pid $!) -> /tmp/cc_leena_sync.log"
+    nohup bash "$LSYNC" >>"$LOG" 2>&1 &
+    log "leena: workers launched + sync sidecar started (pid $!)"
   else
     log "leena: deploy/launch FAILED — continuing local-only. Retry: $leena_manual"
   fi
@@ -121,4 +127,4 @@ else
   log "       once it's up:  $leena_manual"
 fi
 
-log "done. follow: tail -f $RUN_DIR/trainer.log"
+log "done. follow: tail -f $LOG"
