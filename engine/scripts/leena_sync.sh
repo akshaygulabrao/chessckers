@@ -9,7 +9,7 @@
 set -uo pipefail
 LEENA=leenagulabrao@Leenas-MacBook-Air.local   # Bonjour hostname — survives leena's DHCP IP changes
 ENG=/Users/ox/AAworkspace/chessckers/engine
-RUN_DIR="${RUN_DIR:-$ENG/weights/run-frontier}"  # local trainer run-dir (override per run); must match launch_next.sh
+RUN_DIR="${RUN_DIR:-$ENG/weights/run}"           # local trainer run-dir (override per run); must match launch_next.sh
 INGEST="$RUN_DIR/buffer"
 WEIGHTS="$RUN_DIR/weights.pt"
 LOG=/tmp/cc_train.log
