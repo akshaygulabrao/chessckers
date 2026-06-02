@@ -18,7 +18,8 @@ def _ex(value: float = 0.0) -> AZExample:
         fen=f"fen-{value}",
         legal_moves=[{"uci": "a1a2"}],
         visit_distribution=[1.0],
-        value_target=value,
+        wdl_target=[0.0, 1.0, 0.0],
+        moves_left_target=value,  # identifier for tracing through sampling
     )
 
 
@@ -36,7 +37,7 @@ def test_sample_returns_correct_count(tmp_path: Path):
     sample = buf.sample(batch_size=10, rng=random.Random(0))
     assert len(sample) == 10
     # All sampled examples come from the appended set.
-    values = {ex.value_target for ex in sample}
+    values = {ex.moves_left_target for ex in sample}
     assert values <= {0.0, 1.0, -1.0}
 
 
@@ -125,7 +126,8 @@ def test_pickle_roundtrip_preserves_az_example(tmp_path: Path):
         fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         legal_moves=[{"uci": "e2e4", "from": "e2", "to": "e4"}],
         visit_distribution=[1.0],
-        value_target=0.7,
+        wdl_target=[0.2, 0.3, 0.5],
+        moves_left_target=0.7,
     )
     buf = ReplayBuffer(tmp_path)
     buf.append_game(0, 1, [original])
@@ -133,4 +135,5 @@ def test_pickle_roundtrip_preserves_az_example(tmp_path: Path):
     assert sampled.fen == original.fen
     assert sampled.legal_moves == original.legal_moves
     assert sampled.visit_distribution == original.visit_distribution
-    assert sampled.value_target == pytest.approx(original.value_target)
+    assert sampled.wdl_target == original.wdl_target
+    assert sampled.moves_left_target == pytest.approx(original.moves_left_target)

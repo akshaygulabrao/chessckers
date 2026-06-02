@@ -39,45 +39,66 @@ class AZTrainResult:
 def _example_loss(
     model: ChesskersScorer,
     example: AZExample,
-    policy_loss_fn: nn.Module,
-    value_loss_fn: nn.Module,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    policy_loss_fn: nn.Module | None = None,
+    value_loss_fn: nn.Module | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-example reference loss: (policy CE, WDL value CE, moves-left MSE).
+    Mirrors _batch_loss for a singleton batch (bit-identical). Reference/test
+    only — the training loop uses _batch_loss. The *_loss_fn args are accepted
+    for backward-compat but unused (WDL uses cross-entropy)."""
     device = next(model.parameters()).device
     pos = encode_position(example.fen).unsqueeze(0).to(device)
     moves = torch.stack([encode_move(m) for m in example.legal_moves]).to(device)
     target_dist = torch.tensor(example.visit_distribution, dtype=torch.float32, device=device)
-    target_value = torch.tensor(example.value_target, dtype=torch.float32, device=device)
+    pos_emb = model.position_trunk(pos)                              # (1, d_hidden)
+    n = moves.shape[0]
+    logits = model.head(
+        torch.cat([pos_emb.expand(n, -1), model.move_encoder(moves)], dim=1)
+    ).squeeze(-1)
+    policy_loss = -(target_dist * torch.log_softmax(logits, dim=0)).sum()
+    wdl_logits = model.value_head(pos_emb)                           # (1, 3)
+    wdl_target = torch.tensor([example.wdl_target], dtype=torch.float32, device=device)
+    value_loss = -(wdl_target * torch.log_softmax(wdl_logits, dim=1)).sum(dim=1).mean()
+    ml_pred = model.moves_left_head(pos_emb).squeeze(-1)
+    ml_target = torch.tensor([example.moves_left_target], dtype=torch.float32, device=device)
+    mlh_loss = nn.functional.mse_loss(ml_pred / MLH_TARGET_SCALE, ml_target / MLH_TARGET_SCALE)
+    return policy_loss, value_loss, mlh_loss
 
-    logits, value = model.policy_and_value(pos, moves)
-    log_probs = torch.log_softmax(logits, dim=0)
-    # Cross-entropy with a soft target: -sum(target_i * log_prob_i)
-    policy_loss = -(target_dist * log_probs).sum()
-    value_loss = value_loss_fn(value, target_value)
-    return policy_loss, value_loss
+
+# Normalize the moves-left target (~game length in plies) so its MSE sits at
+# ~O(1), comparable to the policy/value losses.
+MLH_TARGET_SCALE = 40.0
 
 
 def _batch_loss(
     model: ChesskersScorer,
     batch: list[AZExample],
-    value_loss_fn: nn.Module,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mini-batched loss: trunk + value head batched in one forward; policy
-    head runs per-position because legal-move counts are ragged. Returns
-    (policy_loss, value_loss) — both means over the batch (so the gradient
-    magnitude is independent of batch size, matching standard mini-batch SGD)."""
+    value_loss_fn: nn.Module | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Mini-batched loss: trunk batched in one forward; WDL value head (cross-
+    entropy vs the one-hot outcome) + moves-left head (MSE on scaled plies-to-
+    end) batched; policy head per-position (ragged move counts). Returns
+    (policy_loss, value_loss, mlh_loss), each a mean over the batch.
+    `value_loss_fn` is accepted for backward-compat but unused (WDL uses CE)."""
     device = next(model.parameters()).device
     positions = torch.stack(
         [encode_position(ex.fen) for ex in batch]
     ).to(device)                                                # (B, C, 8, 8)
-    target_values = torch.tensor(
-        [ex.value_target for ex in batch],
-        dtype=torch.float32, device=device,
-    )                                                            # (B,)
 
-    # Trunk + value head, batched.
+    # Trunk once, then the two scalar-ish heads batched.
     pos_emb = model.position_trunk(positions)                    # (B, d_hidden)
-    values = model.value_head(pos_emb).squeeze(-1)               # (B,)
-    value_loss = value_loss_fn(values, target_values)            # mean MSE
+    # WDL value: cross-entropy against the one-hot Win/Draw/Loss outcome.
+    wdl_logits = model.value_head(pos_emb)                       # (B, 3)
+    wdl_targets = torch.tensor(
+        [ex.wdl_target for ex in batch], dtype=torch.float32, device=device,
+    )                                                            # (B, 3)
+    value_loss = -(wdl_targets * torch.log_softmax(wdl_logits, dim=1)).sum(dim=1).mean()
+    # Moves-left: MSE on scaled plies-to-end.
+    ml_pred = model.moves_left_head(pos_emb).squeeze(-1)         # (B,)
+    ml_target = torch.tensor(
+        [ex.moves_left_target for ex in batch], dtype=torch.float32, device=device,
+    )                                                            # (B,)
+    mlh_loss = nn.functional.mse_loss(ml_pred / MLH_TARGET_SCALE, ml_target / MLH_TARGET_SCALE)
 
     # Policy head per-position (ragged moves). Sum the per-example
     # cross-entropies, then average — matches the per-example loss when B=1.
@@ -98,7 +119,7 @@ def _batch_loss(
         policy_loss = policy_loss + -(target_dist * log_probs).sum()
     policy_loss = policy_loss / len(batch)
 
-    return policy_loss, value_loss
+    return policy_loss, value_loss, mlh_loss
 
 
 def train_az(
@@ -109,6 +130,7 @@ def train_az(
     seed: int = 0,
     log_every: int = 0,
     value_loss_weight: float = 1.0,
+    mlh_loss_weight: float = 0.3,
     grad_clip: float | None = 1.0,
     batch_size: int = 1,
 ) -> AZTrainResult:
@@ -119,11 +141,10 @@ def train_az(
     much faster on GPU because the trunk + value head batch naturally."""
     torch.manual_seed(seed)
     if not examples:
-        return AZTrainResult(epoch_losses=[{"policy": 0.0, "value": 0.0, "total": 0.0}] * epochs,
+        return AZTrainResult(epoch_losses=[{"policy": 0.0, "value": 0.0, "mlh": 0.0, "total": 0.0}] * epochs,
                              final_loss=0.0)
 
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    value_loss_fn = nn.MSELoss()
     epoch_losses: list[dict] = []
 
     model.train()
@@ -137,27 +158,31 @@ def train_az(
         # loss for the batch, so multiply back by len(batch) to recover the sum.
         running_p = 0.0
         running_v = 0.0
+        running_m = 0.0
         for step, batch_start in enumerate(range(0, len(examples), bs)):
             batch_idx = idxs[batch_start:batch_start + bs]
             batch = [examples[i] for i in batch_idx]
             opt.zero_grad()
-            p_loss, v_loss = _batch_loss(model, batch, value_loss_fn)
-            total = p_loss + value_loss_weight * v_loss
+            p_loss, v_loss, m_loss = _batch_loss(model, batch)
+            total = p_loss + value_loss_weight * v_loss + mlh_loss_weight * m_loss
             total.backward()
             if grad_clip is not None and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             opt.step()
             running_p += float(p_loss.item()) * len(batch)
             running_v += float(v_loss.item()) * len(batch)
+            running_m += float(m_loss.item()) * len(batch)
             if log_every and (step + 1) % log_every == 0:
-                log.info("epoch %d step %d policy=%.4f value=%.4f",
-                         ep + 1, step + 1, p_loss.item(), v_loss.item())
+                log.info("epoch %d step %d policy=%.4f value=%.4f mlh=%.4f",
+                         ep + 1, step + 1, p_loss.item(), v_loss.item(), m_loss.item())
         n = len(examples)
         avg_p = running_p / n
         avg_v = running_v / n
-        epoch_losses.append({"policy": avg_p, "value": avg_v, "total": avg_p + value_loss_weight * avg_v})
-        log.info("epoch %d done: policy=%.4f value=%.4f total=%.4f",
-                 ep + 1, avg_p, avg_v, epoch_losses[-1]["total"])
+        avg_m = running_m / n
+        total_avg = avg_p + value_loss_weight * avg_v + mlh_loss_weight * avg_m
+        epoch_losses.append({"policy": avg_p, "value": avg_v, "mlh": avg_m, "total": total_avg})
+        log.info("epoch %d done: policy=%.4f value=%.4f mlh=%.4f total=%.4f",
+                 ep + 1, avg_p, avg_v, avg_m, total_avg)
 
     return AZTrainResult(epoch_losses=epoch_losses, final_loss=epoch_losses[-1]["total"])
 

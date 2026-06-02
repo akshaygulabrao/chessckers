@@ -95,7 +95,8 @@ class AZExample:
     fen: str
     legal_moves: list[LegalMove]
     visit_distribution: list[float]  # probabilities, sum to ~1
-    value_target: float              # in {-1.0, 0.0, 1.0}
+    wdl_target: list[float]          # [P(win), P(draw), P(loss)] from STM POV — one-hot of the game outcome
+    moves_left_target: float         # plies remaining from this position to game end
 
 
 def _outcome_from_state(state: dict[str, Any]) -> str:
@@ -269,28 +270,29 @@ def az_game_to_examples(game: AZGame, gamma: float | None = None) -> list[AZExam
     the policy — an incentive to win *faster*: a mate-in-1 line scores higher
     than a mate-in-3, which flat ±1 targets cannot distinguish. (Symmetric:
     the losing side's target also decays, so it learns to delay the loss.)"""
-    if gamma is None:
-        gamma = float(os.environ.get("CHESSCKERS_VALUE_DISCOUNT", "1.0"))
+    # WDL one-hot from the side-to-move's POV; win-SPEED is carried by the
+    # moves-left target (plies-to-end), so the old gamma value-discount is gone.
+    # `gamma` is accepted but ignored, for call-site compatibility.
     if game.outcome == "draw":
-        v_white, v_black = 0.0, 0.0
+        wdl_white, wdl_black = [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]
     elif game.outcome == "white":
-        v_white, v_black = 1.0, -1.0
-    else:
-        v_white, v_black = -1.0, 1.0
+        wdl_white, wdl_black = [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]
+    else:  # black
+        wdl_white, wdl_black = [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]
 
     out: list[AZExample] = []
     n = len(game.records)
     for i, rec in enumerate(game.records):
         total = sum(rec.visit_counts) or 1
         dist = [v / total for v in rec.visit_counts]
-        base = v_white if rec.side_to_move == "white" else v_black
-        target_v = base * (gamma ** (n - 1 - i))
+        wdl = wdl_white if rec.side_to_move == "white" else wdl_black
         out.append(
             AZExample(
                 fen=rec.fen,
                 legal_moves=rec.legal_moves,
                 visit_distribution=dist,
-                value_target=target_v,
+                wdl_target=wdl,
+                moves_left_target=float(n - i),  # plies remaining (record i -> game end)
             )
         )
     return out

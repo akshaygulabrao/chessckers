@@ -93,12 +93,25 @@ class ChesskersScorer(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(d_hidden, 1),
         )
+        # WDL value head: 3 logits (Win/Draw/Loss from the side-to-move's POV).
+        # MCTS uses the scalar Q = P(win) - P(loss) (see value()/batch_eval).
+        # Replaces the old scalar-tanh head — better calibration + draw-awareness
+        # (Lc0-style); the moves-left head below handles win-speed.
         self.value_head = nn.Sequential(
             nn.Linear(d_hidden, d_hidden // 2),
             nn.LayerNorm(d_hidden // 2),
             nn.ReLU(inplace=True),
+            nn.Linear(d_hidden // 2, 3),
+        )
+        # Moves-left head: plies-to-end estimate (>=0 via Softplus). Trains the
+        # net to prefer faster wins / slower losses — the principled shortest-mate
+        # fix (vs the old value-discount hack).
+        self.moves_left_head = nn.Sequential(
+            nn.Linear(d_hidden, d_hidden // 2),
+            nn.LayerNorm(d_hidden // 2),
+            nn.ReLU(inplace=True),
             nn.Linear(d_hidden // 2, 1),
-            nn.Tanh(),
+            nn.Softplus(),
         )
 
     def _position_embedding(self, position: torch.Tensor) -> torch.Tensor:
@@ -128,7 +141,8 @@ class ChesskersScorer(nn.Module):
         returns:  () scalar tensor
         """
         emb = self._position_embedding(position)            # (1, d_hidden)
-        return self.value_head(emb).reshape(())             # ()
+        wdl = torch.softmax(self.value_head(emb), dim=-1)   # (1, 3)
+        return (wdl[..., 0] - wdl[..., 2]).reshape(())      # Q = P(win) - P(loss)
 
     def batch_eval(
         self, positions: torch.Tensor, moves_list: list[torch.Tensor | None]
@@ -157,7 +171,8 @@ class ChesskersScorer(nn.Module):
             )
         # One trunk pass for all positions (the expensive part).
         pos_emb = self.position_trunk(positions)             # (B, d_hidden)
-        values = self.value_head(pos_emb).squeeze(-1)        # (B,)
+        wdl = torch.softmax(self.value_head(pos_emb), dim=-1)  # (B, 3)
+        values = wdl[:, 0] - wdl[:, 2]                       # (B,) scalar Q = P(win)-P(loss)
 
         B = positions.shape[0]
         device = positions.device
@@ -207,7 +222,8 @@ class ChesskersScorer(nn.Module):
             raise ValueError(f"moves must be (N, D); got {tuple(moves.shape)}")
         n = moves.shape[0]
         pos_emb = self._position_embedding(position)        # (1, d_hidden)
-        v = self.value_head(pos_emb).reshape(())            # ()
+        wdl = torch.softmax(self.value_head(pos_emb), dim=-1)
+        v = (wdl[..., 0] - wdl[..., 2]).reshape(())          # scalar Q for MCTS
         pos_emb_n = pos_emb.expand(n, -1)
         move_emb = self.move_encoder(moves)
         combined = torch.cat([pos_emb_n, move_emb], dim=1)

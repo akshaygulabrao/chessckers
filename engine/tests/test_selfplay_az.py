@@ -162,26 +162,30 @@ def test_examples_normalize_visit_distribution_to_probabilities():
     assert abs(sum(ex.visit_distribution) - 1.0) < 1e-9
 
 
-def test_examples_value_target_matches_outcome_from_movers_perspective():
+def test_examples_wdl_target_matches_outcome_from_movers_perspective():
     white_rec = AZRecord(fen="F1", legal_moves=[_move("M")], visit_counts=[1], side_to_move="white")
     black_rec = AZRecord(fen="F2", legal_moves=[_move("M")], visit_counts=[1], side_to_move="black")
+    WIN, DRAW, LOSS = [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]
 
-    # white wins
+    # white wins: WDL one-hot from each mover's POV.
     game_w = AZGame(records=[white_rec, black_rec], final_status="variantEnd", outcome="white")
     exs = az_game_to_examples(game_w)
-    assert exs[0].value_target == 1.0  # white moved here, white won
-    assert exs[1].value_target == -1.0  # black moved here, black lost
+    assert exs[0].wdl_target == WIN    # white moved here, white won
+    assert exs[1].wdl_target == LOSS   # black moved here, black lost
+    # moves-left = plies remaining (record i of n -> n - i)
+    assert exs[0].moves_left_target == 2.0
+    assert exs[1].moves_left_target == 1.0
 
     # black wins
     game_b = AZGame(records=[white_rec, black_rec], final_status="mate", outcome="black")
     exs = az_game_to_examples(game_b)
-    assert exs[0].value_target == -1.0
-    assert exs[1].value_target == 1.0
+    assert exs[0].wdl_target == LOSS
+    assert exs[1].wdl_target == WIN
 
     # draw
     game_d = AZGame(records=[white_rec], final_status="stalemate", outcome="draw")
     exs = az_game_to_examples(game_d)
-    assert exs[0].value_target == 0.0
+    assert exs[0].wdl_target == DRAW
 
 
 def test_examples_handles_zero_visit_record_without_dividing_by_zero():
@@ -192,4 +196,4 @@ def test_examples_handles_zero_visit_record_without_dividing_by_zero():
     [ex] = az_game_to_examples(game)
     # Sum-zero visits become a degenerate distribution of [0.0]; not crashing is the win.
     assert ex.visit_distribution == [0.0]
-    assert ex.value_target == 0.0
+    assert ex.wdl_target == [0.0, 1.0, 0.0]  # draw

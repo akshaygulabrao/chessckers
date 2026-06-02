@@ -26,7 +26,8 @@ def _ex(value: float = 0.0) -> AZExample:
             {"uci": "d2d4", "from": "d2", "to": "d4", "piece": "P"},
         ],
         visit_distribution=[0.6, 0.4],
-        value_target=value,
+        wdl_target=[0.0, 1.0, 0.0],
+        moves_left_target=value,
     )
 
 

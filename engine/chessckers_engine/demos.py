@@ -125,7 +125,7 @@ def extract_az_examples(
     For each move that `color` played:
     - `legal_moves` = full legal-moves list at that FEN (queried from the API).
     - `visit_distribution` = one-hot on the played move's index.
-    - `value_target` = +1/-1/0 from `color`'s perspective (game outcome).
+    - `wdl_target` = Win/Draw/Loss one-hot from `color`'s perspective; `moves_left_target` = plies to game end.
 
     Plug into `train_az.train_az()` to imitate the played moves (policy head,
     via cross-entropy with the one-hot target) AND learn position values from
@@ -134,8 +134,10 @@ def extract_az_examples(
     for game in games:
         outcome = game["outcome"]
         target_v = _target_for_color(outcome, color)
+        # WDL one-hot from color's POV (value target is now WDL, not a scalar).
+        wdl = [1.0, 0.0, 0.0] if target_v > 0 else ([0.0, 0.0, 1.0] if target_v < 0 else [0.0, 1.0, 0.0])
         history = game.get("history") or []
-        for entry in history:
+        for j, entry in enumerate(history):
             fen = entry["fen"]
             uci = entry["uci"]
             try:
@@ -161,7 +163,8 @@ def extract_az_examples(
                     fen=fen,
                     legal_moves=legal,
                     visit_distribution=dist,
-                    value_target=float(target_v),
+                    wdl_target=wdl,
+                    moves_left_target=float(len(history) - j),
                 )
             )
     return examples

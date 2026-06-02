@@ -42,6 +42,7 @@ class TrainerLoop:
         checkpoint_every: int = 2000,
         min_buffer_games: int = 20,
         value_loss_weight: float = 1.0,
+        mlh_loss_weight: float = 0.3,
         grad_clip: float = 1.0,
         log_every: int = 50,
         wait_poll_seconds: float = 2.0,
@@ -63,6 +64,7 @@ class TrainerLoop:
         self.checkpoint_every = checkpoint_every
         self.min_buffer_games = min_buffer_games
         self.value_loss_weight = value_loss_weight
+        self.mlh_loss_weight = mlh_loss_weight
         self.grad_clip = grad_clip
         self.log_every = log_every
         self.wait_poll_seconds = wait_poll_seconds
@@ -161,8 +163,8 @@ class TrainerLoop:
                 time.sleep(self.wait_poll_seconds)
                 continue
             self._opt.zero_grad()
-            p_loss, v_loss = _batch_loss(self.model, batch, value_loss_fn)
-            total = p_loss + self.value_loss_weight * v_loss
+            p_loss, v_loss, m_loss = _batch_loss(self.model, batch)
+            total = p_loss + self.value_loss_weight * v_loss + self.mlh_loss_weight * m_loss
             total.backward()
             if self.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)

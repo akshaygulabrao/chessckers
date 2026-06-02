@@ -34,14 +34,14 @@ def test_puct_score_unvisited_child_uses_only_prior_term():
     parent_visits = 4
     c_puct = 2.0
     expected = -0.0 + c_puct * 0.5 * (parent_visits ** 0.5) / (1 + 0)
-    assert abs(_puct_score(child, parent_visits, c_puct) - expected) < 1e-9
+    assert abs(_puct_score(child, parent_visits, c_puct, fpu_value=0.0) - expected) < 1e-9
 
 
 def test_puct_score_higher_prior_wins_when_q_and_visits_equal():
     high = PuctNode(fen=FEN_W, move_to_here=None, prior=0.8, visits=2, total_value=0.4)
     low = PuctNode(fen=FEN_W, move_to_here=None, prior=0.1, visits=2, total_value=0.4)
-    s_high = _puct_score(high, parent_visits=10, c_puct=1.5)
-    s_low = _puct_score(low, parent_visits=10, c_puct=1.5)
+    s_high = _puct_score(high, parent_visits=10, cpuct=1.5, fpu_value=0.0)
+    s_low = _puct_score(low, parent_visits=10, cpuct=1.5, fpu_value=0.0)
     assert s_high > s_low
 
 
@@ -49,8 +49,8 @@ def test_puct_score_visited_child_q_dominates_eventually():
     """A frequently visited losing child (low Q) loses to an unvisited child."""
     visited_loser = PuctNode(fen=FEN_W, move_to_here=None, prior=0.5, visits=100, total_value=-90.0)
     unvisited = PuctNode(fen=FEN_W, move_to_here=None, prior=0.05, visits=0, total_value=0.0)
-    s_loser = _puct_score(visited_loser, parent_visits=200, c_puct=1.5)
-    s_unvisited = _puct_score(unvisited, parent_visits=200, c_puct=1.5)
+    s_loser = _puct_score(visited_loser, parent_visits=200, cpuct=1.5, fpu_value=0.0)
+    s_unvisited = _puct_score(unvisited, parent_visits=200, cpuct=1.5, fpu_value=0.0)
     assert s_unvisited > s_loser
 
 

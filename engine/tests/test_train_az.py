@@ -1,5 +1,4 @@
 import torch
-from torch import nn
 
 from chessckers_engine.encoding import MOVE_D
 from chessckers_engine.model import ChesskersScorer
@@ -25,13 +24,15 @@ def _move_distinct(idx: int) -> dict:
     return {"uci": f"M{idx}", "from": f"{f}2", "to": f"{t}3"}
 
 
-def _example(visit_dist: list[float], value: float) -> AZExample:
+def _example(visit_dist: list[float], wdl=(0.0, 1.0, 0.0), moves_left: float = 10.0) -> AZExample:
+    """WDL value target (default = draw one-hot); moves_left = plies-to-end."""
     moves = [_move_distinct(i) for i in range(len(visit_dist))]
     return AZExample(
         fen=INITIAL_FEN,
         legal_moves=moves,
         visit_distribution=visit_dist,
-        value_target=value,
+        wdl_target=list(wdl),
+        moves_left_target=moves_left,
     )
 
 
@@ -39,10 +40,8 @@ def test_total_loss_decreases_on_constant_targets():
     """Repeated training on the same target should monotonically reduce total loss."""
     torch.manual_seed(0)
     model = ChesskersScorer()
-    examples = [_example([0.1, 0.7, 0.2], 0.5) for _ in range(32)]
+    examples = [_example([0.1, 0.7, 0.2]) for _ in range(32)]
     result = train_az(model, examples, epochs=8, lr=5e-3, log_every=0)
-    # Just confirm the trend is downward; the magnitude is dominated by entropy
-    # of the soft-target cross-entropy and bounded below by the target's entropy.
     assert result.epoch_losses[-1]["total"] < result.epoch_losses[0]["total"]
 
 
@@ -51,18 +50,18 @@ def test_policy_loss_responds_to_one_hot_target():
     should converge to near zero given enough epochs."""
     torch.manual_seed(0)
     model = ChesskersScorer()
-    examples = [_example([0.0, 1.0, 0.0], 0.0)] * 32  # policy target sharply favors move 1
+    examples = [_example([0.0, 1.0, 0.0])] * 32  # policy target sharply favors move 1
     result = train_az(model, examples, epochs=20, lr=5e-3, log_every=0)
-    # The cross-entropy loss for a perfect prediction is 0; we should be much smaller than the start.
     assert result.epoch_losses[-1]["policy"] < 0.5
 
 
-def test_value_loss_responds_to_constant_value_target():
+def test_value_loss_responds_to_constant_wdl_target():
+    """WDL value head: a constant one-hot outcome target should drive the
+    cross-entropy value loss toward 0 (a one-hot is exactly reachable)."""
     torch.manual_seed(0)
     model = ChesskersScorer()
-    examples = [_example([1.0], 0.8) for _ in range(16)]
+    examples = [_example([1.0], wdl=(1.0, 0.0, 0.0)) for _ in range(16)]  # always "win"
     result = train_az(model, examples, epochs=20, lr=5e-3, log_every=0)
-    # Tanh's output saturates near ±1, so reaching 0.8 is feasible.
     assert result.epoch_losses[-1]["value"] < 0.1
 
 
@@ -76,7 +75,7 @@ def test_grad_clip_keeps_weights_finite_under_aggressive_lr():
     """At a learning rate high enough to cause numerical blow-up, clipping
     should keep the model's parameters finite (no NaN / Inf)."""
     torch.manual_seed(0)
-    examples = [_example([0.0, 1.0, 0.0], 0.0) for _ in range(16)]
+    examples = [_example([0.0, 1.0, 0.0]) for _ in range(16)]
 
     torch.manual_seed(0)
     clipped = ChesskersScorer()
@@ -89,7 +88,7 @@ def test_grad_clip_disabled_with_none_or_zero():
     """Sanity: a model trained with grad_clip=None and one with grad_clip=0
     behave identically (both skip clipping)."""
     torch.manual_seed(0)
-    examples = [_example([0.4, 0.6], 0.2) for _ in range(8)]
+    examples = [_example([0.4, 0.6]) for _ in range(8)]
 
     torch.manual_seed(0)
     a = ChesskersScorer()
@@ -106,7 +105,7 @@ def test_grad_clip_disabled_with_none_or_zero():
 def test_checkpoint_save_and_load_roundtrip(tmp_path):
     torch.manual_seed(0)
     model = ChesskersScorer()
-    examples = [_example([0.5, 0.5], 0.0) for _ in range(8)]
+    examples = [_example([0.5, 0.5]) for _ in range(8)]
     train_az(model, examples, epochs=3, log_every=0)
     path = tmp_path / "az.pt"
     save_checkpoint(model, path)
@@ -122,44 +121,43 @@ def test_checkpoint_save_and_load_roundtrip(tmp_path):
     assert torch.allclose(a_value, b_value)
 
 
-# ---- Mini-batched loss correctness ----
+# ---- Mini-batched loss correctness (policy CE, WDL value CE, moves-left MSE) ----
 
 
 def test_batch_loss_size_one_matches_example_loss():
     """_batch_loss with a singleton batch must match _example_loss exactly
-    (within float precision) — the math is the same, just expressed batch-aware."""
+    across all three losses — same math, just expressed batch-aware."""
     torch.manual_seed(0)
     model = ChesskersScorer().eval()
-    ex = _example([0.1, 0.7, 0.2], 0.4)
-    value_loss_fn = nn.MSELoss()
-    p1, v1 = _example_loss(model, ex, None, value_loss_fn)
-    p2, v2 = _batch_loss(model, [ex], value_loss_fn)
+    ex = _example([0.1, 0.7, 0.2], wdl=(0.2, 0.3, 0.5), moves_left=12.0)
+    p1, v1, m1 = _example_loss(model, ex)
+    p2, v2, m2 = _batch_loss(model, [ex])
     assert abs(p1.item() - p2.item()) < 1e-5
     assert abs(v1.item() - v2.item()) < 1e-5
+    assert abs(m1.item() - m2.item()) < 1e-5
 
 
 def test_batch_loss_mean_equals_per_example_average():
-    """_batch_loss returns mean per-example loss over the batch. Verify this
-    matches the average of independently computed _example_loss values."""
+    """_batch_loss returns the mean per-example loss; verify it equals the
+    average of independently computed _example_loss values (all three heads)."""
     torch.manual_seed(0)
     model = ChesskersScorer().eval()
     examples = [
-        _example([0.5, 0.3, 0.2], 1.0),
-        _example([0.1, 0.8, 0.1], -1.0),
-        _example([0.25, 0.25, 0.5], 0.0),
+        _example([0.5, 0.3, 0.2], wdl=(1.0, 0.0, 0.0), moves_left=8.0),
+        _example([0.1, 0.8, 0.1], wdl=(0.0, 0.0, 1.0), moves_left=20.0),
+        _example([0.25, 0.25, 0.5], wdl=(0.0, 1.0, 0.0), moves_left=14.0),
     ]
-    value_loss_fn = nn.MSELoss()
-    p_b, v_b = _batch_loss(model, examples, value_loss_fn)
-    indiv_p = [_example_loss(model, ex, None, value_loss_fn)[0].item() for ex in examples]
-    indiv_v = [_example_loss(model, ex, None, value_loss_fn)[1].item() for ex in examples]
-    assert abs(p_b.item() - sum(indiv_p) / len(indiv_p)) < 1e-5
-    assert abs(v_b.item() - sum(indiv_v) / len(indiv_v)) < 1e-5
+    p_b, v_b, m_b = _batch_loss(model, examples)
+    indiv = [_example_loss(model, ex) for ex in examples]
+    for idx, agg in enumerate((p_b, v_b, m_b)):
+        avg = sum(t[idx].item() for t in indiv) / len(indiv)
+        assert abs(agg.item() - avg) < 1e-5
 
 
 def test_train_az_with_batch_size_decreases_loss():
     """End-to-end: training with batch_size > 1 should still converge."""
     torch.manual_seed(0)
     model = ChesskersScorer()
-    examples = [_example([0.1, 0.7, 0.2], 0.5) for _ in range(64)]
+    examples = [_example([0.1, 0.7, 0.2]) for _ in range(64)]
     result = train_az(model, examples, epochs=4, lr=5e-3, batch_size=16, log_every=0)
     assert result.epoch_losses[-1]["total"] < result.epoch_losses[0]["total"]

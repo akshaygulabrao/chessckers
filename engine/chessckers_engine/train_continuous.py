@@ -37,7 +37,6 @@ import time
 from pathlib import Path
 
 import torch
-from torch import nn
 
 from chessckers_engine.checkpoints import load_checkpoint
 from chessckers_engine.device import pick_device
@@ -104,6 +103,7 @@ def main() -> int:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--value-loss-weight", type=float, default=1.0)
+    p.add_argument("--mlh-loss-weight", type=float, default=0.3)
     p.add_argument("--publish-seconds", type=float, default=45.0, help="how often to publish weights.pt to self-play")
     p.add_argument("--ckpt-seconds", type=float, default=300.0, help="how often to save an iter ckpt + log stats")
     p.add_argument("--device", default="auto", help="train device (auto -> mps if available)")
@@ -135,7 +135,6 @@ def main() -> int:
         log.info("warm-started from %s", args.base)
     model.train()
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)  # Adam, persistent across all steps (real continuous training)
-    mse = nn.MSELoss()
     rng = random.Random(args.seed)
 
     # Publish an initial snapshot immediately so self-play has weights to load.
@@ -156,7 +155,7 @@ def main() -> int:
     positions_ingested = 0
     last_publish = last_ckpt = time.time()
     ckpt_n = 0
-    win_p = win_v = 0.0
+    win_p = win_v = win_m = 0.0
     win_steps = 0
     log.info("continuous trainer up: device=%s buffer_cap=%d min=%d batch=%d "
              "replay_factor=%.1f publish=%.0fs ckpt=%.0fs",
@@ -191,13 +190,13 @@ def main() -> int:
         bs = min(args.batch_size, len(buf))
         batch = rng.sample(buf, bs)
         opt.zero_grad()
-        p_loss, v_loss = _batch_loss(model, batch, mse)
-        (p_loss + args.value_loss_weight * v_loss).backward()
+        p_loss, v_loss, ml_loss = _batch_loss(model, batch)
+        (p_loss + args.value_loss_weight * v_loss + args.mlh_loss_weight * ml_loss).backward()
         if args.grad_clip and args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
         opt.step()
         steps += 1
-        win_p += float(p_loss.item()); win_v += float(v_loss.item()); win_steps += 1
+        win_p += float(p_loss.item()); win_v += float(v_loss.item()); win_m += float(ml_loss.item()); win_steps += 1
 
         now = time.time()
         if now - last_publish >= args.publish_seconds:
@@ -207,11 +206,11 @@ def main() -> int:
             ckpt_n += 1
             ckpt = run_dir / f"iter-async-{ckpt_n:04d}.pt"
             save_checkpoint(model, ckpt)
-            log.info("checkpoint saved -> %s | step %d games_seen=%d/%s buf=%d | policy=%.4f value=%.4f | %.1f steps/s",
+            log.info("checkpoint saved -> %s | step %d games_seen=%d/%s buf=%d | policy=%.4f value=%.4f mlh=%.4f | %.1f steps/s",
                      ckpt.name, steps, games_seen, (args.max_games or "inf"), len(buf),
-                     win_p / max(win_steps, 1), win_v / max(win_steps, 1),
+                     win_p / max(win_steps, 1), win_v / max(win_steps, 1), win_m / max(win_steps, 1),
                      win_steps / max(now - last_ckpt, 1e-9))
-            win_p = win_v = 0.0; win_steps = 0; last_ckpt = now
+            win_p = win_v = win_m = 0.0; win_steps = 0; last_ckpt = now
         if args.max_steps and steps >= args.max_steps:
             break
 

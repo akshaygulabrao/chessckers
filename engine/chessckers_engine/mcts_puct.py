@@ -88,14 +88,34 @@ def _node_fen(node: PuctNode, client: Any) -> str:
     return node.fen
 
 
-def _puct_score(child: PuctNode, parent_visits: int, c_puct: float) -> float:
-    q_from_parent = -child.q
-    u = c_puct * child.prior * math.sqrt(max(parent_visits, 1)) / (1 + child.visits)
+# Lc0-style PUCT refinements:
+# - cpuct GROWS with parent visits: cpuct = c_puct + CPUCT_FACTOR*log((N+base)/base).
+#   With base=19652 this is negligible at our sim counts (~+0.04 at N=400) — it
+#   only matters at Lc0-scale visit counts — but it matches Lc0 and future-proofs.
+# - FPU (First-Play Urgency) reduction: an unvisited child is valued at the
+#   parent's Q minus FPU_REDUCTION*sqrt(explored policy mass), rather than the
+#   optimistic 0, so search stops over-exploring untried low-prior moves once
+#   some siblings are visited. Set FPU_REDUCTION=0 to disable.
+CPUCT_FACTOR = 2.0
+CPUCT_BASE = 19652.0
+FPU_REDUCTION = 0.25
+
+
+def _puct_score(child: PuctNode, parent_visits: int, cpuct: float, fpu_value: float) -> float:
+    # Q from the parent's perspective: explored child -> -child.q; unexplored -> FPU.
+    q_from_parent = (-child.q) if child.visits > 0 else fpu_value
+    u = cpuct * child.prior * math.sqrt(max(parent_visits, 1)) / (1 + child.visits)
     return q_from_parent + u
 
 
 def _select_child(parent: PuctNode, c_puct: float) -> PuctNode:
-    return max(parent.children.values(), key=lambda c: _puct_score(c, parent.visits, c_puct))
+    pv = parent.visits
+    cpuct = c_puct + CPUCT_FACTOR * math.log((pv + CPUCT_BASE) / CPUCT_BASE)
+    # FPU base: the parent's own value (parent STM), reduced by the policy mass
+    # already explored among its children.
+    visited_prior = sum(c.prior for c in parent.children.values() if c.visits > 0)
+    fpu_value = parent.q - FPU_REDUCTION * math.sqrt(max(visited_prior, 0.0))
+    return max(parent.children.values(), key=lambda c: _puct_score(c, pv, cpuct, fpu_value))
 
 
 def _terminal_value(node: PuctNode) -> float:

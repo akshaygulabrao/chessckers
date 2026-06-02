@@ -25,7 +25,7 @@ def _example(visit_dist: list[float], value: float) -> AZExample:
     """Minimal AZExample for round-trip testing."""
     return AZExample(
         fen="dummy", legal_moves=[{"uci": f"M{i}"} for i in range(len(visit_dist))],
-        visit_distribution=visit_dist, value_target=value,
+        visit_distribution=visit_dist, wdl_target=[0.0, 1.0, 0.0], moves_left_target=value,
     )
 
 
@@ -70,8 +70,8 @@ def test_save_resume_state_writes_state_and_buffer(tmp_path: Path):
     rb_loaded = torch.load(tmp_path / "replay_buffer.pt", map_location="cpu", weights_only=False)
     assert len(rb_loaded) == 2
     assert len(rb_loaded[0]) == 2 and len(rb_loaded[1]) == 1
-    assert rb_loaded[0][0].value_target == 0.0
-    assert rb_loaded[1][0].value_target == -1.0
+    assert rb_loaded[0][0].moves_left_target == 0.0
+    assert rb_loaded[1][0].moves_left_target == -1.0
 
 
 def test_load_resume_state_restores_model_buffer_and_iter(tmp_path: Path):
@@ -105,7 +105,7 @@ def test_load_resume_state_restores_model_buffer_and_iter(tmp_path: Path):
     assert torch.allclose(restored_best, original_param), "best weights not restored"
     # Replay buffer restored
     assert len(rb_loaded) == 3
-    assert rb_loaded[0][0].value_target == 0.5
+    assert rb_loaded[0][0].moves_left_target == 0.5
 
 
 def test_load_resume_state_handles_missing_replay_buffer(tmp_path: Path):
