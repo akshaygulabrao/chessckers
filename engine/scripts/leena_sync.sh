@@ -9,15 +9,16 @@
 set -uo pipefail
 LEENA=leenagulabrao@Leenas-MacBook-Air.local   # Bonjour hostname — survives leena's DHCP IP changes
 ENG=/Users/ox/AAworkspace/chessckers/engine
-INGEST="$ENG/weights/run/buffer"
-WEIGHTS="$ENG/weights/run/weights.pt"
+RUN_DIR="${RUN_DIR:-$ENG/weights/run-frontier}"  # local trainer run-dir (override per run); must match launch_next.sh
+INGEST="$RUN_DIR/buffer"
+WEIGHTS="$RUN_DIR/weights.pt"
 LOG=/tmp/cc_train.log
 PY="$ENG/.venv/bin/python"
 SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
-PAUSE="$ENG/weights/run/PAUSE_LEENA"        # trainer touches this across its train+save phase
+PAUSE="$RUN_DIR/PAUSE_LEENA"                 # trainer touches this across its train+save phase
 paused=0; pause_started=0; MAX_PAUSE=600    # SIGSTOP leena while present; force-resume after MAX_PAUSE (stale-marker guard)
 last_w_mtime=0                              # only push (+log) weights to leena when train_continuous republishes a newer file
-STOP="$ENG/weights/run/STOP"                # trainer touches this at the game target -> tear down leena + exit
+STOP="$RUN_DIR/STOP"                        # trainer touches this at the game target -> tear down leena + exit
 mkdir -p "$INGEST"
 while true; do
   # Run ended? train_continuous touches STOP at the game target -> stop leena + exit.
