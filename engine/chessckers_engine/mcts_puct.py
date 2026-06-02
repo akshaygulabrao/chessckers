@@ -404,6 +404,7 @@ def run_mcts(
     dirichlet_alpha: float | None = None,
     dirichlet_eps: float = 0.25,
     vloss_batch: int = 1,
+    reuse_root: PuctNode | None = None,
 ) -> MctsResult:
     """Run PUCT MCTS for `n_sims` iterations from `state`. Returns the chosen
     move (most-visited root child) along with the visit distribution that can
@@ -418,6 +419,12 @@ def run_mcts(
     leaves in one batched forward (requires `model` to be an InferenceServer
     so the eval can actually batch), then back up. Multiplies effective
     inference batch size by ~B per game.
+
+    `reuse_root`: a subtree (the chosen child from the previous move's search,
+    re-rooted) to continue from instead of building fresh — Lc0-style tree reuse.
+    Its carried visits count toward `n_sims` (only the shortfall is searched
+    anew), its priors are re-noised for this move, and it is DISCARDED (fresh
+    search) if its FEN doesn't match `state` — never search the wrong position.
     """
     legal = state.get("legalMoves") or []
     if not legal:
@@ -433,14 +440,33 @@ def run_mcts(
     if gc_was_enabled:
         gc.disable()
 
-    root = PuctNode(fen=state["fen"], move_to_here=None, legal_moves=legal)
-    # Eagerly cache the root's parsed State for the fast path so the first
-    # expansion doesn't have to re-parse the same FEN we just got.
-    if hasattr(client, "parse"):
-        try:
-            root.state = client.parse(state["fen"])
-        except Exception:  # noqa: BLE001
-            pass
+    # Tree reuse: continue from the re-rooted chosen-child subtree if it matches
+    # this position; otherwise (or on ANY fen mismatch) build a fresh root.
+    if reuse_root is not None:
+        rf = _node_fen(reuse_root, client)
+        if rf and rf != state["fen"]:
+            reuse_root = None  # stale/mismatched subtree — never search the wrong position
+    if reuse_root is not None:
+        root = reuse_root
+        root.move_to_here = None                      # it's the root now
+        if not root.fen:
+            root.fen = state["fen"]
+        if root.legal_moves is None:
+            root.legal_moves = legal
+        if root.state is None and hasattr(client, "parse"):
+            try:
+                root.state = client.parse(state["fen"])
+            except Exception:  # noqa: BLE001
+                pass
+    else:
+        root = PuctNode(fen=state["fen"], move_to_here=None, legal_moves=legal)
+        # Eagerly cache the root's parsed State for the fast path so the first
+        # expansion doesn't have to re-parse the same FEN we just got.
+        if hasattr(client, "parse"):
+            try:
+                root.state = client.parse(state["fen"])
+            except Exception:  # noqa: BLE001
+                pass
     legal_cache: dict[str, list[LegalMove]] = {state["fen"]: legal}
 
     def get_legal(node: PuctNode) -> list[LegalMove]:
@@ -462,16 +488,19 @@ def run_mcts(
         node.legal_moves = moves
         return moves
 
-    # First sim expands the root, populating children + their priors. Done
-    # sequentially so the Dirichlet noise that follows sees the priors.
-    if n_sims > 0:
+    # First sim expands the root (fresh, or a reused-but-unexpanded node),
+    # populating children + priors so the Dirichlet noise that follows sees them.
+    if n_sims > 0 and not (root.expanded and root.children):
         _simulate(root, client, model, c_puct, get_legal)
 
-    # Optionally mix Dirichlet noise into root priors before the rest of search.
-    if dirichlet_alpha is not None:
+    # Mix Dirichlet noise into the root priors — re-applied each move (including
+    # for a reused root) to drive fresh exploration this move.
+    if dirichlet_alpha is not None and root.children:
         _apply_dirichlet_noise(root, dirichlet_alpha, dirichlet_eps)
 
-    remaining = max(0, n_sims - 1)
+    # Search to a fixed total-visit budget: carried-over reuse visits count, so
+    # only the shortfall is searched anew (the tree-reuse efficiency win).
+    remaining = max(0, n_sims - root.visits)
     try:
         if vloss_batch <= 1:
             for _ in range(remaining):

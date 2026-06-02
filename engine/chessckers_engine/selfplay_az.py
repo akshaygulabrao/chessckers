@@ -197,6 +197,7 @@ def play_az_game(
                       "temperature": temperature})
 
     ply = 0
+    reuse_root = None  # tree reuse: the played move's subtree, carried to the next ply
     while not state.get("status") and ply < max_plies:
         legal = state.get("legalMoves") or []
         if not legal:
@@ -207,6 +208,7 @@ def play_az_game(
             dirichlet_alpha=dirichlet_alpha,
             dirichlet_eps=dirichlet_eps,
             vloss_batch=vloss_batch,
+            reuse_root=reuse_root,
         )
         visits = _aligned_visits(result.visit_distribution, legal)
         records.append(
@@ -230,6 +232,8 @@ def play_az_game(
             game = AZGame(records=records, final_status=None, outcome="draw")
             _emit_game_end(sink, ctx, history, prev_fen, game)
             return game
+        # Carry the played move's subtree into the next ply (re-rooted by run_mcts).
+        reuse_root = result.root.children.get(chosen["uci"])
         ply += 1
         if sink is not None:
             sink.on_move({**ctx, "ply": ply, "fen": state["fen"], "history": list(history),
