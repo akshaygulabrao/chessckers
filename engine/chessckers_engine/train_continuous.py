@@ -66,8 +66,9 @@ class _GameArchive:
 
     SHARD_CAP_BYTES = 256 * 1024 * 1024  # rotate to a new shard at ~256 MB
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, cap_bytes: int = 0):
         self.root = root
+        self.cap_bytes = cap_bytes  # 0 = unbounded; else FIFO-evict oldest shards over cap
         self.enabled = True
         self.games_written = 0
         self._shard = None
@@ -101,9 +102,87 @@ class _GameArchive:
                 self._shard.close()
                 self._shard_idx += 1
                 self._shard = open(self.root / f"games-{self._shard_idx:05d}.pkl", "ab")
+                self._evict_over_cap()  # FIFO-drop oldest shards (only at rotation — rare)
         except OSError as e:
             log.warning("game archive write failed — disabling for this run: %s", e)
             self.enabled = False
+
+    @staticmethod
+    def _read_records(shard: Path):
+        """Yield each {examples, meta} record from a shard, tolerating a
+        truncated tail (a shard being appended-to, or a torn write)."""
+        with open(shard, "rb") as f:
+            while True:
+                try:
+                    yield pickle.load(f)
+                except EOFError:
+                    return
+                except (pickle.UnpicklingError, ValueError):
+                    return  # torn tail — stop at the last good record
+
+    def load_recent(self, max_positions: int) -> list:
+        """Most-recent ~max_positions AZExamples across the archive, for priming
+        the in-RAM replay window on (re)start. Reads newest shards first and
+        stops once it has enough — never the whole archive — so a 400 GB archive
+        still primes from only the last shard or two."""
+        if not self.enabled or max_positions <= 0:
+            return []
+        shards = sorted(self.root.glob("games-*.pkl"))  # ascending index = chronological
+        newest_first: list[list] = []
+        total = 0
+        for shard in reversed(shards):
+            exs: list = []
+            try:
+                for rec in self._read_records(shard):
+                    exs.extend(rec["examples"])
+            except OSError:
+                continue
+            newest_first.append(exs)
+            total += len(exs)
+            if total >= max_positions:
+                break
+        chronological = [e for exs in reversed(newest_first) for e in exs]
+        return chronological[-max_positions:]
+
+    def _evict_over_cap(self) -> None:
+        """Delete oldest shards (and prune their manifest lines) until the
+        archive fits cap_bytes. Keeps the active shard. No-op if cap_bytes=0."""
+        if not self.cap_bytes:
+            return
+        try:
+            shards = sorted(self.root.glob("games-*.pkl"))
+            sizes = {s: s.stat().st_size for s in shards}
+            total = sum(sizes.values())
+            evicted: list[int] = []
+            for shard in shards[:-1]:  # never evict the currently-open (last) shard
+                if total <= self.cap_bytes:
+                    break
+                total -= sizes[shard]
+                evicted.append(int(shard.stem.split("-")[1]))
+                shard.unlink()
+            if evicted:
+                self._prune_manifest(set(evicted))
+                log.info("archive over cap (%d MB): evicted %d oldest shard(s) %s",
+                         self.cap_bytes // (1 << 20), len(evicted), evicted)
+        except OSError as e:
+            log.warning("archive eviction failed: %s", e)
+
+    def _prune_manifest(self, evicted_idx: set[int]) -> None:
+        """Rewrite manifest.jsonl dropping entries for evicted shards. Rare
+        (only fires on eviction), so a full rewrite is fine."""
+        path = self.root / "manifest.jsonl"
+        self._manifest.close()
+        kept = []
+        for line in path.read_text().splitlines():
+            try:
+                if json.loads(line).get("shard") not in evicted_idx:
+                    kept.append(line)
+            except ValueError:
+                continue
+        tmp = path.with_suffix(".jsonl.tmp")
+        tmp.write_text(("\n".join(kept) + "\n") if kept else "")
+        os.replace(tmp, path)
+        self._manifest = open(path, "a")
 
 
 def _drain(buffer_dir: Path, archive: "_GameArchive | None" = None) -> tuple[list, list]:
@@ -157,6 +236,9 @@ def main() -> int:
     p.add_argument("--archive-dir", default="",
                    help="durable append-only game archive (e.g. /Volumes/hd0/chessckers_archive/<run>); "
                         "keeps every ingested game for re-training/re-labeling. Empty = off.")
+    p.add_argument("--archive-cap-gb", type=float, default=0.0,
+                   help="bound the archive to this many GB, FIFO-evicting oldest shards (0 = unbounded). "
+                        "Set below the disk's free space, e.g. 380 on a 400 GB volume.")
     p.add_argument("--buffer-cap", type=int, default=50000, help="rolling replay buffer capacity (positions)")
     p.add_argument("--min-buffer", type=int, default=2000, help="start training once the buffer reaches this")
     p.add_argument("--replay-factor", type=float, default=8.0,
@@ -188,9 +270,13 @@ def main() -> int:
     if stop_path.exists():
         stop_path.unlink()
 
-    archive = _GameArchive(Path(args.archive_dir).resolve()) if args.archive_dir else None
-    if archive and archive.enabled:
-        log.info("archiving every ingested game -> %s", archive.root)
+    archive = None
+    if args.archive_dir:
+        archive = _GameArchive(Path(args.archive_dir).resolve(),
+                               cap_bytes=int(args.archive_cap_gb * (1 << 30)))
+        if archive.enabled:
+            cap = f"{args.archive_cap_gb:g} GB FIFO" if args.archive_cap_gb else "unbounded"
+            log.info("archiving every ingested game -> %s (%s)", archive.root, cap)
 
     torch.manual_seed(args.seed)
     device = pick_device(args.device)
@@ -217,9 +303,17 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_term)
 
     buf: list = []  # rolling replay buffer (list, trimmed from the front; sample is O(bs))
+    # Prime the in-RAM window from the archive's most-recent games so a restart
+    # resumes WARM (no cold min_buffer wait) and the window can be larger than
+    # one process's freshly-ingested games. Stays RAM-resident — the slow flash
+    # is read once here, never per training batch.
+    if archive and archive.enabled:
+        buf = archive.load_recent(args.buffer_cap)
+        if buf:
+            log.info("primed replay window from archive: %d positions (cap %d)", len(buf), args.buffer_cap)
     steps = 0
     games_seen = 0
-    positions_ingested = 0
+    positions_ingested = len(buf)  # primed data counts as ingested (restores the replay-factor throttle state)
     last_publish = last_ckpt = time.time()
     ckpt_n = 0
     win_p = win_v = win_m = 0.0
