@@ -14,8 +14,12 @@
 #      mix, 200-ply cap, and a 300k replay window. The archive is reused
 #      (--archive-dir) so the buffer PRIMES from the old games while the new mix
 #      collects.
+#   4. Best-effort bring up leena: if reachable, deploy the seed mix + relaunch
+#      its workers and start the local leena_sync sidecar. If leena is asleep /
+#      off-network, warn and continue LOCAL-ONLY (never aborts the run).
 #
-#   scripts/launch_next.sh            # start the new run
+#   scripts/launch_next.sh            # start the new run (local + leena)
+#   SKIP_LEENA=1 scripts/launch_next.sh   # local only
 #   DRY_RUN=1 scripts/launch_next.sh  # print the commands, change nothing
 set -euo pipefail
 
@@ -92,7 +96,29 @@ run "cd '$ENG' && CHESSCKERS_START_FEN='$SEED_MIX' CHESSCKERS_MAX_PLIES=$MAX_PLI
   --max-plies $MAX_PLIES --weights-poll-seconds 20 --seed 1000 \
   > '$RUN_DIR/workers.log' 2>&1 & echo \$! > '$RUN_DIR/workers.pid'"
 
+# ---- leena (best-effort: never abort the local run) ----
+LEENA="${LEENA:-leenagulabrao@Leenas-MacBook-Air.local}"   # Bonjour — survives DHCP changes
+SSH_LEENA="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+LSYNC="$ENG/scripts/leena_sync.sh"
+leena_manual="scp '$REPO_ROOT/scripts/seed_mix.txt' '$ENG/scripts/leena_launch.sh' '$LEENA:chessckers/' && $SSH_LEENA '$LEENA' 'bash ~/chessckers/leena_launch.sh' && nohup bash '$LSYNC' >/tmp/cc_leena_sync.log 2>&1 &"
+
+if [ "${SKIP_LEENA:-0}" = 1 ]; then
+  log "leena: skipped (SKIP_LEENA=1)"
+elif [ "${DRY_RUN:-0}" = 1 ]; then
+  echo "DRY: (if reachable) scp seed_mix.txt + leena_launch.sh -> leena; ssh leena bash leena_launch.sh; start leena_sync.sh"
+elif $SSH_LEENA "$LEENA" true 2>/dev/null; then
+  log "leena: reachable — deploying seed mix + (re)launching workers"
+  if scp -q "$REPO_ROOT/scripts/seed_mix.txt" "$ENG/scripts/leena_launch.sh" "$LEENA:chessckers/" 2>/dev/null \
+     && $SSH_LEENA "$LEENA" 'pkill -f selfplay_workers_only 2>/dev/null; pkill -f multiprocessing.spawn 2>/dev/null; sleep 1; bash ~/chessckers/leena_launch.sh'; then
+    pkill -f "$LSYNC" 2>/dev/null || true              # drop any stale sidecar from the prior run
+    nohup bash "$LSYNC" >/tmp/cc_leena_sync.log 2>&1 &
+    log "leena: workers launched + sync sidecar started (pid $!) -> /tmp/cc_leena_sync.log"
+  else
+    log "leena: deploy/launch FAILED — continuing local-only. Retry: $leena_manual"
+  fi
+else
+  log "leena: UNREACHABLE (asleep / off-network?) — started local-only."
+  log "       once it's up:  $leena_manual"
+fi
+
 log "done. follow: tail -f $RUN_DIR/trainer.log"
-log "leena (redeploy + start the sync sidecar):"
-log "  scp scripts/seed_mix.txt engine/scripts/leena_launch.sh leena:~/chessckers/ && ssh leena 'bash ~/chessckers/leena_launch.sh'"
-log "  nohup bash engine/scripts/leena_sync.sh >/tmp/cc_leena_sync.log 2>&1 &"
