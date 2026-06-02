@@ -387,12 +387,23 @@ def _seed_tag(fen: str) -> str:
     (e.g. '[d3:kk,e3:kk]' -> 'd3+e3'), plus the White-pawn count when present so
     seeds that differ only in White pawns are distinguishable (the d6/e6/f6
     towers vs 3/6/8 White pawns -> 'd6+e6+f6+3P' / '+6P' / '+8P'); else a short
-    prefix of the board field."""
+    prefix of the board field.
+
+    A stone-topped tower gets an 's' suffix on its square so it's distinct from
+    an otherwise-identical king tower (h8:ssss -> 'h8s' vs h8:kkkk -> 'h8');
+    king tops (the default for these seeds) are left unmarked."""
     board = fen.split(" ")[0]
     n_wp = board.split("[")[0].count("P")  # White pawns live in the board field, not the overlay
     lb, rb = fen.find("["), fen.find("]")
     if 0 <= lb < rb:
-        squares = [e.split(":")[0] for e in fen[lb + 1:rb].split(",") if ":" in e]
+        squares = []
+        for e in fen[lb + 1:rb].split(","):
+            if ":" not in e:
+                continue
+            sq, pieces = e.split(":", 1)
+            if pieces and pieces[-1] in ("s", "S"):  # top piece (rightmost) is a Stone
+                sq += "s"
+            squares.append(sq)
         if squares:
             tag = "+".join(squares)
             return f"{tag}+{n_wp}P" if n_wp else tag
