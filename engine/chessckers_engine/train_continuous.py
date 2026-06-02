@@ -28,6 +28,7 @@ Stop: `touch <run-dir>/STOP`  (or SIGTERM).
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import pickle
@@ -48,13 +49,70 @@ from chessckers_engine.train_az import _batch_loss, save_checkpoint
 log = logging.getLogger("chessckers_engine.train_continuous")
 
 
-def _drain(buffer_dir: Path) -> tuple[list, list]:
+class _GameArchive:
+    """Append-only durable archive of self-play games on a (slow, secondary)
+    disk — the cold tier for re-training / re-labeling / data-window experiments.
+
+    Each ingested game would otherwise be DISCARDED once the live buffer slides
+    past it; the archive keeps the full AZExamples (targets included) so games
+    can be re-trained on later without regenerating self-play.
+
+    Best-effort by design: any write failure (e.g. a USB volume that dropped off
+    the bus mid-run) is logged once and disables the archive for the rest of the
+    run — it NEVER interrupts training. Games are bundled into rotating shards
+    (not one tiny file per game) to stay friendly to flash random-IO + directory
+    limits; a JSONL manifest lets you scan the archive (counts, seed mix, window
+    sizing) without unpickling the shards."""
+
+    SHARD_CAP_BYTES = 256 * 1024 * 1024  # rotate to a new shard at ~256 MB
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.enabled = True
+        self.games_written = 0
+        self._shard = None
+        self._manifest = None
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            existing = sorted(self.root.glob("games-*.pkl"))
+            # Resume the latest shard after a restart; else start at 1.
+            self._shard_idx = int(existing[-1].stem.split("-")[1]) if existing else 1
+            self._shard = open(self.root / f"games-{self._shard_idx:05d}.pkl", "ab")
+            self._manifest = open(self.root / "manifest.jsonl", "a")
+        except OSError as e:
+            log.warning("game archive disabled (init failed for %s): %s", self.root, e)
+            self.enabled = False
+
+    def append(self, examples: list, meta: dict) -> None:
+        if not self.enabled:
+            return
+        try:
+            pickle.dump({"examples": examples, "meta": meta}, self._shard,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+            self._shard.flush()
+            rec = {k: meta.get(k) for k in ("machine", "outcome", "plies", "seed_fen")}
+            rec["n_examples"] = len(examples)
+            rec["shard"] = self._shard_idx
+            self._manifest.write(json.dumps(rec) + "\n")
+            self._manifest.flush()
+            self.games_written += 1
+            if self._shard.tell() >= self.SHARD_CAP_BYTES:  # rotate
+                os.fsync(self._shard.fileno())
+                self._shard.close()
+                self._shard_idx += 1
+                self._shard = open(self.root / f"games-{self._shard_idx:05d}.pkl", "ab")
+        except OSError as e:
+            log.warning("game archive write failed — disabling for this run: %s", e)
+            self.enabled = False
+
+
+def _drain(buffer_dir: Path, archive: "_GameArchive | None" = None) -> tuple[list, list]:
     """Load + consume every COMPLETE game pkl in buffer_dir. Each pkl is a
     list[AZExample] (what selfplay_worker_async writes), with a sibling .meta
     JSON (machine/outcome/plies/seed_fen). Returns (examples, metas) — one meta
     dict per ingested game; skips partial/mid-rsync pkls (retried next tick),
-    unlinks the consumed pkl + its .meta sidecar."""
-    import json
+    archives the game (if `archive` set) before unlinking the consumed pkl + its
+    .meta sidecar."""
     examples: list = []
     metas: list = []
     if not buffer_dir.exists():
@@ -73,6 +131,8 @@ def _drain(buffer_dir: Path) -> tuple[list, list]:
         except (OSError, ValueError):
             pass
         metas.append(meta)
+        if archive is not None:
+            archive.append(exs, meta)  # durable cold tier before the pkl is gone
         for fp in (pkl, meta_path):
             try:
                 fp.unlink()
@@ -94,6 +154,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Async/continuous AlphaZero trainer (decoupled self-play).")
     p.add_argument("--run-dir", required=True, type=Path)
     p.add_argument("--base", default="", help="warm-start checkpoint (else random init)")
+    p.add_argument("--archive-dir", default="",
+                   help="durable append-only game archive (e.g. /Volumes/hd0/chessckers_archive/<run>); "
+                        "keeps every ingested game for re-training/re-labeling. Empty = off.")
     p.add_argument("--buffer-cap", type=int, default=50000, help="rolling replay buffer capacity (positions)")
     p.add_argument("--min-buffer", type=int, default=2000, help="start training once the buffer reaches this")
     p.add_argument("--replay-factor", type=float, default=8.0,
@@ -124,6 +187,10 @@ def main() -> int:
     buffer_dir.mkdir(parents=True, exist_ok=True)
     if stop_path.exists():
         stop_path.unlink()
+
+    archive = _GameArchive(Path(args.archive_dir).resolve()) if args.archive_dir else None
+    if archive and archive.enabled:
+        log.info("archiving every ingested game -> %s", archive.root)
 
     torch.manual_seed(args.seed)
     device = pick_device(args.device)
@@ -163,7 +230,7 @@ def main() -> int:
              args.replay_factor, args.publish_seconds, args.ckpt_seconds)
 
     while not stop_path.exists():
-        new_ex, metas = _drain(buffer_dir)
+        new_ex, metas = _drain(buffer_dir, archive)
         if metas:
             buf.extend(new_ex)
             games_seen += len(metas)
