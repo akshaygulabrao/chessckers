@@ -6,7 +6,8 @@ MOVE played is always the argmax of the visit counts (the "calculation");
 exploration is injected only as root Dirichlet noise (--explore, default
 0.30 = 30%), so different runs (or --seed) give varied games while each move
 stays the search's best. --explore 0 = pure greedy/deterministic. Each ply
-renders the 10x10 board live, then the engine's top 3 lines for that position:
+renders the 10x10 board live, then the net's raw WDL eval + moves-left estimate
+(both from the mover's POV), then the engine's top 3 lines for that position:
 MCTS policy probability (visits), value (mover's POV), and the principal
 variation. Defaults to the latest ckpt.
 
@@ -29,18 +30,33 @@ TOP_N = 3       # candidate moves ("lines") to show per position
 PV_MAX = 8      # plies of principal-variation continuation to show per line
 
 
-def _resolve_weights(arg: str) -> str:
+def _resolve_weights(arg: str) -> list[str]:
+    """Ordered checkpoint candidates, freshest first. The async/continuous
+    trainer (train_continuous.py) writes weights/run/{weights.pt, iter-async-
+    NNNN.pt}; weights.pt is the live rolling publish (newest but may be mid-
+    write), so it leads and the numbered durable snapshots follow as fallbacks.
+    base_wdl_v* are the WDL-arch bases. (The pre-WDL base_live.pt / iter-az-*.pt
+    are deliberately excluded — old scalar value head, won't load here.)"""
     if arg:
-        return arg
-    cks = sorted(
-        glob.glob(os.path.join(_ENG, "weights/run/iter-az-*.pt")),
+        return [arg]
+    run = os.path.join(_ENG, "weights/run")
+    numbered = glob.glob(os.path.join(run, "iter-async-[0-9]*.pt"))
+    iters = sorted(
+        numbered,
         key=lambda p: int(re.search(r"(\d+)\.pt$", p).group(1)),
         reverse=True,
     )
-    for p in cks + [os.path.join(_ENG, "weights/base_live.pt")]:
-        if os.path.exists(p):
-            return p
-    raise SystemExit("no weights found (weights/run/iter-az-*.pt or base_live.pt); pass --weights")
+    cands = [
+        os.path.join(run, "weights.pt"),
+        *iters,
+        os.path.join(_ENG, "weights/base_wdl_v2.pt"),
+        os.path.join(_ENG, "weights/base_wdl_v1.pt"),
+    ]
+    found = [p for p in cands if os.path.exists(p)]
+    if not found:
+        raise SystemExit("no WDL weights found (weights/run/weights.pt, iter-async-*.pt, "
+                         "or weights/base_wdl_v*.pt); pass --weights")
+    return found
 
 
 def _pv_ucis(child, max_len: int = PV_MAX) -> list[str]:
@@ -60,6 +76,23 @@ def _pv_ucis(child, max_len: int = PV_MAX) -> list[str]:
             break
         node = nxt
     return ucis
+
+
+def _print_net_eval(model, fen: str, turn: str, device: str) -> None:
+    """Show the value head's raw WDL distribution and the moves-left head's
+    plies-to-end estimate for this position (both from the mover's POV) — the
+    network's un-searched read, distinct from the MCTS-backed `ev` per move."""
+    import torch
+
+    from chessckers_engine.encoding import encode_position
+
+    pos = encode_position(fen).unsqueeze(0).to(device)
+    with torch.no_grad():
+        emb = model._position_embedding(pos)
+        wdl = torch.softmax(model.value_head(emb), dim=-1).reshape(-1)
+        mlh = float(model.moves_left_head(emb).reshape(()).item())
+    w, d, lose = (100.0 * wdl[0].item(), 100.0 * wdl[1].item(), 100.0 * wdl[2].item())
+    print(f"  {turn} net eval: W {w:4.1f}% / D {d:4.1f}% / L {lose:4.1f}%  moves-left ~{mlh:.0f}")
 
 
 def _print_analysis(turn: str, result, n_sims: int, top_n: int = TOP_N) -> None:
@@ -104,12 +137,17 @@ def main() -> int:
     from chessckers_engine.variant_py import PyVariantClient
 
     model = ChesskersScorer(d_hidden=256, c_filters=96, n_blocks=4).to(args.device).eval()
-    weights = _resolve_weights(args.weights)
-    try:
-        load_checkpoint(model, weights)
-    except Exception:  # newest checkpoint may be mid-write; fall back
-        weights = os.path.join(_ENG, "weights/base_live.pt")
-        load_checkpoint(model, weights)
+    weights = None
+    last_err: Exception | None = None
+    for cand in _resolve_weights(args.weights):  # freshest first; weights.pt may be mid-write
+        try:
+            load_checkpoint(model, cand)
+            weights = cand
+            break
+        except Exception as e:  # noqa: BLE001 — try the next durable candidate
+            last_err = e
+    if weights is None:
+        raise SystemExit(f"could not load any candidate checkpoint; last error: {last_err}")
 
     seed = args.seed if args.seed >= 0 else int.from_bytes(os.urandom(4), "big")
     # run_mcts draws root Dirichlet noise from the GLOBAL torch RNG, so seed it
@@ -139,6 +177,7 @@ def main() -> int:
             dirichlet_alpha=alpha,      # root exploration noise...
             dirichlet_eps=args.explore,  # ...at --explore fraction (30%)
         )
+        _print_net_eval(model, state["fen"], state["turn"], args.device)  # raw net WDL + moves-left
         _print_analysis(state["turn"], result, args.sims)  # top-3 lines for this position
         chosen = result.chosen
         if chosen is None:
