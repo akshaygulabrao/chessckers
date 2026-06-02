@@ -7,46 +7,37 @@
 # machines), then push current weights up to leena. O_APPEND on the shared log
 # is safe alongside the append-mode trainer.
 set -uo pipefail
-LEENA=leenagulabrao@192.168.68.183
+LEENA=leenagulabrao@Leenas-MacBook-Air.local   # Bonjour hostname — survives leena's DHCP IP changes
 ENG=/Users/ox/AAworkspace/chessckers/engine
 INGEST="$ENG/weights/run/buffer"
 WEIGHTS="$ENG/weights/run/weights.pt"
 LOG=/tmp/cc_train.log
 PY="$ENG/.venv/bin/python"
-SSH="ssh -o BatchMode=yes -o ConnectTimeout=10"
+SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
 PAUSE="$ENG/weights/run/PAUSE_LEENA"        # trainer touches this across its train+save phase
 paused=0; pause_started=0; MAX_PAUSE=600    # SIGSTOP leena while present; force-resume after MAX_PAUSE (stale-marker guard)
+last_w_mtime=0                              # only push (+log) weights to leena when train_continuous republishes a newer file
+STOP="$ENG/weights/run/STOP"                # trainer touches this at the game target -> tear down leena + exit
 mkdir -p "$INGEST"
 while true; do
-  out=$(rsync -ai --remove-source-files -e "$SSH" "$LEENA:chessckers/run/buffer/" "$INGEST/" 2>/dev/null || true)
-  echo "$out" | awk '/\.pkl\.meta$/{print $NF}' | while read -r meta; do
-    f="$INGEST/$meta"; [ -f "$f" ] || continue
-    "$PY" - "$f" <<'PYEOF' >> "$LOG" 2>/dev/null
-import json, sys, re, fcntl
-from datetime import datetime
-COUNTER = "/tmp/cc_gamecount"
-try:
-    m = json.load(open(sys.argv[1]))
-    with open(COUNTER, "a+") as cf:           # shared atomic counter (trainer + sync)
-        fcntl.flock(cf, fcntl.LOCK_EX)
-        cf.seek(0); cur = cf.read().strip()
-        n = (int(cur) if cur.isdigit() else 0) + 1
-        cf.seek(0); cf.truncate(); cf.write(str(n))
-        fcntl.flock(cf, fcntl.LOCK_UN)
-    fen = m.get("seed_fen") or ""
-    board = fen.split(" ")[0]
-    n_wp = board.split("[")[0].count("P")            # White pawns (match _seed_tag)
-    mt = re.search(r"\[([^\]]*)\]", fen)
-    st = "+".join(s.split(":")[0] for s in mt.group(1).split(",")) if mt else "?"
-    if mt and n_wp:
-        st = f"{st}+{n_wp}P"
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]   # millisecond, matches local
-    print(f"{ts}   game #{n} [leena]: {m.get('outcome','?')} in {m.get('plies','?')} plies (seed {st})")
-except Exception:
-    pass
-PYEOF
-  done
-  [ -f "$WEIGHTS" ] && rsync -az -e "$SSH" "$WEIGHTS" "$LEENA:chessckers/run/weights.pt" 2>/dev/null || true
+  # Run ended? train_continuous touches STOP at the game target -> stop leena + exit.
+  if [ -f "$STOP" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S,000')   [sync] run STOP detected -> stopping leena + exiting sync" >> "$LOG"
+    $SSH "$LEENA" 'pkill -f selfplay_workers_only; pkill -f multiprocessing.spawn' 2>/dev/null || true
+    break
+  fi
+  # Pull leena's new games into the shared buffer; train_continuous drains + LOGS
+  # them (local + leena alike), so there is no per-game logging here anymore.
+  rsync -ai --remove-source-files -e "$SSH" "$LEENA:chessckers/run/buffer/" "$INGEST/" >/dev/null 2>&1 || true
+  # Push weights to leena ONLY when train_continuous republished a newer file
+  # (mtime-gated) -> no redundant re-push each cycle; logs the leena weights-fetch.
+  if [ -f "$WEIGHTS" ]; then
+    w_mtime=$(stat -f %m "$WEIGHTS" 2>/dev/null || echo 0)
+    if [ "$w_mtime" != "$last_w_mtime" ] && rsync -az -e "$SSH" "$WEIGHTS" "$LEENA:chessckers/run/weights.pt" 2>/dev/null; then
+      echo "$(date '+%Y-%m-%d %H:%M:%S,000')   [sync] pushed fresh weights -> leena" >> "$LOG"
+      last_w_mtime="$w_mtime"
+    fi
+  fi
   # Pause leena across the trainer's train+save phase (PAUSE_LEENA marker) so it
   # resumes on the fresh weights just pushed above — SIGSTOP/SIGCONT the workers,
   # no leena-side code. Safety: force-resume if the marker goes stale (trainer died).

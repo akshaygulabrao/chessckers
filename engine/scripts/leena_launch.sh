@@ -8,6 +8,12 @@ cd ~/chessckers/engine
 export MACHINE=leena CHESSCKERS_MAX_PLIES=80 CHESSCKERS_VALUE_DISCOUNT=0.98 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 export CHESSCKERS_START_FEN='__MIX__'
 mkdir -p "$HOME/chessckers/run"
+# Keep the Air awake with a STANDALONE detached caffeinate so it doesn't idle/lid
+# sleep and drop off the network (root cause of leena going unreachable). A
+# caffeinate that WRAPS the python did NOT survive ssh-session teardown; a
+# standalone one does. Needs leena on AC power.
+pkill -x caffeinate 2>/dev/null || true
+nohup caffeinate -ims >/dev/null 2>&1 </dev/null & disown
 nohup .venv/bin/python -m chessckers_engine.selfplay_workers_only \
   --run-dir "$HOME/chessckers/run" --weights "$HOME/chessckers/run/weights.pt" \
   --workers 6 --worker-id-base 300 --device cpu --sims 400 \
