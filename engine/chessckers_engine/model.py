@@ -185,7 +185,6 @@ class ChesskersScorer(nn.Module):
             # Value-only batch: no candidate moves anywhere.
             return values, [torch.empty(0, device=device) for _ in range(B)]
 
-        d_hidden = pos_emb.shape[1]
         d_move = next(
             m.shape[1] for m in moves_list if m is not None and m.shape[0] > 0
         )
@@ -197,15 +196,7 @@ class ChesskersScorer(nn.Module):
                 padded[i, : lengths[i]] = moves
                 mask[i, : lengths[i]] = True
 
-        move_emb = self.move_encoder(
-            padded.reshape(B * n_max, d_move)
-        ).reshape(B, n_max, d_hidden)                        # (B, n_max, d_hidden)
-        pos_emb_b = pos_emb.unsqueeze(1).expand(B, n_max, d_hidden)
-        combined = torch.cat([pos_emb_b, move_emb], dim=2)   # (B, n_max, 2*d_hidden)
-        logits = self.head(
-            combined.reshape(B * n_max, 2 * d_hidden)
-        ).reshape(B, n_max)                                  # (B, n_max)
-        logits = logits.masked_fill(~mask, float("-inf"))
+        logits = self._batched_move_logits(pos_emb, padded, mask)
         priors = torch.softmax(logits, dim=1)                # (B, n_max); padding → 0
         # Rows with no moves softmax to NaN (all -inf) but are sliced to empty
         # below and never read.
@@ -213,6 +204,31 @@ class ChesskersScorer(nn.Module):
             priors[i, : lengths[i]] if lengths[i] else torch.empty(0, device=device)
             for i in range(B)
         ]
+
+    def _batched_move_logits(
+        self, pos_emb: torch.Tensor, padded_moves: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Policy-head logits for a padded batch of ragged move lists — shared by
+        batch_eval (MCTS priors) and the training loss so the two can't diverge.
+
+        pos_emb:      (B, d_hidden) — one position embedding per example
+        padded_moves: (B, n_max, d_move) — move features, zero-padded to n_max
+        mask:         (B, n_max) bool — True where a real move sits
+        returns:      (B, n_max) logits with padded slots set to -inf, so a
+                      softmax / log_softmax over dim=1 excludes them. The head is
+                      row-wise, so padding never contaminates real moves' logits.
+        """
+        B, n_max, d_move = padded_moves.shape
+        d_hidden = pos_emb.shape[1]
+        move_emb = self.move_encoder(
+            padded_moves.reshape(B * n_max, d_move)
+        ).reshape(B, n_max, d_hidden)
+        pos_emb_b = pos_emb.unsqueeze(1).expand(B, n_max, d_hidden)
+        combined = torch.cat([pos_emb_b, move_emb], dim=2)   # (B, n_max, 2*d_hidden)
+        logits = self.head(
+            combined.reshape(B * n_max, 2 * d_hidden)
+        ).reshape(B, n_max)
+        return logits.masked_fill(~mask, float("-inf"))
 
     def policy_and_value(
         self, position: torch.Tensor, moves: torch.Tensor

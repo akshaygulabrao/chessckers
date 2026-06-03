@@ -100,32 +100,27 @@ def _batch_loss(
     )                                                            # (B,)
     mlh_loss = nn.functional.mse_loss(ml_pred / MLH_TARGET_SCALE, ml_target / MLH_TARGET_SCALE)
 
-    # Policy head, BATCHED over the whole minibatch. Ragged move lists are
-    # padded to (B, n_max, D); the head is row-wise (LayerNorm/Linear over the
-    # feature dim only) so padding never contaminates real moves, and padded
-    # slots are masked to -inf before the per-position log_softmax — identical
-    # to the per-example computation, but ONE forward instead of B sequential
-    # ones (the old loop ran 256 tiny MPS forwards, kernel-launch-bound).
+    # Policy head, BATCHED via the model's shared padded-policy forward — the
+    # SAME one MCTS uses in batch_eval, so training loss and inference priors
+    # can't drift apart. (The old code ran B tiny sequential forwards, one per
+    # example, which was kernel-launch-bound on MPS.) Build the padded moves +
+    # mask + visit-distribution target on CPU, then ONE host->device transfer
+    # each (mirrors how `positions`/`wdl_targets` are built above).
     move_lists = [
         torch.stack([encode_move(m) for m in ex.legal_moves]) for ex in batch
-    ]                                                            # B × (N_i, D)
+    ]                                                            # B × (N_i, D) on CPU
     counts = [mv.shape[0] for mv in move_lists]
     B, n_max, d_move = len(batch), max(counts), move_lists[0].shape[1]
-    d_hidden = pos_emb.shape[1]
-    padded = positions.new_zeros((B, n_max, d_move))
-    mask = torch.zeros((B, n_max), dtype=torch.bool, device=device)
-    target = positions.new_zeros((B, n_max))
+    padded = torch.zeros((B, n_max, d_move), dtype=torch.float32)
+    mask = torch.zeros((B, n_max), dtype=torch.bool)
+    target = torch.zeros((B, n_max), dtype=torch.float32)
     for i, (mv, ex) in enumerate(zip(move_lists, batch)):
-        padded[i, : counts[i]] = mv.to(device)
+        padded[i, : counts[i]] = mv
         mask[i, : counts[i]] = True
-        target[i, : counts[i]] = torch.tensor(
-            ex.visit_distribution, dtype=torch.float32, device=device,
-        )
-    me = model.move_encoder(padded.reshape(B * n_max, d_move)).reshape(B, n_max, d_hidden)
-    pe = pos_emb.unsqueeze(1).expand(B, n_max, d_hidden)
-    combined = torch.cat([pe, me], dim=2)                        # (B, n_max, 2*d_hidden)
-    logits = model.head(combined.reshape(B * n_max, 2 * d_hidden)).reshape(B, n_max)
-    log_probs = torch.log_softmax(logits.masked_fill(~mask, float("-inf")), dim=1)
+        target[i, : counts[i]] = torch.tensor(ex.visit_distribution, dtype=torch.float32)
+    padded, mask, target = padded.to(device), mask.to(device), target.to(device)
+    logits = model._batched_move_logits(pos_emb, padded, mask)   # (B, n_max); padded -> -inf
+    log_probs = torch.log_softmax(logits, dim=1)
     # CE per example = -Σ target·log_probs over valid moves; padded slots have
     # target=0 and log_probs=-inf (0·-inf=NaN), so zero them before summing.
     policy_loss = (-(target * log_probs)).masked_fill(~mask, 0.0).sum(dim=1).mean()
