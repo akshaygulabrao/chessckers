@@ -14,6 +14,37 @@
 
 namespace py = pybind11;
 
+static cc::WPiece wpiece_from_name(const std::string& n) {
+    if (n == "pawn") return cc::WPiece::Pawn;
+    if (n == "knight") return cc::WPiece::Knight;
+    if (n == "bishop") return cc::WPiece::Bishop;
+    if (n == "rook") return cc::WPiece::Rook;
+    if (n == "queen") return cc::WPiece::Queen;
+    return cc::WPiece::King;
+}
+
+// Reconstruct a White move from its dict. Castling is a White king from e1 to a
+// corner/2-away square (covers both the e1g1 and the e1h1 notation forms).
+static cc::WhiteMove parse_white_move(const py::dict& move) {
+    cc::WhiteMove mv;
+    int from = cc::parse_square(move["from"].cast<std::string>());
+    int to = cc::parse_square(move["to"].cast<std::string>());
+    mv.piece = wpiece_from_name(move["piece"].cast<std::string>());
+    mv.has_promotion = !move["promotion"].is_none();
+    if (mv.has_promotion) mv.promotion = wpiece_from_name(move["promotion"].cast<std::string>());
+    if (!move["capture"].is_none()) mv.capture_sq = cc::parse_square(move["capture"].cast<std::string>());
+    if (mv.piece == cc::WPiece::King && from == 4 && (to == 0 || to == 2 || to == 6 || to == 7)) {
+        mv.is_castling = true;
+        mv.castling_kingside = (to == 6 || to == 7);
+        mv.castling_rook_sq = mv.castling_kingside ? 7 : 0;
+        mv.capture_sq = -1;
+        to = mv.castling_kingside ? 6 : 2;  // king destination
+    }
+    mv.from_sq = from;
+    mv.to_sq = to;
+    return mv;
+}
+
 // Extract the fields PyVariant's Black apply reads off a move dict.
 static cc::BlackMove parse_black_move(const py::dict& move) {
     cc::BlackMove mv;
@@ -343,6 +374,16 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         py::arg("board"), py::arg("move"),
         "Slice 5a: apply a Black move dict to a Board, returning the new Board "
         "(turn flips to White). Mirrors moves_black.apply_black_move_known.");
+
+    m.def(
+        "apply_white_move",
+        [](cc::Board board, const py::dict& move) {
+            cc::apply_white_move(board, parse_white_move(move));
+            return board;
+        },
+        py::arg("board"), py::arg("move"),
+        "Slice 5a: apply a White move dict to a Board, returning the new Board "
+        "(turn flips to Black). Ports python-chess board.push for the search-relevant fields.");
 
     m.def(
         "detect_status",

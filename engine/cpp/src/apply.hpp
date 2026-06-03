@@ -190,6 +190,78 @@ inline void apply_black_move(Board& b, const BlackMove& mv) {
     b.turn_white = true;
 }
 
+// -------- White move apply (python-chess board.push port) --------
+
+// python-chess Board.clean_castling_rights (non-chess960): keep a right only if
+// a friendly rook sits on that corner AND the king is on its home square. This
+// drops a right whose rook was captured by a (manual) Black move before White's
+// next push observes it.
+inline uint64_t clean_castling_rights(const Board& b) {
+    const uint64_t castling = b.castling_rights & b.rooks;
+    uint64_t white = castling & BB_RANK_1 & b.occupied_white & (BB_A1 | BB_H1);
+    uint64_t black = castling & BB_RANK_8 & b.occupied_black & (BB_A8 | BB_H8);
+    if (!(b.occupied_white & b.kings & (1ULL << 4))) white = 0;    // white king must be on e1
+    if (!(b.occupied_black & b.kings & (1ULL << 60))) black = 0;   // black king must be on e8
+    return white | black;
+}
+
+inline void set_white_piece(Board& b, int sq, WPiece t) {
+    bb_remove_piece(b, sq);
+    const uint64_t m = 1ULL << sq;
+    switch (t) {
+        case WPiece::Pawn: b.pawns |= m; break;
+        case WPiece::Knight: b.knights |= m; break;
+        case WPiece::Bishop: b.bishops |= m; break;
+        case WPiece::Rook: b.rooks |= m; break;
+        case WPiece::Queen: b.queens |= m; break;
+        case WPiece::King: b.kings |= m; break;
+    }
+    b.occupied_white |= m;
+}
+
+// Castling is given with to_sq = the king's DESTINATION (g1/c1); castling_rook_sq
+// is the rook origin. (Both notation forms e1g1 and e1h1 reduce to this.)
+struct WhiteMove {
+    int from_sq, to_sq;
+    WPiece piece;
+    bool has_promotion = false;
+    WPiece promotion = WPiece::Queen;
+    int capture_sq = -1;  // captured square (whole Black tower removed); -1 == none
+    bool is_castling = false;
+    bool castling_kingside = false;
+    int castling_rook_sq = 0;
+};
+
+inline void apply_white_move(Board& b, const WhiteMove& mv) {
+    const int from = mv.from_sq, to = mv.to_sq;
+    // Castling rights: clean on the parent state, then clear from/to bits; a
+    // king move clears all White back-rank rights.
+    uint64_t cr = clean_castling_rights(b);
+    cr &= ~(1ULL << from) & ~(1ULL << to);
+    if (mv.piece == WPiece::King) cr &= ~BB_RANK_1;
+    // En passant target: only on a White double push.
+    const int new_ep = (mv.piece == WPiece::Pawn && (to - from) == 16 && (from >> 3) == 1)
+                           ? from + 8
+                           : -1;
+    // Remove captured square (the whole Black tower overlay too).
+    if (mv.capture_sq >= 0) {
+        bb_remove_piece(b, mv.capture_sq);
+        b.stacks.erase((uint8_t)mv.capture_sq);
+    }
+    bb_remove_piece(b, from);
+    if (mv.is_castling) {
+        bb_remove_piece(b, mv.castling_rook_sq);
+        set_white_piece(b, mv.castling_kingside ? 6 : 2, WPiece::King);  // g1/c1
+        set_white_piece(b, mv.castling_kingside ? 5 : 3, WPiece::Rook);  // f1/d1
+    } else {
+        set_white_piece(b, to, mv.has_promotion ? mv.promotion : mv.piece);
+    }
+    b.castling_rights = cr;
+    b.ep_square = new_ep;
+    b.halfmove = (mv.capture_sq >= 0 || mv.piece == WPiece::Pawn) ? 0 : b.halfmove + 1;
+    b.turn_white = false;
+}
+
 // -------- Status detection --------
 
 struct Status {
