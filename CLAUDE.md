@@ -32,6 +32,17 @@ VIRTUAL_ENV=../../.venv ../../.venv/bin/maturin develop --release
 
 Use `--release` for anything performance-sensitive (self-play, the full test suite); the debug build is several× slower. Set `CHESSCKERS_NO_RUST=1` to bypass the extension and run the pure-Python move-gen (used by the spec tests, which also monkeypatch `_rs_movegen = None`).
 
+### C++ engine (lc0-style port, in progress)
+
+A native C++ self-play/search/inference engine is being ported under `engine/cpp/` (pybind11 module `chessckers_cpp`), following lc0 as the reference architecture; **training stays in Python**. The C++ rules are a third implementation (alongside PyVariant + the Rust crate), translated from the validated Rust and held byte-equivalent via the existing parity tests (PyVariant `CHESSCKERS_NO_RUST` is the move-gen oracle; the Rust crate is the cross-check). After editing anything under `cpp/src/`, rebuild + reinstall into the venv:
+
+```
+cd engine
+cpp/build.sh            # cmake + clang++ -> installs chessckers_cpp.*.so into .venv
+```
+
+The slice roadmap (0 = board+FEN round-trip, done) lives in the `project-cpp-port` memory. The C++ module mirrors the Rust crate's bb-decomposed call surface so the same parity tests serve as its oracle.
+
 ### Tests
 
 ```
