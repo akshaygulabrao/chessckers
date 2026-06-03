@@ -8,15 +8,23 @@ the server, so a volunteer needs no inbound SSH — just outbound HTTP. It repla
 the rsync `leena_sync.sh` sidecar.
 
 Each tick (`--poll-seconds`):
-  1. GET /control — if STOP, signal the local workers (touch run-dir/STOP) and exit.
+  1. GET /control (carrying an `X-Client-Id` heartbeat so the server can list live
+     boxes in /status) — if STOP, signal the local workers (touch run-dir/STOP) and
+     exit. A tick that raises an unexpected error is logged and retried next poll —
+     the loop never dies (an unattended volunteer box must outlive transient faults).
   2. GET /version — if changed, GET /weights and write run-dir/weights.pt atomically.
      The local workers hot-reload it on their own mtime poll. Version tracks the
      trainer's newest checkpoint, so this fires once per trainer ITERATION.
   3. Upload finished games: each `*.pkl` older than --min-age with its `.meta`
      present is POSTed (meta first, then pkl, so the server-side trainer sees a
      complete pair), then deleted locally — each game uploaded exactly once.
+  4. If a keep-best gate is open, contribute up to --match-games-per-tick gate
+     games (GET /next_game, play, POST /match_result) via `fleet_match`. This is
+     the only heavy step (torch + move-gen ext), imported lazily and only while a
+     match is open; a box without those deps logs once and stays self-play-only.
 
-Stdlib only (urllib) — no requests/aiohttp dep, so it runs on a bare volunteer venv.
+The sync path is stdlib only (urllib) — no requests/aiohttp dep, so it runs on a
+bare volunteer venv; only the optional step 4 pulls in the engine.
 
 Run (on a self-play box):
 
@@ -28,6 +36,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -38,8 +47,9 @@ from chessckers_engine.runtime import setup_logging
 log = logging.getLogger("chessckers_engine.fleet_client")
 
 
-def _get(url: str, timeout: float) -> bytes:
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+def _get(url: str, timeout: float, headers: dict | None = None) -> bytes:
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
 
@@ -120,38 +130,75 @@ def main() -> int:
     p.add_argument("--min-age", type=float, default=2.0,
                    help="Only upload pkls older than this (s) so their .meta has flushed.")
     p.add_argument("--timeout", type=float, default=30.0, help="per-request HTTP timeout (s)")
+    p.add_argument("--match-games-per-tick", type=int, default=1,
+                   help="keep-best gate games to contribute per tick while a match is open "
+                        "(0 = self-play only; needs torch + the move-gen ext, degrades gracefully)")
+    p.add_argument("--client-id", default="",
+                   help="fleet liveness id sent as X-Client-Id (default: this box's hostname)")
     args = p.parse_args()
 
     server = args.server.rstrip("/")
+    client_id = args.client_id or socket.gethostname()
+    hb = {"X-Client-Id": client_id}  # per-tick heartbeat header (server tracks last-seen)
     run_dir = args.run_dir.resolve()
     weights = run_dir / "weights.pt"
     buffer = run_dir / "buffer"
     stop_path = run_dir / "STOP"
     buffer.mkdir(parents=True, exist_ok=True)
 
-    log.info("fleet client up: server=%s run-dir=%s poll=%.0fs", server, run_dir, args.poll_seconds)
+    log.info("fleet client up: server=%s run-dir=%s poll=%.0fs id=%s",
+             server, run_dir, args.poll_seconds, client_id)
     last_version = ""
     total_up = 0
+    runner = None
+    match_disabled = args.match_games_per_tick <= 0
     while True:
-        # 1. control
         try:
-            control = _get(f"{server}/control", args.timeout).decode().strip()
-        except (urllib.error.URLError, OSError):
-            control = "RUN"  # server unreachable — keep self-playing on current weights
-        if control == "STOP":
-            log.info("server signaled STOP -> stopping local workers + exiting")
+            # 1. control (also the per-tick liveness heartbeat via the X-Client-Id header)
             try:
-                stop_path.touch()
-            except OSError:
-                pass
-            break
-        # 2. net
-        last_version = _pull_weights_if_new(server, weights, last_version, args.timeout)
-        # 3. games
-        n = _upload_games(server, buffer, args.min_age, args.timeout)
-        if n:
-            total_up += n
-            log.info("uploaded %d game(s) (total %d)", n, total_up)
+                control = _get(f"{server}/control", args.timeout, hb).decode().strip()
+            except (urllib.error.URLError, OSError):
+                control = "RUN"  # server unreachable — keep self-playing on current weights
+            if control == "STOP":
+                log.info("server signaled STOP -> stopping local workers + exiting")
+                try:
+                    stop_path.touch()
+                except OSError:
+                    pass
+                break
+            # 2. net
+            last_version = _pull_weights_if_new(server, weights, last_version, args.timeout)
+            # 3. games
+            n = _upload_games(server, buffer, args.min_age, args.timeout)
+            if n:
+                total_up += n
+                log.info("uploaded %d game(s) (total %d)", n, total_up)
+            # 4. contribute gate games while a keep-best match is open (lc0-style).
+            if not match_disabled:
+                if runner is None:
+                    try:
+                        from chessckers_engine.fleet_match import MatchRunner
+                        runner = MatchRunner(run_dir)
+                    except Exception as e:  # noqa: BLE001 — torch/native ext absent: self-play only
+                        log.info("gate-game contribution unavailable (%s) — self-play only", e)
+                        match_disabled = True
+                if runner is not None:
+                    played = 0
+                    for _ in range(args.match_games_per_tick):
+                        try:
+                            if runner.step(server, args.timeout) == 0:
+                                break  # no match open right now
+                        except (urllib.error.URLError, OSError) as e:
+                            log.debug("match step failed (retry next tick): %s", e)
+                            break
+                        except Exception as e:  # noqa: BLE001 — one bad game shouldn't kill the loop
+                            log.warning("match step error (retry next tick): %s", e)
+                            break
+                        played += 1
+                    if played:
+                        log.info("contributed %d gate game(s)", played)
+        except Exception as e:  # noqa: BLE001 — unattended box: never die on an unexpected tick error
+            log.warning("tick error (continuing): %s", e)
         time.sleep(args.poll_seconds)
     return 0
 

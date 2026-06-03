@@ -165,20 +165,46 @@ def _score(outcome: str, cand_is_white: bool) -> float:
     return 1.0 if cand_won else 0.0
 
 
+def _obtain(cand_pick, opp_pick, client, seed: str, cand_white: bool, max_plies: int,
+            remote) -> str:
+    """One gate game's outcome ('white'|'black'|'draw'). If a `remote` source has a
+    matching client-played outcome queued, use it; otherwise play it locally. With
+    `remote=None` this is just a local game — so a gate with no clients is identical
+    to the old all-local gate."""
+    if remote is not None:
+        out = remote.pop(seed, cand_white)
+        if out is not None:
+            return out
+    white_pick, black_pick = (cand_pick, opp_pick) if cand_white else (opp_pick, cand_pick)
+    return _play_from(white_pick, black_pick, client, seed, max_plies)
+
+
 def _gate(cand_pick, opp_pick, client, seeds: list[str], labels: dict[str, str],
-          pairs: int, max_plies: int, tag: str = "gate") -> dict:
+          pairs: int, max_plies: int, tag: str = "gate", remote=None) -> dict:
     """Color-swapped seed-paired match: candidate vs opponent. Returns per-seed
     pair-scores plus the imbalance-aware aggregate (balanced over favored-side
-    classes). Logs a line per seed so a long gate is visibly progressing."""
+    classes). Logs a line per seed so a long gate is visibly progressing.
+
+    `remote` (optional): a source of client-played outcomes for this same match.
+    Each unit a client already supplied is consumed instead of played locally, so
+    the trainer host only plays the units the fleet didn't — the scoring math is
+    unchanged (still exactly 2*pairs games/seed)."""
     per_seed: dict[str, float] = {}
+    rec = [0, 0, 0]  # candidate's aggregate [W, L, D] vs opponent across all gate games
     for si, seed in enumerate(seeds, 1):
         pts = 0.0
+        wld = [0, 0, 0]  # this seed's [W, L, D] from the candidate's perspective
         for _ in range(pairs):
-            pts += _score(_play_from(cand_pick, opp_pick, client, seed, max_plies), True)   # candidate=White
-            pts += _score(_play_from(opp_pick, cand_pick, client, seed, max_plies), False)  # candidate=Black
+            for cand_white in (True, False):
+                s = _score(_obtain(cand_pick, opp_pick, client, seed, cand_white, max_plies, remote),
+                           cand_white)
+                pts += s
+                wld[0 if s == 1.0 else 1 if s == 0.0 else 2] += 1
         per_seed[seed] = pts / (2 * pairs)
-        log.info("  [%s] seed %d/%d %-16s -> %.3f  (%d games)",
-                 tag, si, len(seeds), _seed_tag(seed), per_seed[seed], 2 * pairs)
+        for i in range(3):
+            rec[i] += wld[i]
+        log.info("  [%s] seed %d/%d %-16s -> %.3f  (cand W%d L%d D%d of %d)",
+                 tag, si, len(seeds), _seed_tag(seed), per_seed[seed], wld[0], wld[1], wld[2], 2 * pairs)
 
     # Class scores: a 'balanced' seed counts toward BOTH classes.
     w_scores = [per_seed[s] for s in seeds if labels.get(s) in ("white", "balanced")]
@@ -193,13 +219,66 @@ def _gate(cand_pick, opp_pick, client, seeds: list[str], labels: dict[str, str],
         "class_black": None if class_b is None else round(class_b, 3),
         "balanced_score": round(balanced, 3),
         "min_class": round(min(populated), 3) if populated else 0.0,
+        "record": {"w": rec[0], "l": rec[1], "d": rec[2]},  # candidate vs opponent, whole gate
     }
+
+
+class _RemoteGate:
+    """Outcomes for the open gate that self-play clients POSTed to the server (it
+    wrote each as a JSON file under `match_results/`). `pop` drains the directory
+    into a per-(seed, side) buffer and hands one back, or None if the fleet hasn't
+    supplied that unit yet — in which case the arena plays it locally."""
+
+    def __init__(self, results_dir: Path, match_id: int) -> None:
+        self._dir = results_dir
+        self._mid = match_id
+        self._buf: dict[tuple[str, bool], list[str]] = {}
+        self.popped = 0
+
+    def _drain(self) -> None:
+        for p in sorted(self._dir.glob(f"{self._mid}_*.json")):
+            try:
+                r = json.loads(p.read_text())
+            except (OSError, ValueError):
+                r = None
+            if r and r.get("outcome") in ("white", "black", "draw"):
+                key = (r.get("seed"), bool(r.get("cand_white")))
+                self._buf.setdefault(key, []).append(r["outcome"])
+            try:
+                p.unlink()  # consumed into memory (or unreadable) — don't re-read it
+            except OSError:
+                pass
+
+    def pop(self, seed: str, cand_white: bool):
+        key = (seed, bool(cand_white))
+        if not self._buf.get(key):
+            self._drain()
+        lst = self._buf.get(key)
+        if lst:
+            self.popped += 1
+            return lst.pop()
+        return None
 
 
 def _elo_delta(score: float, cap: float = 400.0) -> float:
     """Elo points implied by a head-to-head score (logistic), clamped."""
     s = min(max(score, 1e-3), 1 - 1e-3)
     return max(-cap, min(cap, 400.0 * math.log10(s / (1 - s))))
+
+
+def _fmt_dur(seconds: float) -> str:
+    """Human-readable elapsed span, e.g. '2h05m', '12m34s', '45s'."""
+    s = int(max(0.0, seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h: return f"{h}h{m:02d}m"
+    if m: return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
+def _clock(t: float) -> str:
+    """Local wall-clock 'YYYY-MM-DD HH:MM:SS' for a unix timestamp."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
 
 
 # --- net loading ---------------------------------------------------------------
@@ -230,6 +309,12 @@ def _atomic_copy(src: Path, dst: Path) -> None:
     tmp = dst.with_suffix(dst.suffix + ".tmp")
     shutil.copy2(src, tmp)
     os.replace(tmp, dst)
+
+
+def _write_json(path: Path, obj: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj))
+    os.replace(tmp, path)
 
 
 def _newest_candidate(run_dir: Path, settle_s: float) -> Path | None:
@@ -303,8 +388,13 @@ def main() -> int:
     arena_dir = run_dir / "_arena"          # working .bin exports for the native gate
     log_path = run_dir / "gate_log.jsonl"
     stop_path = run_dir / "STOP"
+    match_path = run_dir / "match.json"           # open-gate manifest the server hands to clients
+    results_dir = run_dir / "match_results"       # client gate outcomes (server writes them here)
+    cand_served = run_dir / "cand.pt"             # candidate net the server serves as /net/cand
     nets_dir.mkdir(parents=True, exist_ok=True)
     arena_dir.mkdir(parents=True, exist_ok=True)
+    if match_path.exists():
+        match_path.unlink()                       # no gate open at startup; drop any stale manifest
 
     arch = {"d_hidden": args.d_hidden, "c_filters": args.c_filters, "n_blocks": args.n_blocks}
     anchor_pairs = args.anchor_pairs or args.pairs
@@ -335,11 +425,15 @@ def main() -> int:
             _atomic_copy(weights_path, nets_dir / f"net-{ts0}.pt")
             if not anchor_path.exists():
                 _atomic_copy(weights_path, anchor_path)
-            log.info("seeded best v0 from %s (anchor frozen) -> %s", weights_path.name, best_path.name)
+            log.info("best v0 seeded from %s (anchor frozen) @ %s -> %s",
+                     weights_path.name, _clock(ts0), best_path.name)
             break
         log.info("waiting for trainer to publish weights.pt ...")
         time.sleep(5.0)
 
+    # Wall-clock of the current champion: best.pt's mtime (the v0 seed just now,
+    # or a pre-existing best on resume). Drives the "since last best" readouts.
+    last_best_time = best_path.stat().st_mtime
     best_net = _make_net(best_path, arch, arena_dir / "best.bin", device)
     anchor_net = _make_net(anchor_path if anchor_path.exists() else best_path,
                            arch, arena_dir / "anchor.bin", device)
@@ -358,8 +452,8 @@ def main() -> int:
         cand_path = _newest_candidate(run_dir, settle_s=3.0)
         if cand_path is None or cand_path.name == last_cand:
             if not idle_logged:
-                log.info("caught up (newest gated: %s) — waiting for the next checkpoint",
-                         last_cand or "none")
+                log.info("caught up (newest gated: %s) — best is %s old (last promoted %s) — waiting for the next checkpoint",
+                         last_cand or "none", _fmt_dur(time.time() - last_best_time), _clock(last_best_time))
                 idle_logged = True
             time.sleep(args.gate_seconds)
             continue
@@ -373,8 +467,33 @@ def main() -> int:
                  cand_path.name, ", ".join(f"{_seed_tag(s)}={glyph[labels[s]]}" for s in seeds),
                  len(seeds), args.pairs, len(seeds) * args.pairs * 2)
 
+        # Publish this gate so self-play clients can contribute its games (lc0-style):
+        # copy the candidate to a served path, clear stale results, write the manifest.
+        # The arena still plays every unit no client supplied, so with no clients this
+        # is identical to a local gate — the fleet only offloads work.
+        match_id = int(time.time())
+        if results_dir.exists():
+            shutil.rmtree(results_dir, ignore_errors=True)
+        results_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_copy(cand_path, cand_served)
+        _write_json(match_path, {
+            "match_id": match_id,
+            "seeds": seeds,
+            "arch": arch,
+            "params": {"sims": args.sims, "c_puct": args.c_puct,
+                       "dir_alpha": args.dirichlet_alpha, "dir_eps": args.dirichlet_eps,
+                       "max_plies": args.max_plies},
+        })
+        remote = _RemoteGate(results_dir, match_id)
         res = _gate(_picker(cand_net), _picker(best_net), client, seeds, labels,
-                    args.pairs, args.max_plies, tag="gate")
+                    args.pairs, args.max_plies, tag="gate", remote=remote)
+        try:
+            match_path.unlink()                    # close the gate: clients fall back to self-play
+        except OSError:
+            pass
+        if remote.popped:
+            log.info("  %d/%d gate games contributed by clients", remote.popped,
+                     len(seeds) * args.pairs * 2)
         promoted = (res["balanced_score"] >= args.threshold and res["min_class"] >= args.side_floor)
 
         rec = {
@@ -393,9 +512,11 @@ def main() -> int:
             best_net = cand_net                            # in-memory net; cand.bin may be overwritten later
             best_elo += _elo_delta(res["balanced_score"])
             rec["best_elo"] = round(best_elo, 1)
-            log.info("PROMOTED %s -> best (#%d) | balanced=%.3f W=%s B=%s | elo=%.1f | benchmarking vs anchor...",
-                     cand_path.name, promotions, res["balanced_score"],
+            log.info("PROMOTED %s -> best #%d @ %s | %s since previous best | record W%d-L%d-D%d (score=%.3f) W=%s B=%s | elo=%.1f | benchmarking vs anchor...",
+                     cand_path.name, promotions, _clock(ts), _fmt_dur(ts - last_best_time),
+                     res["record"]["w"], res["record"]["l"], res["record"]["d"], res["balanced_score"],
                      res["class_white"], res["class_black"], best_elo)
+            last_best_time = ts
             # Per-side capacity: new best vs the FROZEN anchor (separable, unlike vs best).
             cap = _gate(_picker(best_net), _picker(anchor_net), client, seeds, labels,
                         anchor_pairs, args.max_plies, tag="anchor")
@@ -403,8 +524,9 @@ def main() -> int:
             rec["anchor_black"] = cap["class_black"]
             log.info("  vs-anchor per-side: W=%s B=%s (capacity curve)", cap["class_white"], cap["class_black"])
         else:
-            log.info("rejected %s | balanced=%.3f (need %.2f) min_class=%.3f (need %.2f) W=%s B=%s",
-                     cand_path.name, res["balanced_score"], args.threshold, res["min_class"], args.side_floor,
+            log.info("rejected %s | record W%d-L%d-D%d (score=%.3f, need %.2f) min_class=%.3f (need %.2f) W=%s B=%s",
+                     cand_path.name, res["record"]["w"], res["record"]["l"], res["record"]["d"],
+                     res["balanced_score"], args.threshold, res["min_class"], args.side_floor,
                      res["class_white"], res["class_black"])
 
         with open(log_path, "a") as f:
