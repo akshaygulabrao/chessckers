@@ -7,11 +7,33 @@
 #include <type_traits>
 #include <variant>
 
+#include "apply.hpp"
 #include "board.hpp"
 #include "movegen.hpp"
 #include "movegen_white.hpp"
 
 namespace py = pybind11;
+
+// Extract the fields PyVariant's Black apply reads off a move dict.
+static cc::BlackMove parse_black_move(const py::dict& move) {
+    cc::BlackMove mv;
+    mv.from_sq = cc::parse_square(move["from"].cast<std::string>());
+    mv.to_sq = cc::parse_square(move["to"].cast<std::string>());
+    mv.has_deploy_count = !move["deployCount"].is_none();
+    if (mv.has_deploy_count) mv.deploy_count = move["deployCount"].cast<int>();
+    mv.has_chain_hops = !move["chainHops"].is_none();
+    mv.has_capture = !move["capture"].is_none();
+    mv.has_waypoints = !move["waypoints"].is_none();
+    if (move.contains("_chain_all_captures") && !move["_chain_all_captures"].is_none())
+        mv.chain_all_captures = move["_chain_all_captures"].cast<std::vector<std::string>>();
+    if (move.contains("_is_suicide"))
+        mv.is_suicide = move["_is_suicide"].cast<bool>();
+    if (move.contains("_chain_promotes"))
+        mv.chain_promotes = move["_chain_promotes"].cast<bool>();
+    if (!move["demotedKings"].is_none())
+        mv.demoted_kings = move["demotedKings"].cast<std::vector<int>>();
+    return mv;
+}
 
 static py::dict white_move_to_dict(const cc::WCandidate& c) {
     py::dict d;
@@ -311,4 +333,26 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         py::arg("castling_rights"), py::arg("ep_square"), py::arg("stacks"),
         "Slice 3b: full White legal move list (FIDE pseudo-legal + Chessckers check filter), "
         "with the king-to-rook castling alt form. Mirrors Rust white_legal_moves.");
+
+    m.def(
+        "apply_black_move",
+        [](cc::Board board, const py::dict& move) {
+            cc::apply_black_move(board, parse_black_move(move));
+            return board;
+        },
+        py::arg("board"), py::arg("move"),
+        "Slice 5a: apply a Black move dict to a Board, returning the new Board "
+        "(turn flips to White). Mirrors moves_black.apply_black_move_known.");
+
+    m.def(
+        "detect_status",
+        [](const cc::Board& b) {
+            const auto s = cc::detect_status(b);
+            py::object status = s.status.empty() ? py::none() : py::cast(s.status);
+            py::object winner = s.winner.empty() ? py::none() : py::cast(s.winner);
+            return py::make_tuple(status, winner);
+        },
+        py::arg("board"),
+        "Slice 5a: (status, winner) for a Board — terminal detection mirroring "
+        "client._detect_status + the move-gen-derived mate/stalemate/variantEnd.");
 }
