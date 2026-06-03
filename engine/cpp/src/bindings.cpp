@@ -9,8 +9,48 @@
 
 #include "board.hpp"
 #include "movegen.hpp"
+#include "movegen_white.hpp"
 
 namespace py = pybind11;
+
+static py::dict white_move_to_dict(const cc::WCandidate& c) {
+    py::dict d;
+    d["uci"] = cc::white_uci(c);
+    d["from"] = cc::square_name(c.from_sq);
+    d["to"] = cc::square_name(c.to_sq);
+    d["piece"] = cc::wpiece_name(c.piece);
+    d["color"] = "white";
+    if (c.capture_sq >= 0) d["capture"] = cc::square_name(c.capture_sq);
+    else d["capture"] = py::none();
+    d["waypoints"] = py::none();
+    d["chainHops"] = py::none();
+    if (c.promotion) d["promotion"] = *c.promotion;
+    else d["promotion"] = py::none();
+    d["demotedKings"] = py::none();
+    d["demotionsRequired"] = py::none();
+    d["sourceKingPositions"] = py::none();
+    d["deployCount"] = py::none();
+    return d;
+}
+
+// King-to-rook alternate castling form (e1h1 / e1a1) the Rust also emits.
+static py::dict white_castling_alt_to_dict(const cc::WCandidate& c) {
+    py::dict d;
+    d["uci"] = cc::square_name(c.from_sq) + cc::square_name(c.castling_rook_sq);
+    d["from"] = cc::square_name(c.from_sq);
+    d["to"] = cc::square_name(c.castling_rook_sq);
+    d["piece"] = "king";
+    d["color"] = "white";
+    d["capture"] = py::none();
+    d["waypoints"] = py::none();
+    d["chainHops"] = py::none();
+    d["promotion"] = py::none();
+    d["demotedKings"] = py::none();
+    d["demotionsRequired"] = py::none();
+    d["sourceKingPositions"] = py::none();
+    d["deployCount"] = py::none();
+    return d;
+}
 
 static py::dict chain_to_dict(const cc::ChainMove& m) {
     py::dict d;
@@ -222,4 +262,53 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         py::arg("occupied"), py::arg("occupied_white"), py::arg("king_sq"), py::arg("stacks"),
         "Slice 2d: full Black legal move list with mandate applied, in the authoritative "
         "(Rust) order. Mirrors moves_black._all_black_legal / Rust all_black_legal_moves.");
+
+    m.def(
+        "black_can_capture_white_king",
+        [](uint64_t occupied, uint64_t occupied_white, long king_sq,
+           std::map<uint8_t, std::string> stacks) {
+            return cc::black_can_capture_white_king(occupied, occupied_white, king_sq, stacks);
+        },
+        py::arg("occupied"), py::arg("occupied_white"), py::arg("king_sq"), py::arg("stacks"),
+        "Slice 3a: can Black capture the White king (diagonal chains + rams)?");
+
+    m.def(
+        "square_attacked_by_black_chessckers",
+        [](uint64_t occupied, uint64_t occupied_white, std::map<uint8_t, std::string> stacks,
+           int target_sq) {
+            return cc::square_attacked_by_black_chessckers(occupied, occupied_white, stacks,
+                                                           target_sq);
+        },
+        py::arg("occupied"), py::arg("occupied_white"), py::arg("stacks"), py::arg("target_sq"),
+        "Slice 3a: walk-based Black attack test on a target square.");
+
+    m.def(
+        "white_in_chessckers_check",
+        [](uint64_t occupied, uint64_t occupied_white, long white_king,
+           std::map<uint8_t, std::string> stacks) {
+            return cc::white_in_chessckers_check(occupied, occupied_white, white_king, stacks);
+        },
+        py::arg("occupied"), py::arg("occupied_white"), py::arg("white_king"), py::arg("stacks"),
+        "Slice 3a: is White in Chessckers check? black_can_capture_white_king OR "
+        "square_attacked_by_black_chessckers on the king square.");
+
+    m.def(
+        "white_legal_moves",
+        [](uint64_t occupied, uint64_t occupied_white, uint64_t pawns, uint64_t knights,
+           uint64_t bishops, uint64_t rooks, uint64_t queens, uint64_t kings,
+           uint64_t castling_rights, long ep_square, std::map<uint8_t, std::string> stacks) {
+            cc::WhiteBoard b{occupied, occupied_white, pawns,          knights,  bishops, rooks,
+                             queens,   kings,          castling_rights, ep_square};
+            py::list out;
+            for (const auto& c : cc::white_legal_moves(b, stacks)) {
+                out.append(white_move_to_dict(c));
+                if (c.is_castling) out.append(white_castling_alt_to_dict(c));  // alt form too
+            }
+            return out;
+        },
+        py::arg("occupied"), py::arg("occupied_white"), py::arg("pawns"), py::arg("knights"),
+        py::arg("bishops"), py::arg("rooks"), py::arg("queens"), py::arg("kings"),
+        py::arg("castling_rights"), py::arg("ep_square"), py::arg("stacks"),
+        "Slice 3b: full White legal move list (FIDE pseudo-legal + Chessckers check filter), "
+        "with the king-to-rook castling alt form. Mirrors Rust white_legal_moves.");
 }

@@ -12,6 +12,7 @@
 // ring; rim squares carry no pieces and have square index -1.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -33,6 +34,8 @@ constexpr int MAX_HOP_STEPS = 26;
 constexpr int SQ_EMPTY = 0;
 constexpr int SQ_WHITE = 1;
 constexpr int SQ_BLACK = 2;
+
+inline constexpr std::pair<int, int> ORTHO_DIRS[4] = {{0, 1}, {0, -1}, {1, 0}, {-1, 0}};
 
 inline bool on_board(int f, int r) { return f >= 0 && f <= 7 && r >= 0 && r <= 7; }
 inline bool on_grid(int f, int r) { return f >= -1 && f <= 8 && r >= -1 && r <= 8; }
@@ -597,7 +600,6 @@ inline std::vector<std::vector<int>> combinations(const std::vector<int>& items,
 
 inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t occupied_white,
                                                   const std::map<uint8_t, std::string>& stacks) {
-    static const std::pair<int, int> ORTHO_DIRS[4] = {{0, 1}, {0, -1}, {1, 0}, {-1, 0}};
     std::vector<ChargeMove> moves;
     for (auto& [from_sq, pieces] : stacks) {
         if (pieces.empty() || pieces.back() != 'k') continue;  // King-top towers only
@@ -776,6 +778,122 @@ inline std::vector<AnyMove> all_black_legal_moves(uint64_t occupied, uint64_t oc
         for (auto& cm : chain) out.push_back(cm);
     }
     return out;
+}
+
+// -------- White-king check predicate (Slice 3a) --------
+//
+// Used by White move legality: white_in_chessckers_check = can Black capture the
+// White king via a diagonal chain/ram (black_can_capture_white_king, full chain
+// search) OR is the king's square attacked under the cheaper walk-based model
+// (square_attacked_by_black_chessckers). python-chess's own is_check is wrong
+// here because it treats the Black-King encoding as a FIDE 8-direction king.
+
+inline bool contains(const std::vector<int>& v, int x) {
+    return std::find(v.begin(), v.end(), x) != v.end();
+}
+
+// Bool early-exit mirror of enumerate_chains_recursive: does any chain from here
+// path-capture the king?
+inline bool chain_captures_king_rec(uint64_t occupied, uint64_t occupied_white,
+                                    const std::map<uint8_t, std::string>& stacks, int cf, int cr,
+                                    const std::string& cur_stack, bool has_last_dir, int ldf, int ldr,
+                                    bool has_cadence, int cadence, int n, int king) {
+    if ((occupied_white & (1ULL << king)) == 0) return false;
+    for (auto& hop : next_capture_options(occupied, occupied_white, stacks, cf, cr, cur_stack,
+                                          has_last_dir, ldf, ldr, n, has_cadence, cadence, false)) {
+        if (contains(hop.captures, king)) return true;
+        if (hop.is_overshoot) continue;
+        auto ap = apply_hop(occupied, occupied_white, stacks, cf, cr, cur_stack, hop);
+        int nf, nr;
+        if (hop.landing_square >= 0) {
+            nf = hop.landing_square & 7;
+            nr = hop.landing_square >> 3;
+        } else {
+            const auto pr = parse_waypoint_key(hop.landing_key);
+            nf = pr ? pr->first : cf;
+            nr = pr ? pr->second : cr;
+        }
+        const int next_cadence = has_cadence ? cadence : hop.cadence;
+        if (chain_captures_king_rec(ap.occupied, ap.occupied_white, ap.stacks, nf, nr, ap.land_stack,
+                                    true, hop.df, hop.dr, true, next_cadence, n, king))
+            return true;
+    }
+    return false;
+}
+
+inline bool black_can_capture_white_king(uint64_t occupied, uint64_t occupied_white, long king_sq,
+                                         const std::map<uint8_t, std::string>& stacks) {
+    if (king_sq < 0 || (occupied_white & (1ULL << king_sq)) == 0) return false;
+    const int king = (int)king_sq;
+    for (auto& [sq, pieces] : stacks) {
+        if (pieces.empty()) continue;
+        const int n = (int)pieces.size();
+        const int cf = sq & 7, cr = sq >> 3;
+        if (chain_captures_king_rec(occupied, occupied_white, stacks, cf, cr, pieces, false, 0, 0,
+                                    false, 0, n, king))
+            return true;
+        // First-hop rams capture their path Whites in transit (may include the king).
+        for (auto [df, dr] : dirs_for_top(pieces.back()))
+            for (auto& hop : find_capture_hops(occupied, occupied_white, stacks, cf, cr, df, dr, n))
+                if (hop.is_suicide && contains(hop.captures, king)) return true;
+    }
+    return false;
+}
+
+// Cheaper walk-based attack test on a target square (does NOT model rim-bounce
+// diagonals — matches the Python/Rust reference). Diagonal walks (range = tower
+// height; Whites in path don't block, friendly Black towers do) + orthogonal
+// charges (King-top, n_kings>=2; rim-overshoot still attacks).
+inline bool square_attacked_by_black_chessckers(uint64_t occupied, uint64_t occupied_white,
+                                                const std::map<uint8_t, std::string>& stacks,
+                                                int target_sq) {
+    for (auto& [from_sq, pieces] : stacks) {
+        if (pieces.empty()) continue;
+        const int n = (int)pieces.size();
+        const char top = pieces.back();
+        const bool is_king_top = (top == 'k');
+        int n_kings = 0;
+        if (is_king_top)
+            for (char c : pieces)
+                if (c == 'k') ++n_kings;
+        const int sf = from_sq & 7, sr = from_sq >> 3;
+
+        for (auto [df, dr] : dirs_for_top(top)) {  // ALL_DIAGS for king-top, else FORWARD_DIAGS
+            for (int k = 1; k <= n; ++k) {
+                const int nf = sf + k * df, nr = sr + k * dr;
+                if (!on_board(nf, nr)) break;
+                const int nsq = sq_idx(nf, nr);
+                if (nsq == target_sq) return true;
+                if (owner(occupied, occupied_white, nsq) == SQ_BLACK && stacks.count((uint8_t)nsq))
+                    break;
+            }
+        }
+
+        if (is_king_top && n_kings >= 2) {
+            for (auto [df, dr] : ORTHO_DIRS) {
+                for (int k = 1; k < n_kings; ++k) {
+                    const int nf = sf + k * df, nr = sr + k * dr;
+                    if (!on_board(nf, nr)) break;
+                    const int nsq = sq_idx(nf, nr);
+                    if (nsq == target_sq) {
+                        // charge to k+1 must land on the grid (board OR rim) to capture in transit
+                        if (on_grid(sf + (k + 1) * df, sr + (k + 1) * dr)) return true;
+                        break;
+                    }
+                    if (owner(occupied, occupied_white, nsq) == SQ_BLACK && stacks.count((uint8_t)nsq))
+                        break;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+inline bool white_in_chessckers_check(uint64_t occupied, uint64_t occupied_white, long white_king,
+                                      const std::map<uint8_t, std::string>& stacks) {
+    if (white_king < 0) return false;  // king already captured
+    if (black_can_capture_white_king(occupied, occupied_white, white_king, stacks)) return true;
+    return square_attacked_by_black_chessckers(occupied, occupied_white, stacks, (int)white_king);
 }
 
 }  // namespace cc
