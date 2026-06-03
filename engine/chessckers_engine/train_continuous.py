@@ -240,6 +240,11 @@ def main() -> int:
                    help="bound the archive to this many GB, FIFO-evicting oldest shards (0 = unbounded). "
                         "Set below the disk's free space, e.g. 380 on a 400 GB volume.")
     p.add_argument("--buffer-cap", type=int, default=50000, help="rolling replay buffer capacity (positions)")
+    p.add_argument("--no-prime", action="store_true",
+                   help="do NOT warm-start the in-RAM window from the archive. Keeps archiving, but the "
+                        "trainer starts cold (waits for --min-buffer) and stays generation-bound — avoids "
+                        "the startup burst (priming injects buffer-cap positions at once, handing the "
+                        "replay-factor throttle a huge budget that hogs CPU and starves self-play workers).")
     p.add_argument("--min-buffer", type=int, default=2000, help="start training once the buffer reaches this")
     p.add_argument("--replay-factor", type=float, default=8.0,
                    help="cap total samples at this x positions-ingested (prevents overfitting a small buffer "
@@ -307,10 +312,12 @@ def main() -> int:
     # resumes WARM (no cold min_buffer wait) and the window can be larger than
     # one process's freshly-ingested games. Stays RAM-resident — the slow flash
     # is read once here, never per training batch.
-    if archive and archive.enabled:
+    if archive and archive.enabled and not args.no_prime:
         buf = archive.load_recent(args.buffer_cap)
         if buf:
             log.info("primed replay window from archive: %d positions (cap %d)", len(buf), args.buffer_cap)
+    elif args.no_prime:
+        log.info("cold start (--no-prime): not priming from archive; trainer waits for min_buffer")
     steps = 0
     games_seen = 0
     positions_ingested = len(buf)  # primed data counts as ingested (restores the replay-factor throttle state)

@@ -11,9 +11,11 @@
 #      move the finished run's iter-async checkpoints aside (prev_ckpts/) so the
 #      new run's numbering doesn't clobber them.
 #   3. Start train_continuous + local workers in weights/run, with the new seed
-#      mix, 200-ply cap, and a 300k replay window. The archive is reused
-#      (--archive-dir) so the buffer PRIMES from the old games while the new mix
-#      collects.
+#      mix, 200-ply cap, and a 300k replay window. The net is warm-started
+#      (--base), but the replay window is NOT primed from the archive
+#      (--no-prime): the trainer starts cold and generation-bound so it never
+#      bursts and starves the self-play workers of CPU. The archive is still
+#      written (--archive-dir, FIFO-capped).
 #   4. Best-effort bring up leena: if reachable, deploy the seed mix + relaunch
 #      its workers and start the local leena_sync sidecar. If leena is asleep /
 #      off-network, warn and continue LOCAL-ONLY (never aborts the run).
@@ -39,7 +41,7 @@ MIN_BUFFER=2000
 ARCHIVE_CAP_GB=380         # FIFO-cap the 400 GB stick (oldest shards evicted)
 MAX_PLIES=200              # was 80
 SIMS=400
-WORKERS=6
+WORKERS=4                  # was 6 — fewer native workers to cut CPU contention (8 cores, 6 P-cores)
 DHID=256; CFIL=96; NBLK=4  # arch — UNCHANGED from the current run (2.5 M params)
 # --------------------------------
 
@@ -88,7 +90,7 @@ BASE_ARG=""; [ -n "$BASE" ] && BASE_ARG="--base '$BASE'"
 log "starting trainer (train_continuous)…"
 run "cd '$ENG' && nohup '$PY' -m chessckers_engine.train_continuous \
   --run-dir '$RUN_DIR' $BASE_ARG \
-  --archive-dir '$ARCHIVE_DIR' --archive-cap-gb $ARCHIVE_CAP_GB \
+  --archive-dir '$ARCHIVE_DIR' --archive-cap-gb $ARCHIVE_CAP_GB --no-prime \
   --buffer-cap $BUFFER_CAP --min-buffer $MIN_BUFFER \
   --replay-factor 8 --batch-size 256 --lr 1e-3 \
   --publish-seconds 45 --ckpt-seconds 120 \
@@ -98,9 +100,9 @@ run "cd '$ENG' && nohup '$PY' -m chessckers_engine.train_continuous \
 sleep 2  # let the trainer publish initial weights.pt before workers poll
 log "starting local workers (new seed mix, ${MAX_PLIES}-ply cap)…"
 run "cd '$ENG' && CHESSCKERS_START_FEN='$SEED_MIX' CHESSCKERS_MAX_PLIES=$MAX_PLIES \
-  OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 MACHINE=local \
+  OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 MACHINE=local \
   nohup '$PY' -m chessckers_engine.selfplay_workers_only \
-  --run-dir '$RUN_DIR' --weights '$RUN_DIR/weights.pt' \
+  --run-dir '$RUN_DIR' --weights '$RUN_DIR/weights.pt' --native \
   --workers $WORKERS --worker-id-base 0 --device cpu --sims $SIMS \
   --d-hidden $DHID --c-filters $CFIL --n-blocks $NBLK \
   --temperature 1.0 --dirichlet-alpha 0.5 --dirichlet-eps 0.40 \

@@ -301,22 +301,42 @@ static void mcts_simulate(cc::PuctNode* root, const py::function& eval_fn, doubl
 static double mcts_expand_native(cc::PuctNode* node, const cc::ChesskersNet& net) {
     py::list legal = gen_legal_dicts(node->board);
     const size_t n = py::len(legal);
+    node->expanded = true;
+    if (n == 0) {
+        // No legal moves => a no-moves terminal (mate / stalemate / Black-stuck)
+        // that the cheap child-creation checks below couldn't resolve. Resolve
+        // its exact status now (lazy terminal detection) and back up the true
+        // terminal value, not the value head. detect_status re-runs one move-gen,
+        // but only for genuine no-moves nodes, which are rare.
+        const auto st = cc::detect_status(node->board);
+        node->is_terminal = true;
+        node->terminal_status = st.status;
+        return cc::terminal_value(*node);
+    }
     const auto pos_enc = cc::encode_position(node->board);
     std::vector<std::vector<float>> move_encs;
     move_encs.reserve(n);
     for (size_t i = 0; i < n; ++i) move_encs.push_back(encode_move_dict(legal[i].cast<py::dict>()));
     const auto r = net.eval(pos_enc, move_encs);
-    node->expanded = true;
-    if (n == 0) return r.first;
     for (size_t i = 0; i < n; ++i) {
         const py::dict mv = legal[i].cast<py::dict>();
         auto child = std::make_unique<cc::PuctNode>();
         child->board = apply_dict(node->board, mv);
         child->uci = mv["uci"].cast<std::string>();
         child->prior = r.second[i];
-        const auto st = cc::detect_status(child->board);
-        child->is_terminal = !st.status.empty();
-        child->terminal_status = st.status;
+        // Cheap-only terminal checks (O(1) popcounts), mirroring detect_status's
+        // first two branches: Black eliminated, or White king captured -- the
+        // DOMINANT Chessckers terminals. The no-moves terminals are detected
+        // lazily when this child is itself expanded (n==0 above), so we never run
+        // full move-gen for the ~80-90% of children that are never expanded. This
+        // is behavior-identical to eager detection (the terminal value enters
+        // backup only when the node is first selected) but generates far fewer
+        // move lists -- the per-child move-gen was the native search's bottleneck.
+        if (child->board.stacks.empty() ||
+            (child->board.kings & child->board.occupied_white) == 0) {
+            child->is_terminal = true;
+            child->terminal_status = "variantEnd";
+        }
         node->children.push_back(std::move(child));
     }
     return r.first;
