@@ -269,6 +269,11 @@ def _last_elo(log_path: Path) -> float:
 
 def main() -> int:
     setup_logging()
+    # Tag every line with [arena] so the arena can share the trainer's unified log
+    # stream (both append to /tmp/cc_train.log) and still be told apart from the
+    # trainer's per-game lines — one log to watch.
+    for _h in logging.getLogger().handlers:
+        _h.setFormatter(logging.Formatter("%(asctime)s [arena] %(message)s"))
     p = argparse.ArgumentParser(description="Keep-best gating arena (imbalance-aware).")
     p.add_argument("--run-dir", required=True, type=Path, help="trainer's run-dir (shared)")
     p.add_argument("--seed-mix-file", required=True, type=Path,
