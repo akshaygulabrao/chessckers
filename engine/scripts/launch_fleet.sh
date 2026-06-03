@@ -33,7 +33,7 @@ LAN_IP=$(ipconfig getifaddr en0 || ipconfig getifaddr en1 || echo 127.0.0.1)
 DH=256; CF=96; NB=4
 # Curriculum: the SAME canonical seed mix leena_launch.sh reads, so local + leena
 # self-play the identical distribution into the shared buffer.
-SEED_MIX_FILE="$ENG/scripts/seed_mix.txt"
+SEED_MIX_FILE="$(dirname "$ENG")/scripts/seed_mix.txt"   # repo-root scripts/, same file launch_next.sh uses
 MIX=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$SEED_MIX_FILE" | paste -sd ';' -)
 [ -n "$MIX" ] || { echo "empty/missing seed mix at $SEED_MIX_FILE" >&2; exit 1; }
 
