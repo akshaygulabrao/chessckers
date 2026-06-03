@@ -17,7 +17,7 @@ PY="$ENG/.venv/bin/python"
 SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
 PAUSE="$RUN_DIR/PAUSE_LEENA"                 # trainer touches this across its train+save phase
 paused=0; pause_started=0; MAX_PAUSE=600    # SIGSTOP leena while present; force-resume after MAX_PAUSE (stale-marker guard)
-last_w_mtime=0                              # only push (+log) weights to leena when train_continuous republishes a newer file
+last_push_ckpt=-1                           # push weights to leena once per trainer ITERATION (new iter-async-*.pt), not every 45s publish; -1 forces an initial push so leena has weights at startup
 STOP="$RUN_DIR/STOP"                        # trainer touches this at the game target -> tear down leena + exit
 mkdir -p "$INGEST"
 while true; do
@@ -30,13 +30,18 @@ while true; do
   # Pull leena's new games into the shared buffer; train_continuous drains + LOGS
   # them (local + leena alike), so there is no per-game logging here anymore.
   rsync -ai --remove-source-files -e "$SSH" "$LEENA:chessckers/run/buffer/" "$INGEST/" >/dev/null 2>&1 || true
-  # Push weights to leena ONLY when train_continuous republished a newer file
-  # (mtime-gated) -> no redundant re-push each cycle; logs the leena weights-fetch.
+  # Push weights to leena once per trainer ITERATION (when a new iter-async-*.pt
+  # checkpoint lands), NOT on every 45s publish: each push makes leena's 4 workers
+  # hot-reload (torch load + native .bin re-export + ChesskersNet rebuild), which
+  # interrupts game-gen on the Air. The initial push (last_push_ckpt=-1) still
+  # fires immediately so leena has weights to start. Leena self-plays on slightly
+  # staler weights between iterations — benign for async self-play.
   if [ -f "$WEIGHTS" ]; then
-    w_mtime=$(stat -f %m "$WEIGHTS" 2>/dev/null || echo 0)
-    if [ "$w_mtime" != "$last_w_mtime" ] && rsync -az -e "$SSH" "$WEIGHTS" "$LEENA:chessckers/run/weights.pt" 2>/dev/null; then
-      echo "$(date '+%Y-%m-%d %H:%M:%S,000')   [sync] pushed fresh weights -> leena" >> "$LOG"
-      last_w_mtime="$w_mtime"
+    newest_ckpt=$(ls -t "$RUN_DIR"/iter-async-*.pt 2>/dev/null | head -1)
+    ckpt_mtime=0; [ -n "$newest_ckpt" ] && ckpt_mtime=$(stat -f %m "$newest_ckpt" 2>/dev/null || echo 0)
+    if [ "$ckpt_mtime" != "$last_push_ckpt" ] && rsync -az -e "$SSH" "$WEIGHTS" "$LEENA:chessckers/run/weights.pt" 2>/dev/null; then
+      echo "$(date '+%Y-%m-%d %H:%M:%S,000')   [sync] pushed weights -> leena (iter ckpt)" >> "$LOG"
+      last_push_ckpt="$ckpt_mtime"
     fi
   fi
   # Pause leena across the trainer's train+save phase (PAUSE_LEENA marker) so it
