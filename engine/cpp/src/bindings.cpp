@@ -13,6 +13,7 @@
 #include "board.hpp"
 #include "movegen.hpp"
 #include "movegen_white.hpp"
+#include "nn.hpp"
 #include "search.hpp"
 
 namespace py = pybind11;
@@ -485,6 +486,20 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         py::arg("board"),
         "Slice 5a: (status, winner) for a Board — terminal detection mirroring "
         "client._detect_status + the move-gen-derived mate/stalemate/variantEnd.");
+
+    py::class_<cc::ChesskersNet>(m, "ChesskersNet")
+        .def(py::init<const std::string&>(), py::arg("weights_path"),
+             "Slice 6: native NN forward, loaded from native_net.export_state_dict.")
+        .def(
+            "eval",
+            [](const cc::ChesskersNet& net, const std::vector<float>& position,
+               const std::vector<std::vector<float>>& moves) {
+                const auto r = net.eval(position, moves);
+                return py::make_tuple(r.first, r.second);
+            },
+            py::arg("position"), py::arg("moves"),
+            "(value, priors): position is the flat 14*8*8 encoded planes; moves is a list of "
+            "240-dim move features. Mirrors model.policy_and_value (WDL->Q + softmax priors).");
 
     m.def(
         "run_mcts",
