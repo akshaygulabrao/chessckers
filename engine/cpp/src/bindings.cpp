@@ -11,6 +11,7 @@
 
 #include "apply.hpp"
 #include "board.hpp"
+#include "encode.hpp"
 #include "movegen.hpp"
 #include "movegen_white.hpp"
 #include "nn.hpp"
@@ -486,6 +487,30 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         py::arg("board"),
         "Slice 5a: (status, winner) for a Board — terminal detection mirroring "
         "client._detect_status + the move-gen-derived mate/stalemate/variantEnd.");
+
+    m.def(
+        "encode_position", [](const cc::Board& b) { return cc::encode_position(b); },
+        py::arg("board"),
+        "Slice 6c: encode a Board to the flat 14*8*8 NN position planes. Mirrors "
+        "encoding.encode_position / Rust encode_position_bb.");
+
+    m.def(
+        "encode_move",
+        [](const py::dict& mv) {
+            const int from_sq = cc::parse_square(mv["from"].cast<std::string>());
+            const int to_sq = cc::parse_square(mv["to"].cast<std::string>());
+            std::vector<std::string> wps;
+            if (!mv["waypoints"].is_none()) wps = mv["waypoints"].cast<std::vector<std::string>>();
+            const bool has_deploy = !mv["deployCount"].is_none();
+            const bool has_dem = !mv["demotionsRequired"].is_none();
+            const std::string promo = mv["promotion"].is_none() ? "" : mv["promotion"].cast<std::string>();
+            return cc::encode_move(from_sq, to_sq, !mv["capture"].is_none(), wps, has_deploy,
+                                   has_deploy ? mv["deployCount"].cast<int>() : 0, has_dem,
+                                   has_dem ? mv["demotionsRequired"].cast<int>() : 0, promo);
+        },
+        py::arg("move"),
+        "Slice 6c: encode a move dict to the flat 240-dim NN move features. Mirrors "
+        "encoding.encode_move / Rust encode_move.");
 
     py::class_<cc::ChesskersNet>(m, "ChesskersNet")
         .def(py::init<const std::string&>(), py::arg("weights_path"),
