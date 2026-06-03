@@ -7,6 +7,11 @@ server versions on `best.pt`, so workers reload once per PROMOTION, not per
 iteration). It also archives every champion by timestamp and logs a per-side
 capacity signal, so we can read empirically when the network stops improving.
 
+Gate games run on the NATIVE C++ search (cpp.run_mcts_native) when the extension
+is present — ~5x faster than the Python MCTS, so a full gate is minutes not tens
+of minutes — falling back to the Python search otherwise. Progress is logged per
+label and per seed so the run is visibly working between gate boundaries.
+
 Imbalance-aware promotion rule
 ------------------------------
 Chessckers is structurally lopsided and the curriculum seeds are one-sided by
@@ -35,7 +40,7 @@ the moving best, against which per-side advantage is not separable) gives two
 independent per-side strength curves over time — their plateaus are the per-side
 capacity answer. Everything is appended to gate_log.jsonl.
 
-Stdlib + torch only. Run on the trainer box, sharing its run-dir:
+Run on the trainer box, sharing its run-dir:
 
     python -m chessckers_engine.fleet_arena --run-dir weights/run \\
       --seed-mix-file ../scripts/seed_mix.txt --d-hidden 256 --c-filters 96 --n-blocks 4
@@ -43,6 +48,7 @@ Stdlib + torch only. Run on the trainer box, sharing its run-dir:
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import logging
 import math
@@ -63,6 +69,16 @@ from chessckers_engine.runtime import setup_logging
 from chessckers_engine.variant_py import PyVariantClient
 
 log = logging.getLogger("chessckers_engine.fleet_arena")
+
+# Native C++ search for gate games (~5x the Python MCTS). Optional — falls back
+# to the Python search if the extension isn't built on this box.
+try:
+    import chessckers_cpp as _cpp
+    from chessckers_engine.native_net import export_state_dict as _export_state_dict
+    NATIVE_OK = True
+except Exception:  # noqa: BLE001
+    _cpp = None
+    NATIVE_OK = False
 
 
 # --- game runner ---------------------------------------------------------------
@@ -87,11 +103,29 @@ def _play_from(white_picker, black_picker, client, start_fen: str, max_plies: in
     return _state_to_outcome(state)
 
 
+def _native_picker(net, sims: int, c_puct: float, dir_alpha: float | None, dir_eps: float,
+                   counter):
+    """A PUCT picker driven by the native C++ search. A per-move incrementing
+    `counter` seeds the root Dirichlet so repeated gate games diverge (light
+    noise — play stays strong). Fresh tree per move (no reuse): the 2-net gate
+    descends two plies between a side's turns, so single-ply reuse doesn't apply.
+    """
+    def pick(state):
+        chosen, _vd, _val, _tree = _cpp.run_mcts_native(
+            _cpp.parse_fen(state["fen"]), net, int(sims), float(c_puct),
+            float(dir_alpha or 0.0), float(dir_eps), next(counter))
+        if not chosen:
+            return None
+        for m in (state.get("legalMoves") or []):
+            if m["uci"] == chosen:
+                return m
+        return None
+    return pick
+
+
 def _model_picker(model: ChesskersScorer, client, sims: int, c_puct: float,
                   dir_alpha: float | None, dir_eps: float):
-    """A PUCT picker with a small root Dirichlet so repeated gate games diverge
-    (deterministic argmax play would make every pair an identical replay — no
-    sampling). The noise is much lighter than self-play's so play stays strong."""
+    """Python-MCTS picker (fallback when the native extension isn't available)."""
     def pick(state):
         return run_mcts(state, client, model, n_sims=sims, c_puct=c_puct,
                         dirichlet_alpha=dir_alpha, dirichlet_eps=dir_eps).chosen
@@ -115,7 +149,9 @@ def _label_seeds(best_pick, rand_pick, client, seeds: list[str], max_plies: int)
     for seed in seeds:
         w = _play_from(best_pick, rand_pick, client, seed, max_plies) == "white"
         b = _play_from(rand_pick, best_pick, client, seed, max_plies) == "black"
-        labels[seed] = "white" if (w and not b) else "black" if (b and not w) else "balanced"
+        lab = "white" if (w and not b) else "black" if (b and not w) else "balanced"
+        labels[seed] = lab
+        log.info("  label %-16s = %-8s (best wins as W:%s as B:%s)", _seed_tag(seed), lab, w, b)
     return labels
 
 
@@ -130,17 +166,19 @@ def _score(outcome: str, cand_is_white: bool) -> float:
 
 
 def _gate(cand_pick, opp_pick, client, seeds: list[str], labels: dict[str, str],
-          pairs: int, max_plies: int) -> dict:
+          pairs: int, max_plies: int, tag: str = "gate") -> dict:
     """Color-swapped seed-paired match: candidate vs opponent. Returns per-seed
     pair-scores plus the imbalance-aware aggregate (balanced over favored-side
-    classes). Pure measurement — no promotion decision here."""
+    classes). Logs a line per seed so a long gate is visibly progressing."""
     per_seed: dict[str, float] = {}
-    for seed in seeds:
+    for si, seed in enumerate(seeds, 1):
         pts = 0.0
         for _ in range(pairs):
             pts += _score(_play_from(cand_pick, opp_pick, client, seed, max_plies), True)   # candidate=White
             pts += _score(_play_from(opp_pick, cand_pick, client, seed, max_plies), False)  # candidate=Black
         per_seed[seed] = pts / (2 * pairs)
+        log.info("  [%s] seed %d/%d %-16s -> %.3f  (%d games)",
+                 tag, si, len(seeds), _seed_tag(seed), per_seed[seed], 2 * pairs)
 
     # Class scores: a 'balanced' seed counts toward BOTH classes.
     w_scores = [per_seed[s] for s in seeds if labels.get(s) in ("white", "balanced")]
@@ -164,13 +202,28 @@ def _elo_delta(score: float, cap: float = 400.0) -> float:
     return max(-cap, min(cap, 400.0 * math.log10(s / (1 - s))))
 
 
-# --- persistence helpers -------------------------------------------------------
+# --- net loading ---------------------------------------------------------------
 
 def _load_model(path: Path, arch: dict, device) -> ChesskersScorer:
     m = ChesskersScorer(**arch).to(device)
     load_checkpoint(m, str(path))
     m.eval()
     return m
+
+
+def _make_net(path: Path, arch: dict, bin_path: Path, device):
+    """Load a checkpoint into a gate-playable net. Native: export the state_dict
+    to a flat .bin and return a cc::ChesskersNet (CPU C++ search). Fallback: the
+    torch model for the Python search."""
+    if not NATIVE_OK:
+        return _load_model(path, arch, device)
+    m = ChesskersScorer(**arch)
+    load_checkpoint(m, str(path))
+    m.eval()
+    tmp = str(bin_path) + ".tmp"
+    _export_state_dict(m.state_dict(), tmp)
+    os.replace(tmp, bin_path)
+    return _cpp.ChesskersNet(str(bin_path))
 
 
 def _atomic_copy(src: Path, dst: Path) -> None:
@@ -232,7 +285,7 @@ def main() -> int:
     p.add_argument("--dirichlet-eps", type=float, default=0.15, help="root noise for gate-game diversity (light)")
     p.add_argument("--max-plies", type=int, default=200)
     p.add_argument("--gate-seconds", type=float, default=60.0, help="poll cadence between gate cycles")
-    p.add_argument("--device", default="cpu", help="arena device (cpu so it doesn't contend with the trainer's MPS)")
+    p.add_argument("--device", default="cpu", help="device for the Python fallback (native runs on CPU C++)")
     p.add_argument("--anchor-pairs", type=int, default=0, help="pairs for the vs-anchor per-side capacity bench (0 = use --pairs)")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -242,9 +295,11 @@ def main() -> int:
     best_path = run_dir / "best.pt"
     nets_dir = run_dir / "nets"
     anchor_path = nets_dir / "anchor.pt"
+    arena_dir = run_dir / "_arena"          # working .bin exports for the native gate
     log_path = run_dir / "gate_log.jsonl"
     stop_path = run_dir / "STOP"
     nets_dir.mkdir(parents=True, exist_ok=True)
+    arena_dir.mkdir(parents=True, exist_ok=True)
 
     arch = {"d_hidden": args.d_hidden, "c_filters": args.c_filters, "n_blocks": args.n_blocks}
     anchor_pairs = args.anchor_pairs or args.pairs
@@ -252,14 +307,16 @@ def main() -> int:
     device = pick_device(args.device)
     client = PyVariantClient()
     rand_pick = _random_picker()
+    seed_counter = itertools.count(1)       # per-move Dirichlet seed (native diversity)
 
     seeds = [ln.strip() for ln in args.seed_mix_file.read_text().splitlines()
              if ln.strip() and not ln.lstrip().startswith("#")]
     if not seeds:
         log.error("no seeds in %s", args.seed_mix_file)
         return 2
-    log.info("arena up: device=%s seeds=%d sims=%d pairs=%d tau=%.2f floor=%.2f",
-             device, len(seeds), args.sims, args.pairs, args.threshold, args.side_floor)
+    backend = "native(cpp)" if NATIVE_OK else "python(mcts)"
+    log.info("arena up: backend=%s seeds=%d sims=%d pairs=%d tau=%.2f floor=%.2f max_plies=%d",
+             backend, len(seeds), args.sims, args.pairs, args.threshold, args.side_floor, args.max_plies)
 
     # Establish best v0 (the gated champion) + the frozen anchor. Adopt the
     # trainer's current weights as the first champion so self-play has something
@@ -278,28 +335,41 @@ def main() -> int:
         log.info("waiting for trainer to publish weights.pt ...")
         time.sleep(5.0)
 
-    best_model = _load_model(best_path, arch, device)
-    anchor_model = _load_model(anchor_path if anchor_path.exists() else best_path, arch, device)
+    best_net = _make_net(best_path, arch, arena_dir / "best.bin", device)
+    anchor_net = _make_net(anchor_path if anchor_path.exists() else best_path,
+                           arch, arena_dir / "anchor.bin", device)
     best_elo = _last_elo(log_path)
     last_cand: str | None = None
     promotions = 0
+    idle_logged = False
 
-    def _picker(m):
-        return _model_picker(m, client, args.sims, args.c_puct, args.dirichlet_alpha, args.dirichlet_eps)
+    def _picker(net):
+        if NATIVE_OK:
+            return _native_picker(net, args.sims, args.c_puct, args.dirichlet_alpha,
+                                  args.dirichlet_eps, seed_counter)
+        return _model_picker(net, client, args.sims, args.c_puct, args.dirichlet_alpha, args.dirichlet_eps)
 
     while not stop_path.exists():
         cand_path = _newest_candidate(run_dir, settle_s=3.0)
         if cand_path is None or cand_path.name == last_cand:
+            if not idle_logged:
+                log.info("caught up (newest gated: %s) — waiting for the next checkpoint",
+                         last_cand or "none")
+                idle_logged = True
             time.sleep(args.gate_seconds)
             continue
+        idle_logged = False
 
-        cand_model = _load_model(cand_path, arch, device)
-        labels = _label_seeds(_picker(best_model), rand_pick, client, seeds, args.max_plies)
+        log.info("new candidate %s — labelling %d seeds (best vs random)...", cand_path.name, len(seeds))
+        cand_net = _make_net(cand_path, arch, arena_dir / "cand.bin", device)
+        labels = _label_seeds(_picker(best_net), rand_pick, client, seeds, args.max_plies)
         glyph = {"white": "W", "black": "B", "balanced": "~"}
-        log.info("gating %s (favored sides: %s)", cand_path.name,
-                 ", ".join(f"{_seed_tag(s)}={glyph[labels[s]]}" for s in seeds))
+        log.info("gating %s vs best | favored: %s | %d seeds x %d pairs x2 = %d games",
+                 cand_path.name, ", ".join(f"{_seed_tag(s)}={glyph[labels[s]]}" for s in seeds),
+                 len(seeds), args.pairs, len(seeds) * args.pairs * 2)
 
-        res = _gate(_picker(cand_model), _picker(best_model), client, seeds, labels, args.pairs, args.max_plies)
+        res = _gate(_picker(cand_net), _picker(best_net), client, seeds, labels,
+                    args.pairs, args.max_plies, tag="gate")
         promoted = (res["balanced_score"] >= args.threshold and res["min_class"] >= args.side_floor)
 
         rec = {
@@ -315,16 +385,18 @@ def main() -> int:
             ts = int(time.time())
             _atomic_copy(cand_path, best_path)             # server versions on best.pt -> clients pull
             _atomic_copy(cand_path, nets_dir / f"net-{ts}.pt")
-            best_model = cand_model
+            best_net = cand_net                            # in-memory net; cand.bin may be overwritten later
             best_elo += _elo_delta(res["balanced_score"])
             rec["best_elo"] = round(best_elo, 1)
+            log.info("PROMOTED %s -> best (#%d) | balanced=%.3f W=%s B=%s | elo=%.1f | benchmarking vs anchor...",
+                     cand_path.name, promotions, res["balanced_score"],
+                     res["class_white"], res["class_black"], best_elo)
             # Per-side capacity: new best vs the FROZEN anchor (separable, unlike vs best).
-            cap = _gate(_picker(best_model), _picker(anchor_model), client, seeds, labels, anchor_pairs, args.max_plies)
+            cap = _gate(_picker(best_net), _picker(anchor_net), client, seeds, labels,
+                        anchor_pairs, args.max_plies, tag="anchor")
             rec["anchor_white"] = cap["class_white"]
             rec["anchor_black"] = cap["class_black"]
-            log.info("PROMOTED %s -> best (#%d) | balanced=%.3f W=%s B=%s | elo=%.1f | vs-anchor W=%s B=%s",
-                     cand_path.name, promotions, res["balanced_score"], res["class_white"], res["class_black"],
-                     best_elo, cap["class_white"], cap["class_black"])
+            log.info("  vs-anchor per-side: W=%s B=%s (capacity curve)", cap["class_white"], cap["class_black"])
         else:
             log.info("rejected %s | balanced=%.3f (need %.2f) min_class=%.3f (need %.2f) W=%s B=%s",
                      cand_path.name, res["balanced_score"], args.threshold, res["min_class"], args.side_floor,
