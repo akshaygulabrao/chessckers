@@ -54,8 +54,18 @@ run() { if [ "${DRY_RUN:-0}" = 1 ]; then echo "DRY: $*"; else eval "$*"; fi; }
 # ---- guard: don't start over a live run ----
 if [ "${DRY_RUN:-0}" != 1 ] && pgrep -f 'chessckers_engine.train_continuous' >/dev/null; then
   echo "ABORT: a train_continuous is still running. Wait for the current run to finish" >&2
-  echo "       (or stop it) before launching the next run." >&2
+  echo "       (or stop it with scripts/stop_run.sh) before launching the next run." >&2
   exit 1
+fi
+
+# Heal any orphaned worker children left by a previous unclean stop (a stray
+# pkill -9 on the parent orphans its mp-spawn children). stop_run.sh prevents
+# these; this just makes a fresh launch self-correcting.
+if [ "${DRY_RUN:-0}" != 1 ]; then
+  for p in $(pgrep -f 'multiprocessing.(spawn|resource_tracker)' 2>/dev/null); do
+    cmd=$(ps -o command= -p "$p" 2>/dev/null); pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    case "$cmd" in *"$ENG/.venv/bin/python"*) [ "$pp" = "1" ] && kill -9 "$p" 2>/dev/null ;; esac
+  done
 fi
 
 log "next run (weights/run): $N_SEEDS seeds | buffer_cap=$BUFFER_CAP | max_plies=$MAX_PLIES | arch ${DHID}/${CFIL}/${NBLK}"
