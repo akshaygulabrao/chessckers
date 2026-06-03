@@ -41,7 +41,7 @@ MIN_BUFFER=2000
 ARCHIVE_CAP_GB=380         # FIFO-cap the 400 GB stick (oldest shards evicted)
 MAX_PLIES=200              # was 80
 SIMS=400
-WORKERS=6                  # 2x2 bench (8-pawn seed, plies/s): 6w native 8.1 > 4w native 7.1; 6>=4 always (sublinear, no contention cliff)
+WORKERS=4                  # user choice: 4 (bench had 6w native 8.1 > 4w 7.1, but only +14%; 4 leaves headroom)
 DHID=256; CFIL=96; NBLK=4  # arch — UNCHANGED from the current run (2.5 M params)
 # --------------------------------
 
