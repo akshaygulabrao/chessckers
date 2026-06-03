@@ -353,6 +353,13 @@ static void mcts_simulate_native(cc::PuctNode* root, const cc::ChesskersNet& net
     cc::backup(path, value, gamma);
 }
 
+// Opaque holder so a native PUCT tree can outlive a single run_mcts_native call
+// and be handed back as `reuse` next ply (Lc0 tree reuse). Python holds it via
+// the native_search _RootShim; child(uci) detaches the played move's subtree.
+struct NativeTree {
+    std::unique_ptr<cc::PuctNode> root;
+};
+
 PYBIND11_MODULE(chessckers_cpp, m) {
     m.doc() = "Chessckers C++ engine (Slice 0: board + FEN; Slice 1: §3B capture hops)";
 
@@ -618,15 +625,49 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         "only the NN forward crosses into Python. Returns (chosen_uci, {uci: visits}). "
         "No Dirichlet -> deterministic, for parity with mcts_puct.run_mcts.");
 
+    // Opaque native-tree handle for Lc0 tree reuse across plies.
+    py::class_<NativeTree>(m, "NativeTree")
+        .def("child", [](NativeTree& self, const std::string& uci) -> std::unique_ptr<NativeTree> {
+            if (self.root) {
+                for (auto& c : self.root->children) {
+                    if (c && c->uci == uci) {
+                        auto t = std::make_unique<NativeTree>();
+                        t->root = std::move(c);  // detach; siblings freed with the parent tree
+                        return t;
+                    }
+                }
+            }
+            return nullptr;  // not found / unexpanded -> None in Python (fresh search next ply)
+        })
+        .def("fen", [](const NativeTree& self) {
+            return self.root ? cc::serialize_fen(self.root->board) : std::string();
+        })
+        .def("visits", [](const NativeTree& self) { return self.root ? self.root->visits : 0; });
+
     m.def(
         "run_mcts_native",
         [](cc::Board board, const cc::ChesskersNet& net, int n_sims, double c_puct,
-           double dirichlet_alpha, double dirichlet_eps, uint64_t seed) {
+           double dirichlet_alpha, double dirichlet_eps, uint64_t seed, py::object reuse) {
             const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
             const double gamma = g ? std::atof(g) : 1.0;
-            auto root = std::make_unique<cc::PuctNode>();
-            root->board = std::move(board);
-            // First sim expands the root so Dirichlet noise has children to mix into.
+            std::unique_ptr<cc::PuctNode> root;
+            // Tree reuse (Lc0): adopt the passed subtree iff its position matches this
+            // search position; its carried visits then count toward the n_sims budget
+            // (only the shortfall is searched anew). Any mismatch -> fresh tree.
+            if (!reuse.is_none()) {
+                NativeTree* rt = nullptr;
+                try { rt = reuse.cast<NativeTree*>(); } catch (const std::exception&) { rt = nullptr; }
+                if (rt && rt->root && cc::serialize_fen(rt->root->board) == cc::serialize_fen(board)) {
+                    root = std::move(rt->root);
+                    root->uci.clear();  // it is the root now
+                }
+            }
+            if (!root) {
+                root = std::make_unique<cc::PuctNode>();
+                root->board = std::move(board);
+            }
+            // First sim expands the root so Dirichlet noise has children to mix into
+            // (skipped when a reused root is already expanded).
             if (n_sims > 0 && !(root->expanded && !root->children.empty()))
                 mcts_simulate_native(root.get(), net, c_puct, gamma);
             if (dirichlet_alpha > 0.0 && !root->children.empty()) {
@@ -660,12 +701,18 @@ PYBIND11_MODULE(chessckers_cpp, m) {
                     chosen = c->uci;
                 }
             }
-            return py::make_tuple(chosen, visit_dist, root->q());
+            const double root_value = root->q();
+            auto handle = std::make_unique<NativeTree>();
+            handle->root = std::move(root);
+            return py::make_tuple(chosen, visit_dist, root_value, py::cast(std::move(handle)));
         },
         py::arg("board"), py::arg("net"), py::arg("n_sims") = 100, py::arg("c_puct") = 1.5,
         py::arg("dirichlet_alpha") = 0.0, py::arg("dirichlet_eps") = 0.25, py::arg("seed") = 0,
+        py::arg("reuse") = py::none(),
         "Slice 6d/8: FULLY-NATIVE PUCT search — native move-gen, apply, encode, NN forward. "
         "Optional Dirichlet root noise (alpha>0) for self-play exploration. Returns "
-        "(chosen_uci, {uci: visits}, root_value), where root_value=root->q() is the side-to-"
-        "move's expected outcome at the root (negamax Q in [-1,1]) — used for resignation.");
+        "(chosen_uci, {uci: visits}, root_value, tree): root_value=root->q() is the side-to-"
+        "move's expected outcome at the root (negamax Q in [-1,1], for resignation); `tree` is a "
+        "NativeTree — pass tree.child(uci) back as `reuse` next ply for Lc0 tree reuse (carried "
+        "visits count toward n_sims).");
 }
