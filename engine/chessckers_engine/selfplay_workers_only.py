@@ -122,6 +122,7 @@ def _build_per_worker_payload(*, wid: int, buffer_root: Path, stop_path: Path,
         "device": args.device,
         "model_arch": model_arch,
         "weights_path": str(weights_path),
+        "params_path": str(buffer_root.parent / "selfplay.json"),
         "mcts_batch_size": args.mcts_batch_size,
         "weights_poll_seconds": args.weights_poll_seconds,
         "pin_cpu": (wid % os.cpu_count()) if args.pin_cpu else None,
@@ -151,6 +152,7 @@ def _build_shared_payload(*, wid: int, q_index: int, buffer_root: Path, stop_pat
         "seed": args.seed + wid,
         "stop_path": str(stop_path),
         "max_games": None,
+        "params_path": str(buffer_root.parent / "selfplay.json"),
         "request_q": request_q,
         "response_q": response_q,
         "pin_cpu": (wid % os.cpu_count()) if args.pin_cpu else None,
@@ -315,12 +317,27 @@ def main() -> int:
     # or all workers die.
     last_count = 0
     last_log = time.time()
+    # Live self-play params (selfplay.json) — log once per change so the operator
+    # sees the fleet reconfigure; the workers apply it at their next game boundary.
+    params_path = run_dir / "selfplay.json"
+    last_params_mtime = -1.0
     try:
         while not stop_path.exists():
             alive = sum(1 for w in workers if w.is_alive())
             if alive == 0:
                 log.info("all workers exited; stopping")
                 break
+            try:
+                pm = params_path.stat().st_mtime
+            except OSError:
+                pm = -1.0
+            if pm != last_params_mtime:
+                last_params_mtime = pm
+                if pm > 0:
+                    try:
+                        log.info("self-play params active: %s", params_path.read_text().strip())
+                    except OSError:
+                        pass
             now = time.time()
             if now - last_log >= 60.0:
                 count = sum(1 for _ in buffer_root.glob("*.pkl"))

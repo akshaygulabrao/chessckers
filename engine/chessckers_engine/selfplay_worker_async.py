@@ -19,6 +19,7 @@ in-flight game finishes — no SIGTERM, no half-written buffer entries.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -28,6 +29,40 @@ log = logging.getLogger("chessckers_engine.selfplay_worker_async")
 
 def _stop_requested(stop_path: Path | None) -> bool:
     return stop_path is not None and stop_path.exists()
+
+
+# Self-play knobs that may be live-overridden mid-run via run_dir/selfplay.json
+# (server-published, mirrored onto each box by fleet_client, or written directly by
+# the operator on the trainer host). JSON key -> type. A missing file or a missing
+# key means the launch-time payload value stands, so a standalone worker — and any
+# box before its first server pull — behaves exactly as before.
+_LIVE_KEYS = {
+    "sims": int, "c_puct": float, "temperature": float,
+    "dirichlet_alpha": float, "dirichlet_eps": float, "max_plies": int,
+}
+
+
+def _read_live_overrides(params_path: Path | None, cache: dict) -> dict:
+    """Current override dict from `params_path`, re-parsed only when the file's
+    mtime changes (cache holds the last mtime + parsed values). A missing file or a
+    malformed/partial write keeps the last good values, so a half-written update
+    landing mid-game never crashes a worker — it just applies one game later."""
+    if params_path is None:
+        return cache.get("vals", {})
+    try:
+        mtime = params_path.stat().st_mtime
+    except OSError:
+        return cache.get("vals", {})
+    if mtime != cache.get("mtime"):
+        try:
+            raw = json.loads(params_path.read_text())
+            if isinstance(raw, dict):
+                cache["vals"] = {k: conv(raw[k]) for k, conv in _LIVE_KEYS.items()
+                                 if k in raw}
+                cache["mtime"] = mtime
+        except (OSError, ValueError, TypeError):
+            pass  # keep last good
+    return cache.get("vals", {})
 
 
 def play_forever_subprocess(payload: dict) -> None:
@@ -109,6 +144,11 @@ def play_forever(payload: dict) -> int:
     buffer = ReplayBuffer(payload["buffer_root"])
     max_games = payload.get("max_games")
     max_plies = int(payload.get("max_plies", 400))
+    # Live self-play params: re-read run_dir/selfplay.json each game (mtime-gated)
+    # so a server-published change anneals this worker at the next game boundary —
+    # no restart, no lost in-flight game. `live_cache` carries the parsed values.
+    params_path = Path(payload["params_path"]) if payload.get("params_path") else None
+    live_cache: dict = {}
 
     # Heartbeat setup. run_dir is derived from buffer_root's parent;
     # heartbeats land at run_dir/heartbeats/<machine>_<worker_id>.json.
@@ -208,15 +248,16 @@ def play_forever(payload: dict) -> int:
                         time.sleep(float(payload.get("weights_poll_seconds", 2.0)))
                         continue
 
+            ov = _read_live_overrides(params_path, live_cache)
             game = play_az_game(
                 evaluator, client,
-                n_sims=int(payload["n_sims"]),
-                c_puct=float(payload["c_puct"]),
-                temperature=float(payload["temperature"]),
-                max_plies=max_plies,
+                n_sims=int(ov.get("sims", payload["n_sims"])),
+                c_puct=float(ov.get("c_puct", payload["c_puct"])),
+                temperature=float(ov.get("temperature", payload["temperature"])),
+                max_plies=int(ov.get("max_plies", max_plies)),
                 rng=rng,
-                dirichlet_alpha=payload.get("dirichlet_alpha"),
-                dirichlet_eps=float(payload.get("dirichlet_eps", 0.25)),
+                dirichlet_alpha=ov.get("dirichlet_alpha", payload.get("dirichlet_alpha")),
+                dirichlet_eps=float(ov.get("dirichlet_eps", payload.get("dirichlet_eps", 0.25))),
                 vloss_batch=int(payload.get("vloss_batch", 1)),
                 search_fn=native_search if not use_shared else None,
                 resign_threshold=float(payload.get("resign_threshold", 0.0)),

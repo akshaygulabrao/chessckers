@@ -38,7 +38,12 @@ cumulative Elo by the gate margin, and benchmark the new best vs a FROZEN ANCHOR
 (the run's first champion) per side. Comparing to a *fixed* anchor (rather than
 the moving best, against which per-side advantage is not separable) gives two
 independent per-side strength curves over time — their plateaus are the per-side
-capacity answer. Everything is appended to gate_log.jsonl.
+capacity answer. A REGRESSION LADDER additionally benches the new best against
+several PAST champions (-1/-4/-16 back by default): the gate alone only ever
+compares to the *immediate* predecessor, so a rung score < 0.5 is the alarm that
+strength cycled backwards even as the gate kept promoting. Archived champions are
+capped at the newest --keep-nets (the ladder's rungs are always retained).
+Everything is appended to gate_log.jsonl.
 
 Run on the trainer box, sharing its run-dir:
 
@@ -377,6 +382,14 @@ def main() -> int:
     p.add_argument("--gate-seconds", type=float, default=60.0, help="poll cadence between gate cycles")
     p.add_argument("--device", default="cpu", help="device for the Python fallback (native runs on CPU C++)")
     p.add_argument("--anchor-pairs", type=int, default=0, help="pairs for the vs-anchor per-side capacity bench (0 = use --pairs)")
+    p.add_argument("--ladder-rungs", default="1,4,16",
+                   help="comma offsets of PAST champions to bench the new best against on "
+                        "promotion (regression ladder; empty disables)")
+    p.add_argument("--ladder-pairs", type=int, default=2,
+                   help="color-swapped pairs per seed for each ladder rung (kept small — it runs only on promotion)")
+    p.add_argument("--keep-nets", type=int, default=32,
+                   help="retain only the newest N archived champions in nets/ (0 = keep all); "
+                        "floored above the deepest ladder rung so rungs always survive GC")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -398,6 +411,9 @@ def main() -> int:
 
     arch = {"d_hidden": args.d_hidden, "c_filters": args.c_filters, "n_blocks": args.n_blocks}
     anchor_pairs = args.anchor_pairs or args.pairs
+    ladder_offsets = [int(x) for x in args.ladder_rungs.split(",") if x.strip()]
+    # Keep enough champions that every ladder rung still exists after GC.
+    keep_floor = max(args.keep_nets, max(ladder_offsets) + 1) if (args.keep_nets and ladder_offsets) else args.keep_nets
     torch.manual_seed(args.seed)
     device = pick_device(args.device)
     client = PyVariantClient()
@@ -412,6 +428,8 @@ def main() -> int:
     backend = "native(cpp)" if NATIVE_OK else "python(mcts)"
     log.info("arena up: backend=%s seeds=%d sims=%d pairs=%d tau=%.2f floor=%.2f max_plies=%d",
              backend, len(seeds), args.sims, args.pairs, args.threshold, args.side_floor, args.max_plies)
+    log.info("regression ladder rungs=%s pairs=%d | keep-nets=%s",
+             ladder_offsets or "off", args.ladder_pairs, keep_floor or "all")
 
     # Establish best v0 (the gated champion) + the frozen anchor. Adopt the
     # trainer's current weights as the first champion so self-play has something
@@ -507,6 +525,7 @@ def main() -> int:
         if promoted:
             promotions += 1
             ts = int(time.time())
+            past = sorted(nets_dir.glob("net-*.pt"), key=_net_ts)  # champions BEFORE this one (ladder rungs)
             _atomic_copy(cand_path, best_path)             # server versions on best.pt -> clients pull
             _atomic_copy(cand_path, nets_dir / f"net-{ts}.pt")
             best_net = cand_net                            # in-memory net; cand.bin may be overwritten later
@@ -523,6 +542,32 @@ def main() -> int:
             rec["anchor_white"] = cap["class_white"]
             rec["anchor_black"] = cap["class_black"]
             log.info("  vs-anchor per-side: W=%s B=%s (capacity curve)", cap["class_white"], cap["class_black"])
+            # Regression ladder: new best vs several PAST champions (-k back). The gate
+            # only ever compares to the *immediate* best, so it can't see strength
+            # cycling — a net beating its predecessor while weaker than one from N
+            # promotions ago. A rung score < 0.5 means we regressed vs that older net.
+            if ladder_offsets and past:
+                ladder = []
+                for k in ladder_offsets:
+                    if k > len(past):
+                        continue
+                    rung = past[-k]
+                    rung_net = _make_net(rung, arch, arena_dir / "rung.bin", device)
+                    lr = _gate(_picker(best_net), _picker(rung_net), client, seeds, labels,
+                               args.ladder_pairs, args.max_plies, tag=f"ladder-{k}")
+                    gap = _elo_delta(lr["balanced_score"])
+                    ladder.append({"back": k, "net": rung.name,
+                                   "score": lr["balanced_score"], "elo_gap": round(gap, 1)})
+                    log.info("  ladder -%d vs %s: score=%.3f elo_gap=%+.1f%s", k, rung.name,
+                             lr["balanced_score"], gap,
+                             "  <-- REGRESSION" if lr["balanced_score"] < 0.5 else "")
+                rec["ladder"] = ladder
+            # Retention: cap nets/ at the newest keep_floor champions (>= the deepest
+            # ladder rung, so rungs survive). anchor.pt is a separate filename, untouched.
+            if keep_floor:
+                gone = _gc_nets(nets_dir, keep_floor)
+                if gone:
+                    log.info("  pruned %d old champion net(s) (kept newest %d)", gone, keep_floor)
         else:
             log.info("rejected %s | record W%d-L%d-D%d (score=%.3f, need %.2f) min_class=%.3f (need %.2f) W=%s B=%s",
                      cand_path.name, res["record"]["w"], res["record"]["l"], res["record"]["d"],
@@ -541,6 +586,28 @@ def _seed_tag(fen: str) -> str:
     """Short label for a seed FEN (reuse the trainer's compact tag)."""
     from chessckers_engine.selfplay_az_loop import _seed_tag as _t
     return _t(fen)
+
+
+def _net_ts(path: Path) -> int:
+    """Unix ts embedded in an archived champion filename `net-<ts>.pt` (sort key)."""
+    try:
+        return int(path.stem.split("-", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _gc_nets(nets_dir: Path, keep: int) -> int:
+    """Delete all but the newest `keep` archived champions (`net-*.pt`); returns the
+    count removed. anchor.pt is a different filename and is never matched."""
+    champs = sorted(nets_dir.glob("net-*.pt"), key=_net_ts)
+    removed = 0
+    for p in (champs[:-keep] if keep else []):
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 if __name__ == "__main__":

@@ -16,9 +16,22 @@ Endpoints:
                             replaces, now generalized to every client.
   GET  /weights          -> octet-stream of the freshest weights.pt + X-Version hdr.
   GET  /control          -> "RUN" or "STOP" (STOP once the trainer touches run/STOP).
-  GET  /status           -> small JSON: version, weights present, buffer backlog, and
-                            the fleet's live clients (any box whose request carried an
-                            `X-Client-Id` within the last CLIENT_ACTIVE_WINDOW seconds).
+  GET  /client-version   -> the trainer host's own git sha (resolved at server start).
+                            Self-updating clients (fleet_client --update-cmd) compare it
+                            to the sha they booted on and, on drift, pull + rebuild the
+                            native ext + re-exec — closing the stale-.so failure class.
+  GET  /selfplay         -> JSON of the canonical self-play params (run_dir/selfplay.json:
+                            sims, c_puct, temperature, dirichlet_*, max_plies), or `{}`
+                            if none published. Clients mirror it into their own run-dir
+                            and the workers live-apply it at the next game boundary — so
+                            every box self-plays with the SAME, operator-tunable params
+                            (no more leena/local sims drift; anneal by editing the file).
+  GET  /status           -> small JSON: version, weights present, buffer backlog, fleet
+                            throughput (games ingested this run, promotions, best_elo,
+                            open match_id), and the fleet's live clients with their code
+                            version + worker-subprocess liveness (any box whose request
+                            carried an `X-Client-Id` within the last CLIENT_ACTIVE_WINDOW
+                            seconds; a box heartbeating with workers=down is a zombie).
   POST /game/<filename>  -> ingest one game artifact (`NNN_..pkl` or its `.pkl.meta`)
                             into buffer/ for the trainer to drain. pkl written
                             atomically; filename validated (no path traversal).
@@ -46,6 +59,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -61,6 +75,18 @@ log = logging.getLogger("chessckers_engine.fleet_server")
 _NAME_RE = re.compile(r"^\d{3,}_\d{10}\.pkl(\.meta)?$")
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024  # a single game pkl is tens of KB; 64 MB is paranoia
 CLIENT_ACTIVE_WINDOW = 120  # s — a client last-seen within this counts as "active" in /status
+
+
+def _code_version() -> str:
+    """Short git sha of the server's own code, resolved once at startup and served at
+    /client-version so self-updating clients can detect when they're behind the trainer
+    host's code (the stale-.so class of silent failure). 'unknown' off a git checkout."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or "unknown"
+    except Exception:  # noqa: BLE001 — version is diagnostics-only; never block startup on it
+        return "unknown"
 
 
 def _net_path(run_dir: Path) -> Path:
@@ -99,6 +125,27 @@ def _read_match(run_dir: Path) -> dict | None:
         return None
 
 
+def _gate_stats(run_dir: Path) -> tuple[int, float]:
+    """Promotions so far + the latest cumulative best Elo, read from the arena's
+    gate_log.jsonl (shared run-dir). (0, 0.0) before the first gate. Cheap enough
+    for the human-polled /status — the log is one line per gate cycle."""
+    promotions = 0
+    best_elo = 0.0
+    try:
+        for line in (run_dir / "gate_log.jsonl").read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("promoted"):
+                promotions += 1
+                if "best_elo" in rec:
+                    best_elo = float(rec["best_elo"])
+    except OSError:
+        pass
+    return promotions, best_elo
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "ChesskersFleet/1.0"
     run_dir: Path  # set on the server instance below; bound per-request via self.server
@@ -107,13 +154,24 @@ class _Handler(BaseHTTPRequestHandler):
         return self.server.run_dir  # type: ignore[attr-defined]
 
     def _note_client(self) -> None:
-        """Stamp the calling box's last-seen time for the /status fleet view. Best-effort
-        and header-only — a client that sends no X-Client-Id is simply invisible here."""
+        """Stamp the calling box's last-seen time, code version (X-Client-Version), and
+        worker-subprocess liveness (X-Client-Workers: up/down/off, when the client owns
+        its workers) for the /status fleet view. Best-effort and header-only — a client
+        that sends no X-Client-Id is invisible here. A request lacking a given header
+        keeps the last value seen for that box, so a plain GET doesn't clobber state."""
         cid = self.headers.get("X-Client-Id")
         if not cid:
             return
+        cid = cid[:64]
+        ver = self.headers.get("X-Client-Version")
+        wk = self.headers.get("X-Client-Workers")
         with self.server.clients_lock:  # type: ignore[attr-defined]
-            self.server.clients[cid[:64]] = time.time()  # type: ignore[attr-defined]
+            prev = self.server.clients.get(cid)  # type: ignore[attr-defined]
+            self.server.clients[cid] = (  # type: ignore[attr-defined]
+                time.time(),
+                ver or (prev[1] if prev else None),
+                wk or (prev[2] if prev else None),
+            )
 
     def log_message(self, fmt: str, *a) -> None:  # silence default stderr access log
         log.debug("%s - " + fmt, self.address_string(), *a)
@@ -136,6 +194,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, _version(rd).encode())
         elif self.path == "/control":
             self._send(200, b"STOP" if (rd / "STOP").exists() else b"RUN")
+        elif self.path == "/client-version":
+            self._send(200, self.server.code_version.encode())  # type: ignore[attr-defined]
+        elif self.path == "/selfplay":
+            try:
+                data = (rd / "selfplay.json").read_bytes()
+            except OSError:
+                data = b"{}"  # nothing published -> clients keep their launch defaults
+            self._send(200, data, "application/json")
         elif self.path == "/weights":
             try:
                 data = _net_path(rd).read_bytes()
@@ -147,11 +213,14 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/status":
             backlog = sum(1 for _ in (rd / "buffer").glob("*.pkl")) if (rd / "buffer").exists() else 0
             m = _read_match(rd)
+            promotions, best_elo = _gate_stats(rd)
             now = time.time()
             with self.server.clients_lock:  # type: ignore[attr-defined]
-                clients = {cid: round(now - ts, 1)
-                           for cid, ts in self.server.clients.items()  # type: ignore[attr-defined]
+                clients = {cid: {"age": round(now - ts, 1), "version": ver, "workers": wk}
+                           for cid, (ts, ver, wk) in self.server.clients.items()  # type: ignore[attr-defined]
                            if now - ts <= CLIENT_ACTIVE_WINDOW}
+            with self.server.stats_lock:  # type: ignore[attr-defined]
+                games_ingested = self.server.games_ingested  # type: ignore[attr-defined]
             body = json.dumps({
                 "version": _version(rd),
                 "weights": (rd / "weights.pt").exists(),
@@ -159,8 +228,12 @@ class _Handler(BaseHTTPRequestHandler):
                 "buffer_backlog": backlog,
                 "control": "STOP" if (rd / "STOP").exists() else "RUN",
                 "gate_open": bool(m),
+                "match_id": (m or {}).get("match_id"),
+                "games_ingested": games_ingested,  # game pkls POSTed to this process since start
+                "promotions": promotions,
+                "best_elo": round(best_elo, 1),
                 "clients_active": len(clients),
-                "clients": clients,  # {id: seconds-since-last-seen}, active window only
+                "clients": clients,  # {id: {age: s-since-seen, version: git-sha, workers: up/down/off}}, active window only
             }).encode()
             self._send(200, body, "application/json")
         elif self.path == "/next_game":
@@ -221,6 +294,9 @@ class _Handler(BaseHTTPRequestHandler):
             log.warning("write %s failed: %s", name, e)
             self._send(500, b"write failed")
             return
+        if name.endswith(".pkl"):  # count games (not the .meta sidecar) for /status throughput
+            with self.server.stats_lock:  # type: ignore[attr-defined]
+                self.server.games_ingested += 1  # type: ignore[attr-defined]
         self._send(200, b"ok")
 
     def _match_result(self) -> None:
@@ -282,11 +358,14 @@ def main() -> int:
     httpd.run_dir = run_dir  # type: ignore[attr-defined]
     httpd.match_cursor = itertools.count()    # round-robins gate units in /next_game
     httpd.result_counter = itertools.count()  # unique filenames for /match_result writes
-    httpd.clients = {}                        # X-Client-Id -> last-seen epoch (fleet liveness)
+    httpd.clients = {}                        # X-Client-Id -> (last-seen epoch, version, workers) (fleet liveness)
     httpd.clients_lock = threading.Lock()     # guards clients across handler threads
+    httpd.games_ingested = 0                  # cumulative game pkls ingested this process (/status throughput)
+    httpd.stats_lock = threading.Lock()       # guards games_ingested across handler threads
+    httpd.code_version = _code_version()      # this host's git sha, served at /client-version for self-update
     httpd.daemon_threads = True
-    log.info("fleet server up on %s:%d (run-dir=%s, version=%s)",
-             args.host, args.port, run_dir, _version(run_dir))
+    log.info("fleet server up on %s:%d (run-dir=%s, version=%s, code=%s)",
+             args.host, args.port, run_dir, _version(run_dir), httpd.code_version)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

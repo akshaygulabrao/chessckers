@@ -281,7 +281,7 @@ def main() -> int:
                                cap_bytes=int(args.archive_cap_gb * (1 << 30)))
         if archive.enabled:
             cap = f"{args.archive_cap_gb:g} GB FIFO" if args.archive_cap_gb else "unbounded"
-            log.info("archiving every ingested game -> %s (%s)", archive.root, cap)
+            log.info("[train] archiving every ingested game -> %s (%s)", archive.root, cap)
 
     torch.manual_seed(args.seed)
     device = pick_device(args.device)
@@ -290,14 +290,14 @@ def main() -> int:
     ).to(device)
     if args.base:
         load_checkpoint(model, args.base)
-        log.info("warm-started from %s", args.base)
+        log.info("[train] warm-started from %s", args.base)
     model.train()
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)  # Adam, persistent across all steps (real continuous training)
     rng = random.Random(args.seed)
 
     # Publish an initial snapshot immediately so self-play has weights to load.
     _publish(model, weights_path)
-    log.info("published initial weights -> %s", weights_path)
+    log.info("[train] published initial weights -> %s", weights_path)
 
     def _on_term(*_a):
         try:
@@ -315,9 +315,9 @@ def main() -> int:
     if archive and archive.enabled and not args.no_prime:
         buf = archive.load_recent(args.buffer_cap)
         if buf:
-            log.info("primed replay window from archive: %d positions (cap %d)", len(buf), args.buffer_cap)
+            log.info("[train] primed replay window from archive: %d positions (cap %d)", len(buf), args.buffer_cap)
     elif args.no_prime:
-        log.info("cold start (--no-prime): not priming from archive; trainer waits for min_buffer")
+        log.info("[train] cold start (--no-prime): not priming from archive; trainer waits for min_buffer")
     steps = 0
     games_seen = 0
     positions_ingested = len(buf)  # primed data counts as ingested (restores the replay-factor throttle state)
@@ -325,7 +325,7 @@ def main() -> int:
     ckpt_n = 0
     win_p = win_v = win_m = 0.0
     win_steps = 0
-    log.info("continuous trainer up: device=%s buffer_cap=%d min=%d batch=%d "
+    log.info("[train] continuous trainer up: device=%s buffer_cap=%d min=%d batch=%d "
              "replay_factor=%.1f publish=%.0fs ckpt=%.0fs",
              device, args.buffer_cap, args.min_buffer, args.batch_size,
              args.replay_factor, args.publish_seconds, args.ckpt_seconds)
@@ -338,13 +338,13 @@ def main() -> int:
             positions_ingested += len(new_ex)
             for m in metas:  # log EVERY ingested game (local + leena) — single unified per-game logger
                 gn = _next_game_num()
-                log.info("  game #%d [%s]: %s in %s plies (seed %s)",
+                log.info("[selfplay] game #%d [%s]: %s in %s plies (seed %s)",
                          gn, m.get("machine", "?"), m.get("outcome", "?"),
                          m.get("plies", "?"), _seed_tag(m.get("seed_fen") or ""))
             if len(buf) > args.buffer_cap:
                 del buf[: len(buf) - args.buffer_cap]  # drop oldest in place
             if args.max_games and games_seen >= args.max_games:
-                log.info("reached --max-games %d (games_seen=%d) — stopping run", args.max_games, games_seen)
+                log.info("[train] reached --max-games %d (games_seen=%d) — stopping run", args.max_games, games_seen)
                 break
 
         if len(buf) < args.min_buffer:
@@ -377,10 +377,12 @@ def main() -> int:
             arch_stat = (f" archived={archive.games_written}" if archive and archive.enabled
                          else " archived=off" if not archive
                          else " archived=DISABLED")  # best-effort archive dropped out mid-run
-            log.info("checkpoint saved -> %s | step %d games_seen=%d/%s buf=%d%s | policy=%.4f value=%.4f mlh=%.4f | %.1f steps/s",
-                     ckpt.name, steps, games_seen, (args.max_games or "inf"), len(buf), arch_stat,
+            log.info("[train] step %d | policy=%.4f value=%.4f mlh=%.4f | %.1f steps/s | buf=%d games_seen=%d/%s",
+                     steps,
                      win_p / max(win_steps, 1), win_v / max(win_steps, 1), win_m / max(win_steps, 1),
-                     win_steps / max(now - last_ckpt, 1e-9))
+                     win_steps / max(now - last_ckpt, 1e-9),
+                     len(buf), games_seen, (args.max_games or "inf"))
+            log.info("[ckpt] saved %s | step %d |%s", ckpt.name, steps, arch_stat)
             win_p = win_v = win_m = 0.0; win_steps = 0; last_ckpt = now
         if args.max_steps and steps >= args.max_steps:
             break
@@ -388,7 +390,7 @@ def main() -> int:
     stop_path.touch()  # signal local self-play workers (shared run-dir STOP) + the sidecar to tear down
     _publish(model, weights_path)
     save_checkpoint(model, run_dir / "iter-async-final.pt")
-    log.info("stopped: %d steps, %d games seen, %d positions ingested, %d games archived (STOP signaled)",
+    log.info("[train] stopped: %d steps, %d games seen, %d positions ingested, %d games archived (STOP signaled)",
              steps, games_seen, positions_ingested,
              archive.games_written if archive else 0)
     return 0
