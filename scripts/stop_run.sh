@@ -21,8 +21,10 @@ SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=
 echo "[stop] STOP -> $RUN_DIR/STOP (graceful: workers + trainer finish + exit)"
 touch "$RUN_DIR/STOP"
 
-# leena_sync watches STOP and tears down leena's workers, then exits.
-for _ in $(seq 60); do
+# leena_sync watches STOP and tears down leena's workers, then exits. Workers
+# only check STOP between games, so an in-flight 200-ply game can delay exit by
+# a minute+ — wait generously (the worker parent's own deadline is 300s).
+for _ in $(seq 240); do
   pgrep -f 'chessckers_engine.(train_continuous|selfplay_workers_only)' >/dev/null || break
   sleep 1
 done
