@@ -219,6 +219,10 @@ def play_forever(payload: dict) -> int:
                 dirichlet_eps=float(payload.get("dirichlet_eps", 0.25)),
                 vloss_batch=int(payload.get("vloss_batch", 1)),
                 search_fn=native_search if not use_shared else None,
+                resign_threshold=float(payload.get("resign_threshold", 0.0)),
+                resign_no_resign_frac=float(payload.get("resign_no_resign_frac", 0.1)),
+                resign_consecutive=int(payload.get("resign_consecutive", 2)),
+                resign_min_ply=int(payload.get("resign_min_ply", 8)),
             )
             games_played += 1
             examples = az_game_to_examples(game)

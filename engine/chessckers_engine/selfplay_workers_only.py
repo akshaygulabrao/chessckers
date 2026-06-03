@@ -127,6 +127,10 @@ def _build_per_worker_payload(*, wid: int, buffer_root: Path, stop_path: Path,
         "pin_cpu": (wid % os.cpu_count()) if args.pin_cpu else None,
         "machine": os.environ.get("MACHINE", "unknown"),
         "use_native": bool(getattr(args, "native", False)),
+        "resign_threshold": args.resign_threshold,
+        "resign_no_resign_frac": args.resign_no_resign_frac,
+        "resign_consecutive": args.resign_consecutive,
+        "resign_min_ply": args.resign_min_ply,
     }
 
 
@@ -151,6 +155,10 @@ def _build_shared_payload(*, wid: int, q_index: int, buffer_root: Path, stop_pat
         "response_q": response_q,
         "pin_cpu": (wid % os.cpu_count()) if args.pin_cpu else None,
         "machine": os.environ.get("MACHINE", "unknown"),
+        "resign_threshold": args.resign_threshold,
+        "resign_no_resign_frac": args.resign_no_resign_frac,
+        "resign_consecutive": args.resign_consecutive,
+        "resign_min_ply": args.resign_min_ply,
     }
 
 
@@ -176,6 +184,19 @@ def main() -> int:
     p.add_argument("--mcts-batch-size", type=int, default=1)
     p.add_argument("--vloss-batch", type=int, default=1)
     p.add_argument("--max-plies", type=int, default=400)
+    # Resignation (self-play throughput) — DISABLED by default (threshold 0) so the
+    # worker upgrade never silently changes training semantics; opt in per run.
+    p.add_argument("--resign-threshold", type=float, default=0.0,
+                   help="End a self-play game early when the side-to-move's native search value "
+                        "<= -threshold for --resign-consecutive plies (native search only). "
+                        "0 = disabled (default). Try 0.90.")
+    p.add_argument("--resign-no-resign-frac", type=float, default=0.1,
+                   help="Fraction of games that NEVER resign (play to a real terminal) so the "
+                        "false-positive resign rate stays measurable.")
+    p.add_argument("--resign-consecutive", type=int, default=2,
+                   help="Plies the value must stay below threshold before resigning.")
+    p.add_argument("--resign-min-ply", type=int, default=8,
+                   help="Never resign before this ply (avoid early-game eval noise).")
     p.add_argument("--d-hidden", type=int, default=128)
     p.add_argument("--c-filters", type=int, default=64)
     p.add_argument("--n-blocks", type=int, default=4)

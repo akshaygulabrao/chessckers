@@ -660,11 +660,12 @@ PYBIND11_MODULE(chessckers_cpp, m) {
                     chosen = c->uci;
                 }
             }
-            return py::make_tuple(chosen, visit_dist);
+            return py::make_tuple(chosen, visit_dist, root->q());
         },
         py::arg("board"), py::arg("net"), py::arg("n_sims") = 100, py::arg("c_puct") = 1.5,
         py::arg("dirichlet_alpha") = 0.0, py::arg("dirichlet_eps") = 0.25, py::arg("seed") = 0,
         "Slice 6d/8: FULLY-NATIVE PUCT search — native move-gen, apply, encode, NN forward. "
         "Optional Dirichlet root noise (alpha>0) for self-play exploration. Returns "
-        "(chosen_uci, {uci: visits}).");
+        "(chosen_uci, {uci: visits}, root_value), where root_value=root->q() is the side-to-"
+        "move's expected outcome at the root (negamax Q in [-1,1]) — used for resignation.");
 }

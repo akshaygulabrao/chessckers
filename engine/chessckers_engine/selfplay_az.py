@@ -165,6 +165,10 @@ def play_az_game(
     sink_context: dict[str, Any] | None = None,
     vloss_batch: int = 1,
     search_fn: Any = None,
+    resign_threshold: float = 0.0,
+    resign_no_resign_frac: float = 0.1,
+    resign_consecutive: int = 2,
+    resign_min_ply: int = 8,
 ) -> AZGame:
     """Play one self-play game using PUCT MCTS at each move.
 
@@ -199,6 +203,18 @@ def play_az_game(
 
     ply = 0
     reuse_root = None  # tree reuse: the played move's subtree, carried to the next ply
+    # Resignation (self-play throughput): end a game once the side-to-move's search
+    # value is hopeless, so converted endgames don't burn plies past the decision.
+    # `resign_threshold<=0` disables it. A held-out `resign_no_resign_frac` of games
+    # never resign (play to a real terminal) so the false-positive rate stays
+    # measurable — the lc0 calibration trick. Require the value to stay below
+    # threshold for `resign_consecutive` plies (and past `resign_min_ply`) so a
+    # single noisy eval can't end a game.
+    resign_enabled = resign_threshold > 0.0
+    no_resign_game = (not resign_enabled) or (
+        rng is not None and float(torch.rand(1, generator=rng).item()) < resign_no_resign_frac
+    )
+    consec_resign = 0
     while not state.get("status") and ply < max_plies:
         legal = state.get("legalMoves") or []
         if not legal:
@@ -220,6 +236,21 @@ def play_az_game(
                 side_to_move=state["turn"],
             )
         )
+        # Resign check: the position is recorded above (a valid training example);
+        # if the STM's search value is hopeless we end the game HERE, attributing
+        # the win to the other side. `result.value` is the root Q (STM-relative);
+        # it's None for search backends that don't expose it (resign just no-ops).
+        if resign_enabled and not no_resign_game and ply >= resign_min_ply:
+            v = getattr(result, "value", None)
+            if v is not None and v <= -resign_threshold:
+                consec_resign += 1
+                if consec_resign >= resign_consecutive:
+                    winner = "black" if state["turn"] == "white" else "white"
+                    game = AZGame(records=records, final_status="resign", outcome=winner)
+                    _emit_game_end(sink, ctx, history, state["fen"], game)
+                    return game
+            else:
+                consec_resign = 0
         # AlphaZero per-ply temperature: explore the opening, then play sharp.
         eff_temp = temperature if ply < temp_cutoff_plies else 0.0
         idx = _sample_move_index_from_visits(visits, eff_temp, rng)

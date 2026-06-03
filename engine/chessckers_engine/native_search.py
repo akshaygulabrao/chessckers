@@ -29,6 +29,7 @@ class _NoReuseRoot:
 class _NativeResult:
     chosen: Any
     visit_distribution: dict
+    value: float | None = None  # root->q(): STM-relative expected outcome, for resignation
     root: _NoReuseRoot = field(default_factory=_NoReuseRoot)
 
 
@@ -37,10 +38,10 @@ def make_native_search_fn(net_box: list):
 
     def search_fn(state, client, model, *, n_sims, c_puct, dirichlet_alpha, dirichlet_eps,
                   vloss_batch, reuse_root):
-        _chosen, visit_dist = cpp.run_mcts_native(
+        _chosen, visit_dist, root_value = cpp.run_mcts_native(
             cpp.parse_fen(state["fen"]), net_box[0], int(n_sims), float(c_puct),
             float(dirichlet_alpha or 0.0), float(dirichlet_eps), next(seed),
         )
-        return _NativeResult(chosen=None, visit_distribution=dict(visit_dist))
+        return _NativeResult(chosen=None, visit_distribution=dict(visit_dist), value=float(root_value))
 
     return search_fn

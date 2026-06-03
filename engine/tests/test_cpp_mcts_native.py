@@ -41,6 +41,6 @@ def test_native_search_matches_eval_callback(net, seed: str, n_sims: int):
         b = cpp.parse_fen(fen)
         return net.eval(cpp.encode_position(b), [cpp.encode_move(mv) for mv in moves])
 
-    _, vd_native = cpp.run_mcts_native(cpp.parse_fen(seed), net, n_sims, 1.5)
+    _, vd_native, _ = cpp.run_mcts_native(cpp.parse_fen(seed), net, n_sims, 1.5)
     _, vd_callback = cpp.run_mcts(cpp.parse_fen(seed), evf, n_sims, 1.5)
     assert dict(vd_native) == dict(vd_callback), f"seed={seed} n_sims={n_sims}"
