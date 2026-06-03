@@ -29,11 +29,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENG="$REPO_ROOT/engine"
 PY="$ENG/.venv/bin/python"
+source "$REPO_ROOT/scripts/cc_lib.sh"   # LOG, COUNTER, VENV, sweep_orphans()
 
 # ---- run config (edit here) ----
 RUN_DIR="$ENG/weights/run"                          # reused across runs
-LOG=/tmp/cc_train.log                               # SINGLE unified log: trainer + workers + leena_sync
-COUNTER=/tmp/cc_gamecount                           # shared game counter; reset per launch so #N starts at 1
 ARCHIVE_DIR="/Volumes/hd0/chessckers_archive/run"   # reused -> primes the buffer from old games
 BUFFER_CAP=300000          # replay window (was 50000); RAM-resident, ~450 MB
 MIN_BUFFER=2000
@@ -58,15 +57,9 @@ if [ "${DRY_RUN:-0}" != 1 ] && pgrep -f 'chessckers_engine.train_continuous' >/d
   exit 1
 fi
 
-# Heal any orphaned worker children left by a previous unclean stop (a stray
-# pkill -9 on the parent orphans its mp-spawn children). stop_run.sh prevents
-# these; this just makes a fresh launch self-correcting.
-if [ "${DRY_RUN:-0}" != 1 ]; then
-  for p in $(pgrep -f 'multiprocessing.(spawn|resource_tracker)' 2>/dev/null); do
-    cmd=$(ps -o command= -p "$p" 2>/dev/null); pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
-    case "$cmd" in *"$ENG/.venv/bin/python"*) [ "$pp" = "1" ] && kill -9 "$p" 2>/dev/null ;; esac
-  done
-fi
+# Heal any orphaned worker children left by a previous unclean stop, so a fresh
+# launch self-corrects (stop_run.sh prevents these in the first place).
+[ "${DRY_RUN:-0}" != 1 ] && sweep_orphans
 
 log "next run (weights/run): $N_SEEDS seeds | buffer_cap=$BUFFER_CAP | max_plies=$MAX_PLIES | arch ${DHID}/${CFIL}/${NBLK}"
 log "seed mix: $SEED_MIX"

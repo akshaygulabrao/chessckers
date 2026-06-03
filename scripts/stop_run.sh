@@ -13,8 +13,8 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENG="$REPO_ROOT/engine"
+source "$REPO_ROOT/scripts/cc_lib.sh"   # VENV, sweep_orphans()
 RUN_DIR="${RUN_DIR:-$ENG/weights/run}"
-VENV="$ENG/.venv/bin/python"
 LEENA="${LEENA:-leenagulabrao@Leenas-MacBook-Air.local}"
 SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
 
@@ -30,17 +30,8 @@ for _ in $(seq 240); do
 done
 pkill -f "$ENG/scripts/leena_sync.sh" 2>/dev/null || true
 
-# Safety net: sweep ORPHANED (ppid=1) chessckers mp-spawn children the graceful
-# exit may have missed. Precise: only this venv's mp-spawn/resource_tracker procs.
-swept=0
-for p in $(pgrep -f 'multiprocessing.(spawn|resource_tracker)' 2>/dev/null); do
-  cmd=$(ps -o command= -p "$p" 2>/dev/null)
-  ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
-  case "$cmd" in
-    *"$VENV"*) [ "$ppid" = "1" ] && { kill -9 "$p" 2>/dev/null && swept=$((swept+1)); } ;;
-  esac
-done
-[ "$swept" -gt 0 ] && echo "[stop] swept $swept orphaned worker(s)"
+# Safety net: sweep any ORPHANED mp-spawn children the graceful exit missed.
+sweep_orphans
 
 # Belt-and-suspenders for leena (leena_sync already does this on STOP).
 $SSH "$LEENA" 'pkill -f selfplay_workers_only; pkill -f multiprocessing.spawn' 2>/dev/null || true
