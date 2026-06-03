@@ -4,6 +4,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <cstdlib>
+#include <memory>
 #include <type_traits>
 #include <variant>
 
@@ -11,6 +13,7 @@
 #include "board.hpp"
 #include "movegen.hpp"
 #include "movegen_white.hpp"
+#include "search.hpp"
 
 namespace py = pybind11;
 
@@ -186,6 +189,92 @@ static py::dict hop_to_dict(const cc::CaptureHop& h) {
     d["cadence"] = h.cadence;
     d["is_overshoot"] = h.is_overshoot;
     return d;
+}
+
+// -------- Slice 5b/5c: native PUCT search with a Python NN eval bridge --------
+
+// Generate the side-to-move's legal moves as Python dicts (same content + order
+// as the move-gen bindings, incl. both White castling forms) — what the leaf NN
+// eval encodes.
+static py::list gen_legal_dicts(const cc::Board& b) {
+    py::list out;
+    if (b.turn_white) {
+        cc::WhiteBoard wb{b.occupied(),      b.occupied_white, b.pawns, b.knights,
+                          b.bishops,         b.rooks,          b.queens, b.kings,
+                          b.castling_rights, (long)b.ep_square};
+        for (const auto& c : cc::white_legal_moves(wb, b.stacks)) {
+            out.append(white_move_to_dict(c));
+            if (c.is_castling) out.append(white_castling_alt_to_dict(c));
+        }
+    } else {
+        const uint64_t wk = b.kings & b.occupied_white;
+        const long king_sq = wk ? __builtin_ctzll(wk) : -1;
+        for (const auto& mv : cc::all_black_legal_moves(b.occupied(), b.occupied_white, king_sq, b.stacks)) {
+            std::visit(
+                [&](auto&& x) {
+                    using T = std::decay_t<decltype(x)>;
+                    if constexpr (std::is_same_v<T, cc::QuietMove>)
+                        out.append(simple_move_dict(x.uci, x.from_name, x.to_name, x.piece, py::none()));
+                    else if constexpr (std::is_same_v<T, cc::DeployMove>)
+                        out.append(simple_move_dict(x.uci, x.from_name, x.to_name, x.piece,
+                                                    py::cast(x.deploy_count)));
+                    else if constexpr (std::is_same_v<T, cc::ChargeMove>)
+                        out.append(charge_to_dict(x));
+                    else if constexpr (std::is_same_v<T, cc::ChainMove>)
+                        out.append(chain_to_dict(x));
+                },
+                mv);
+        }
+    }
+    return out;
+}
+
+static cc::Board apply_dict(cc::Board b, const py::dict& mv) {
+    if (b.turn_white) cc::apply_white_move(b, parse_white_move(mv));
+    else cc::apply_black_move(b, parse_black_move(mv));
+    return b;
+}
+
+// Expand a leaf: native legal-move gen -> Python eval(fen, dicts) -> (value,
+// priors) -> create a child per move via native apply + native status. Returns
+// the leaf's value.
+static double mcts_expand(cc::PuctNode* node, const py::function& eval_fn) {
+    py::list legal = gen_legal_dicts(node->board);
+    const std::string fen = cc::serialize_fen(node->board);
+    const py::tuple res = eval_fn(fen, legal).cast<py::tuple>();
+    const double value = res[0].cast<double>();
+    const size_t n = py::len(legal);
+    node->expanded = true;
+    if (n == 0) return value;
+    const std::vector<double> priors = res[1].cast<std::vector<double>>();
+    for (size_t i = 0; i < n; ++i) {
+        const py::dict mv = legal[i].cast<py::dict>();
+        auto child = std::make_unique<cc::PuctNode>();
+        child->board = apply_dict(node->board, mv);
+        child->uci = mv["uci"].cast<std::string>();
+        child->prior = priors[i];
+        const auto st = cc::detect_status(child->board);
+        child->is_terminal = !st.status.empty();
+        child->terminal_status = st.status;
+        node->children.push_back(std::move(child));
+    }
+    return value;
+}
+
+static void mcts_simulate(cc::PuctNode* root, const py::function& eval_fn, double c_puct,
+                          double gamma) {
+    const auto path = cc::select_to_leaf(root, c_puct);
+    cc::PuctNode* leaf = path.back();
+    double value;
+    if (leaf->is_terminal) {
+        value = cc::terminal_value(*leaf);
+    } else if (!leaf->expanded) {
+        value = mcts_expand(leaf, eval_fn);
+    } else {  // expanded but childless — value-head fallback (mirrors Python)
+        const py::tuple t = eval_fn(cc::serialize_fen(leaf->board), py::list()).cast<py::tuple>();
+        value = t[0].cast<double>();
+    }
+    cc::backup(path, value, gamma);
 }
 
 PYBIND11_MODULE(chessckers_cpp, m) {
@@ -396,4 +485,35 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         py::arg("board"),
         "Slice 5a: (status, winner) for a Board — terminal detection mirroring "
         "client._detect_status + the move-gen-derived mate/stalemate/variantEnd.");
+
+    m.def(
+        "run_mcts",
+        [](cc::Board board, const py::function& eval_fn, int n_sims, double c_puct) {
+            const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
+            const double gamma = g ? std::atof(g) : 1.0;
+            auto root = std::make_unique<cc::PuctNode>();
+            root->board = std::move(board);
+            // First sim expands the root; then search to the n_sims visit budget.
+            if (n_sims > 0 && !(root->expanded && !root->children.empty()))
+                mcts_simulate(root.get(), eval_fn, c_puct, gamma);
+            const int remaining = std::max(0, n_sims - root->visits);
+            for (int i = 0; i < remaining; ++i)
+                mcts_simulate(root.get(), eval_fn, c_puct, gamma);
+
+            py::dict visit_dist;
+            std::string chosen;
+            int best = -1;
+            for (auto& c : root->children) {
+                visit_dist[py::str(c->uci)] = c->visits;
+                if (c->visits > best) {
+                    best = c->visits;
+                    chosen = c->uci;
+                }
+            }
+            return py::make_tuple(chosen, visit_dist);
+        },
+        py::arg("board"), py::arg("eval_fn"), py::arg("n_sims") = 100, py::arg("c_puct") = 1.5,
+        "Slice 5b/5c: native PUCT search. eval_fn(fen, legal_move_dicts) -> (value, priors); "
+        "only the NN forward crosses into Python. Returns (chosen_uci, {uci: visits}). "
+        "No Dirichlet -> deterministic, for parity with mcts_puct.run_mcts.");
 }
