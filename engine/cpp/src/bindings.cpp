@@ -4,6 +4,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <type_traits>
+#include <variant>
+
 #include "board.hpp"
 #include "movegen.hpp"
 
@@ -51,6 +54,29 @@ static py::dict simple_move_dict(const std::string& uci, const std::string& from
     d["demotionsRequired"] = py::none();
     d["sourceKingPositions"] = py::none();
     d["deployCount"] = std::move(deploy_count);
+    return d;
+}
+
+static py::dict charge_to_dict(const cc::ChargeMove& c) {
+    py::dict d;
+    d["uci"] = c.uci;
+    d["from"] = c.from_name;
+    d["to"] = c.to_name;
+    d["piece"] = c.piece;
+    d["color"] = "black";
+    if (c.capture) d["capture"] = *c.capture;
+    else d["capture"] = py::none();
+    if (c.waypoints) d["waypoints"] = *c.waypoints;
+    else d["waypoints"] = py::none();
+    d["chainHops"] = py::none();
+    d["promotion"] = py::none();
+    if (c.demoted_kings) d["demotedKings"] = *c.demoted_kings;
+    else d["demotedKings"] = py::none();
+    if (c.demotions_required) d["demotionsRequired"] = *c.demotions_required;
+    else d["demotionsRequired"] = py::none();
+    if (c.source_king_positions) d["sourceKingPositions"] = *c.source_king_positions;
+    else d["sourceKingPositions"] = py::none();
+    d["deployCount"] = py::none();
     return d;
 }
 
@@ -147,4 +173,53 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         py::arg("occupied"), py::arg("occupied_white"), py::arg("stacks"),
         "Slice 2b: Black deploy moves (sub-tower diagonal deploys). Mirrors "
         "moves_black.black_deploy_moves.");
+
+    m.def(
+        "black_charge_moves",
+        [](uint64_t occupied, uint64_t occupied_white, std::map<uint8_t, std::string> stacks) {
+            py::list out;
+            for (const auto& c : cc::black_charge_moves(occupied, occupied_white, stacks))
+                out.append(charge_to_dict(c));
+            return out;
+        },
+        py::arg("occupied"), py::arg("occupied_white"), py::arg("stacks"),
+        "Slice 2c: Black charges (orthogonal King-top tower moves with demotion "
+        "choices + overshoot). Mirrors moves_black.black_charge_moves.");
+
+    m.def(
+        "black_mandatory_capture_active",
+        [](uint64_t occupied, uint64_t occupied_white, std::map<uint8_t, std::string> stacks) {
+            return cc::black_mandatory_capture_active(occupied, occupied_white, stacks);
+        },
+        py::arg("occupied"), py::arg("occupied_white"), py::arg("stacks"),
+        "Slice 2d: §4 mandate trigger. Mirrors moves_black.black_mandatory_capture_active.");
+
+    m.def(
+        "all_black_legal_moves",
+        [](uint64_t occupied, uint64_t occupied_white, long king_sq,
+           std::map<uint8_t, std::string> stacks) {
+            py::list out;
+            for (const auto& mv :
+                 cc::all_black_legal_moves(occupied, occupied_white, king_sq, stacks)) {
+                std::visit(
+                    [&](auto&& x) {
+                        using T = std::decay_t<decltype(x)>;
+                        if constexpr (std::is_same_v<T, cc::QuietMove>)
+                            out.append(simple_move_dict(x.uci, x.from_name, x.to_name, x.piece,
+                                                        py::none()));
+                        else if constexpr (std::is_same_v<T, cc::DeployMove>)
+                            out.append(simple_move_dict(x.uci, x.from_name, x.to_name, x.piece,
+                                                        py::cast(x.deploy_count)));
+                        else if constexpr (std::is_same_v<T, cc::ChargeMove>)
+                            out.append(charge_to_dict(x));
+                        else if constexpr (std::is_same_v<T, cc::ChainMove>)
+                            out.append(chain_to_dict(x));
+                    },
+                    mv);
+            }
+            return out;
+        },
+        py::arg("occupied"), py::arg("occupied_white"), py::arg("king_sq"), py::arg("stacks"),
+        "Slice 2d: full Black legal move list with mandate applied, in the authoritative "
+        "(Rust) order. Mirrors moves_black._all_black_legal / Rust all_black_legal_moves.");
 }

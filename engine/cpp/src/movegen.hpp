@@ -19,6 +19,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "board.hpp"  // cc::square_name
@@ -555,6 +556,226 @@ inline std::vector<DeployMove> black_deploy_moves(uint64_t occupied, uint64_t oc
         }
     }
     return moves;
+}
+
+// -------- Charges (Slice 2c) --------
+
+struct ChargeMove {
+    std::string uci, from_name, to_name, piece;
+    std::optional<std::string> capture;
+    std::optional<std::vector<std::string>> waypoints;       // [rim key] for overshoot charge
+    std::optional<std::vector<int>> demoted_kings;           // chosen king positions (1-based)
+    std::optional<int> demotions_required;
+    std::optional<std::vector<int>> source_king_positions;
+};
+
+// In-place r-combinations of `items` (lexicographic). 1:1 with the Rust port —
+// used to enumerate king-demotion choices when n_kings > d.
+inline std::vector<std::vector<int>> combinations(const std::vector<int>& items, int r) {
+    const int n = (int)items.size();
+    if (r == 0 || r > n) return {};
+    std::vector<std::vector<int>> out;
+    std::vector<int> idx(r);
+    for (int i = 0; i < r; ++i) idx[i] = i;
+    while (true) {
+        std::vector<int> combo;
+        combo.reserve(r);
+        for (int i = 0; i < r; ++i) combo.push_back(items[idx[i]]);
+        out.push_back(std::move(combo));
+        int i = r;
+        while (i > 0) {
+            --i;
+            if (idx[i] != i + n - r) break;
+            if (i == 0) return out;
+        }
+        idx[i] += 1;
+        for (int j = i + 1; j < r; ++j) idx[j] = idx[j - 1] + 1;
+        if (idx[0] > n - r) break;
+    }
+    return out;
+}
+
+inline std::vector<ChargeMove> black_charge_moves(uint64_t occupied, uint64_t occupied_white,
+                                                  const std::map<uint8_t, std::string>& stacks) {
+    static const std::pair<int, int> ORTHO_DIRS[4] = {{0, 1}, {0, -1}, {1, 0}, {-1, 0}};
+    std::vector<ChargeMove> moves;
+    for (auto& [from_sq, pieces] : stacks) {
+        if (pieces.empty() || pieces.back() != 'k') continue;  // King-top towers only
+        int n_kings = 0;
+        for (char c : pieces)
+            if (c == 'k') ++n_kings;
+        if (n_kings == 0) continue;
+        const int from_file = from_sq & 7, from_rank = from_sq >> 3;
+        const std::string from_name = square_name(from_sq);
+        std::vector<int> king_positions;  // 1-based indices of kings in the tower
+        for (int i = 0; i < (int)pieces.size(); ++i)
+            if (pieces[i] == 'k') king_positions.push_back(i + 1);
+
+        for (auto [df, dr] : ORTHO_DIRS) {
+            bool stop_after = false;
+            for (int d = 1; d <= n_kings; ++d) {
+                if (stop_after) break;
+                // Path scan over intermediate squares 1..d-1.
+                bool blocked = false, off_grid = false;
+                std::vector<std::string> path_captures;
+                int last_on_board_sq = -1;
+                for (int k = 1; k < d; ++k) {
+                    const int pf = from_file + k * df, pr = from_rank + k * dr;
+                    if (pf < -1 || pf > 8 || pr < -1 || pr > 8) {
+                        off_grid = true;
+                        break;
+                    }
+                    if (pf >= 0 && pf <= 7 && pr >= 0 && pr <= 7) {
+                        const int psq = sq_idx(pf, pr);
+                        const int po = owner(occupied, occupied_white, psq);
+                        if (po == SQ_BLACK && stacks.count((uint8_t)psq)) {
+                            blocked = true;
+                            break;
+                        }
+                        if (po == SQ_WHITE) path_captures.push_back(square_name(psq));
+                        last_on_board_sq = psq;
+                    }
+                    // else: rim square, no action
+                }
+                if (off_grid) break;
+                if (blocked) break;
+
+                const int tf = from_file + d * df, tr = from_rank + d * dr;
+                if (tf < -1 || tf > 8 || tr < -1 || tr > 8) break;  // off-grid landing
+
+                std::string to_name;
+                bool is_ram = false, is_friendly_merge = false;
+                std::optional<std::string> rim_landing_key;
+                if (tf >= 0 && tf <= 7 && tr >= 0 && tr <= 7) {
+                    const int s = sq_idx(tf, tr);
+                    to_name = square_name(s);
+                    const int o = owner(occupied, occupied_white, s);
+                    is_ram = (o == SQ_WHITE);
+                    is_friendly_merge = (o == SQ_BLACK && stacks.count((uint8_t)s));
+                } else {
+                    // Rim landing -> fall back to the last on-board square.
+                    if (last_on_board_sq < 0) continue;  // d=1 rim: nothing to settle on
+                    to_name = square_name(last_on_board_sq);
+                    rim_landing_key = coord_key(tf, tr);
+                }
+
+                std::string landing_repr;
+                std::optional<std::vector<std::string>> charge_waypoints;
+                if (!rim_landing_key) {
+                    landing_repr = to_name;
+                } else {
+                    landing_repr = *rim_landing_key + "->" + to_name;  // e.g. e0->e1
+                    charge_waypoints = std::vector<std::string>{*rim_landing_key};
+                }
+
+                std::optional<std::string> capture_field;
+                if (!path_captures.empty()) capture_field = path_captures[0];
+                else if (is_ram) capture_field = to_name;
+
+                if (is_ram) {
+                    // §3C: a ram requires >=1 path capture (must overshoot an enemy).
+                    if (!path_captures.empty()) {
+                        ChargeMove m;
+                        m.uci = from_name + to_name;
+                        m.from_name = from_name;
+                        m.to_name = to_name;
+                        m.piece = "king";
+                        m.capture = capture_field;
+                        moves.push_back(std::move(m));
+                    }
+                    continue;
+                }
+
+                if (n_kings == d) {
+                    // Forced demotion (all kings) -> null choice fields.
+                    std::string new_pieces = pieces;
+                    for (int pos : king_positions) new_pieces[pos - 1] = 'S';
+                    ChargeMove m;
+                    m.uci = from_name + landing_repr;
+                    m.from_name = from_name;
+                    m.to_name = to_name;
+                    m.piece = (new_pieces.back() == 'k') ? "king" : "pawn";
+                    m.capture = capture_field;
+                    m.waypoints = charge_waypoints;
+                    moves.push_back(std::move(m));
+                } else {
+                    for (auto& choice : combinations(king_positions, d)) {
+                        std::string new_pieces = pieces;
+                        for (int pos : choice) new_pieces[pos - 1] = 'S';
+                        std::vector<std::string> cs;
+                        for (int i : choice) cs.push_back(std::to_string(i));
+                        ChargeMove m;
+                        m.uci = from_name + landing_repr + "{" + join(cs, ",") + "}";
+                        m.from_name = from_name;
+                        m.to_name = to_name;
+                        m.piece = (new_pieces.back() == 'k') ? "king" : "pawn";
+                        m.capture = capture_field;
+                        m.waypoints = charge_waypoints;
+                        m.demoted_kings = choice;
+                        m.demotions_required = d;
+                        m.source_king_positions = king_positions;
+                        moves.push_back(std::move(m));
+                    }
+                }
+
+                if (is_friendly_merge) stop_after = true;
+            }
+        }
+    }
+    return moves;
+}
+
+// -------- Mandate + assembly (Slice 2d) --------
+
+// §4 mandate trigger: some Black tower has a diagonal-adjacent White and a
+// non-suicide hop from there that lands on a board square. Mirrors scalachess
+// hasMandatoryCapture (and the Rust/Python ports) including the adjacency
+// pre-filter. Bool early-exit, so stack iteration order is irrelevant.
+inline bool black_mandatory_capture_active(uint64_t occupied, uint64_t occupied_white,
+                                           const std::map<uint8_t, std::string>& stacks) {
+    for (auto& [from_sq, pieces] : stacks) {
+        if (pieces.empty()) continue;
+        const int n = (int)pieces.size();
+        const int from_file = from_sq & 7, from_rank = from_sq >> 3;
+        for (auto [df, dr] : dirs_for_top(pieces.back())) {
+            const int adj_f = from_file + df, adj_r = from_rank + dr;
+            if (!on_board(adj_f, adj_r)) continue;
+            if (owner(occupied, occupied_white, sq_idx(adj_f, adj_r)) != SQ_WHITE) continue;
+            for (auto& hop :
+                 find_capture_hops(occupied, occupied_white, stacks, from_file, from_rank, df, dr, n))
+                if (!hop.is_suicide && hop.landing_square >= 0) return true;
+        }
+    }
+    return false;
+}
+
+using AnyMove = std::variant<QuietMove, DeployMove, ChargeMove, ChainMove>;
+
+// Full Black legal move list with the mandate filter applied. Order matches the
+// Rust all_black_legal_moves_native exactly (the authoritative move order the
+// policy head indexes): under mandate, charges-with-capture then chains;
+// otherwise quiets, deploys, charges, chains.
+inline std::vector<AnyMove> all_black_legal_moves(uint64_t occupied, uint64_t occupied_white,
+                                                  long king_sq,
+                                                  const std::map<uint8_t, std::string>& stacks) {
+    auto quiet = black_diagonal_quiet_moves(occupied, occupied_white, stacks);
+    auto deploy = black_deploy_moves(occupied, occupied_white, stacks);
+    auto charge = black_charge_moves(occupied, occupied_white, stacks);
+    auto chain = black_diagonal_capture_moves(occupied, occupied_white, king_sq, stacks);
+    const bool mandate = black_mandatory_capture_active(occupied, occupied_white, stacks);
+
+    std::vector<AnyMove> out;
+    if (mandate) {
+        for (auto& c : charge)
+            if (c.capture.has_value()) out.push_back(c);
+        for (auto& cm : chain) out.push_back(cm);
+    } else {
+        for (auto& q : quiet) out.push_back(q);
+        for (auto& dm : deploy) out.push_back(dm);
+        for (auto& c : charge) out.push_back(c);
+        for (auto& cm : chain) out.push_back(cm);
+    }
+    return out;
 }
 
 }  // namespace cc
