@@ -156,7 +156,19 @@ def play_forever(payload: dict) -> int:
                 return 0
             time.sleep(poll_s)
         last_mtime = -1.0
-        use_in_proc_server = int(payload["mcts_batch_size"]) > 1
+        # Native C++ search mode: drive play_az_game through cpp.run_mcts_native
+        # (~4.8x). The PyTorch model is loaded only to produce the canonical
+        # state_dict, which is exported to a flat .bin the C++ net loads/reloads.
+        use_native = bool(payload.get("use_native", False))
+        native_search = None
+        net_box = [None]
+        native_bin = None
+        if use_native:
+            import chessckers_cpp  # noqa: F401  — fail fast if the extension is missing
+            from chessckers_engine.native_search import make_native_search_fn
+            native_bin = run_dir / f"native_{worker_id}.bin"
+            native_search = make_native_search_fn(net_box)
+        use_in_proc_server = int(payload["mcts_batch_size"]) > 1 and not use_native
         if use_in_proc_server:
             server = _IS(model, max_batch_size=int(payload["mcts_batch_size"]))
             evaluator = server
@@ -183,6 +195,13 @@ def play_forever(payload: dict) -> int:
                     try:
                         load_checkpoint(model, weights_path)
                         model.eval()
+                        if use_native:
+                            import chessckers_cpp
+                            from chessckers_engine.native_net import export_state_dict
+                            _tmp = str(native_bin) + ".tmp"
+                            export_state_dict(model.state_dict(), _tmp)
+                            Path(_tmp).replace(native_bin)
+                            net_box[0] = chessckers_cpp.ChesskersNet(str(native_bin))
                         last_mtime = cur_mtime
                     except (EOFError, RuntimeError, OSError) as e:
                         log.debug("worker %d weight reload failed: %s", worker_id, e)
@@ -199,6 +218,7 @@ def play_forever(payload: dict) -> int:
                 dirichlet_alpha=payload.get("dirichlet_alpha"),
                 dirichlet_eps=float(payload.get("dirichlet_eps", 0.25)),
                 vloss_batch=int(payload.get("vloss_batch", 1)),
+                search_fn=native_search if not use_shared else None,
             )
             games_played += 1
             examples = az_game_to_examples(game)

@@ -164,6 +164,7 @@ def play_az_game(
     sink: WatchSink | None = None,
     sink_context: dict[str, Any] | None = None,
     vloss_batch: int = 1,
+    search_fn: Any = None,
 ) -> AZGame:
     """Play one self-play game using PUCT MCTS at each move.
 
@@ -202,7 +203,7 @@ def play_az_game(
         legal = state.get("legalMoves") or []
         if not legal:
             break
-        result = run_mcts(
+        result = (search_fn or run_mcts)(
             state, client, model,
             n_sims=n_sims, c_puct=c_puct,
             dirichlet_alpha=dirichlet_alpha,

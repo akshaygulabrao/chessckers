@@ -126,6 +126,7 @@ def _build_per_worker_payload(*, wid: int, buffer_root: Path, stop_path: Path,
         "weights_poll_seconds": args.weights_poll_seconds,
         "pin_cpu": (wid % os.cpu_count()) if args.pin_cpu else None,
         "machine": os.environ.get("MACHINE", "unknown"),
+        "use_native": bool(getattr(args, "native", False)),
     }
 
 
@@ -179,6 +180,10 @@ def main() -> int:
     p.add_argument("--c-filters", type=int, default=64)
     p.add_argument("--n-blocks", type=int, default=4)
     p.add_argument("--weights-poll-seconds", type=float, default=5.0)
+    p.add_argument("--native", action="store_true",
+                   help="Per-worker mode: run the native C++ PUCT search "
+                        "(cpp.run_mcts_native) — ~4.8x faster than the Python MCTS. "
+                        "weights.pt is exported to a flat .bin and hot-reloaded.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--pin-cpu", action="store_true",
                    help="Pin each worker to a CPU core (Linux only).")

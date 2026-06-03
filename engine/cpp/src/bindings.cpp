@@ -4,8 +4,10 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <random>
 #include <type_traits>
 #include <variant>
 
@@ -598,13 +600,33 @@ PYBIND11_MODULE(chessckers_cpp, m) {
 
     m.def(
         "run_mcts_native",
-        [](cc::Board board, const cc::ChesskersNet& net, int n_sims, double c_puct) {
+        [](cc::Board board, const cc::ChesskersNet& net, int n_sims, double c_puct,
+           double dirichlet_alpha, double dirichlet_eps, uint64_t seed) {
             const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
             const double gamma = g ? std::atof(g) : 1.0;
             auto root = std::make_unique<cc::PuctNode>();
             root->board = std::move(board);
+            // First sim expands the root so Dirichlet noise has children to mix into.
             if (n_sims > 0 && !(root->expanded && !root->children.empty()))
                 mcts_simulate_native(root.get(), net, c_puct, gamma);
+            if (dirichlet_alpha > 0.0 && !root->children.empty()) {
+                std::mt19937_64 rng(seed);
+                std::gamma_distribution<double> gd(dirichlet_alpha, 1.0);
+                const int nch = (int)root->children.size();
+                std::vector<double> noise(nch);
+                double s = 0.0;
+                for (int i = 0; i < nch; ++i) {
+                    noise[i] = gd(rng);
+                    s += noise[i];
+                }
+                if (s > 0.0) {
+                    int i = 0;
+                    for (auto& c : root->children) {
+                        c->prior = (1.0 - dirichlet_eps) * c->prior + dirichlet_eps * (noise[i] / s);
+                        ++i;
+                    }
+                }
+            }
             const int remaining = std::max(0, n_sims - root->visits);
             for (int i = 0; i < remaining; ++i)
                 mcts_simulate_native(root.get(), net, c_puct, gamma);
@@ -621,7 +643,8 @@ PYBIND11_MODULE(chessckers_cpp, m) {
             return py::make_tuple(chosen, visit_dist);
         },
         py::arg("board"), py::arg("net"), py::arg("n_sims") = 100, py::arg("c_puct") = 1.5,
-        "Slice 6d: FULLY-NATIVE PUCT search — native move-gen, apply, encode, and NN forward "
-        "(cc::ChesskersNet). Nothing crosses into Python per leaf. Returns (chosen_uci, "
-        "{uci: visits}).");
+        py::arg("dirichlet_alpha") = 0.0, py::arg("dirichlet_eps") = 0.25, py::arg("seed") = 0,
+        "Slice 6d/8: FULLY-NATIVE PUCT search — native move-gen, apply, encode, NN forward. "
+        "Optional Dirichlet root noise (alpha>0) for self-play exploration. Returns "
+        "(chosen_uci, {uci: visits}).");
 }
