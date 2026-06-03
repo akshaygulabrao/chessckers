@@ -299,7 +299,10 @@ def main() -> int:
             if now - last_log >= 60.0:
                 count = sum(1 for _ in buffer_root.glob("*.pkl"))
                 rate = (count - last_count) / max(1.0, now - last_log) * 60.0
-                log.info("alive=%d games=%d (+%.1f/min)", alive, count, rate)
+                # `count` is the buffer BACKLOG (pkls awaiting drain), not games
+                # produced; `rate` is its change/min (negative = trainer draining
+                # faster than workers produce). %+.1f gives a single signed value.
+                log.info("alive=%d buffered=%d (%+.1f/min)", alive, count, rate)
                 last_count = count
                 last_log = now
             time.sleep(2.0)
