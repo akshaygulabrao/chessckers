@@ -237,6 +237,20 @@ static cc::Board apply_dict(cc::Board b, const py::dict& mv) {
     return b;
 }
 
+// Native encode of a move dict's features (no torch) — used by the native eval.
+static std::vector<float> encode_move_dict(const py::dict& mv) {
+    const int from_sq = cc::parse_square(mv["from"].cast<std::string>());
+    const int to_sq = cc::parse_square(mv["to"].cast<std::string>());
+    std::vector<std::string> wps;
+    if (!mv["waypoints"].is_none()) wps = mv["waypoints"].cast<std::vector<std::string>>();
+    const bool has_deploy = !mv["deployCount"].is_none();
+    const bool has_dem = !mv["demotionsRequired"].is_none();
+    const std::string promo = mv["promotion"].is_none() ? "" : mv["promotion"].cast<std::string>();
+    return cc::encode_move(from_sq, to_sq, !mv["capture"].is_none(), wps, has_deploy,
+                           has_deploy ? mv["deployCount"].cast<int>() : 0, has_dem,
+                           has_dem ? mv["demotionsRequired"].cast<int>() : 0, promo);
+}
+
 // Expand a leaf: native legal-move gen -> Python eval(fen, dicts) -> (value,
 // priors) -> create a child per move via native apply + native status. Returns
 // the leaf's value.
@@ -276,6 +290,44 @@ static void mcts_simulate(cc::PuctNode* root, const py::function& eval_fn, doubl
         const py::tuple t = eval_fn(cc::serialize_fen(leaf->board), py::list()).cast<py::tuple>();
         value = t[0].cast<double>();
     }
+    cc::backup(path, value, gamma);
+}
+
+// Fully-native expansion: native legal-move gen + native encode + native forward
+// (cc::ChesskersNet) — NOTHING crosses into Python. This is the eval that makes
+// the search fast (the per-leaf Python round-trip was the ~1x bottleneck).
+static double mcts_expand_native(cc::PuctNode* node, const cc::ChesskersNet& net) {
+    py::list legal = gen_legal_dicts(node->board);
+    const size_t n = py::len(legal);
+    const auto pos_enc = cc::encode_position(node->board);
+    std::vector<std::vector<float>> move_encs;
+    move_encs.reserve(n);
+    for (size_t i = 0; i < n; ++i) move_encs.push_back(encode_move_dict(legal[i].cast<py::dict>()));
+    const auto r = net.eval(pos_enc, move_encs);
+    node->expanded = true;
+    if (n == 0) return r.first;
+    for (size_t i = 0; i < n; ++i) {
+        const py::dict mv = legal[i].cast<py::dict>();
+        auto child = std::make_unique<cc::PuctNode>();
+        child->board = apply_dict(node->board, mv);
+        child->uci = mv["uci"].cast<std::string>();
+        child->prior = r.second[i];
+        const auto st = cc::detect_status(child->board);
+        child->is_terminal = !st.status.empty();
+        child->terminal_status = st.status;
+        node->children.push_back(std::move(child));
+    }
+    return r.first;
+}
+
+static void mcts_simulate_native(cc::PuctNode* root, const cc::ChesskersNet& net, double c_puct,
+                                 double gamma) {
+    const auto path = cc::select_to_leaf(root, c_puct);
+    cc::PuctNode* leaf = path.back();
+    double value;
+    if (leaf->is_terminal) value = cc::terminal_value(*leaf);
+    else if (!leaf->expanded) value = mcts_expand_native(leaf, net);
+    else value = net.eval(cc::encode_position(leaf->board), {}).first;
     cc::backup(path, value, gamma);
 }
 
@@ -495,20 +547,7 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         "encoding.encode_position / Rust encode_position_bb.");
 
     m.def(
-        "encode_move",
-        [](const py::dict& mv) {
-            const int from_sq = cc::parse_square(mv["from"].cast<std::string>());
-            const int to_sq = cc::parse_square(mv["to"].cast<std::string>());
-            std::vector<std::string> wps;
-            if (!mv["waypoints"].is_none()) wps = mv["waypoints"].cast<std::vector<std::string>>();
-            const bool has_deploy = !mv["deployCount"].is_none();
-            const bool has_dem = !mv["demotionsRequired"].is_none();
-            const std::string promo = mv["promotion"].is_none() ? "" : mv["promotion"].cast<std::string>();
-            return cc::encode_move(from_sq, to_sq, !mv["capture"].is_none(), wps, has_deploy,
-                                   has_deploy ? mv["deployCount"].cast<int>() : 0, has_dem,
-                                   has_dem ? mv["demotionsRequired"].cast<int>() : 0, promo);
-        },
-        py::arg("move"),
+        "encode_move", [](const py::dict& mv) { return encode_move_dict(mv); }, py::arg("move"),
         "Slice 6c: encode a move dict to the flat 240-dim NN move features. Mirrors "
         "encoding.encode_move / Rust encode_move.");
 
@@ -556,4 +595,33 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         "Slice 5b/5c: native PUCT search. eval_fn(fen, legal_move_dicts) -> (value, priors); "
         "only the NN forward crosses into Python. Returns (chosen_uci, {uci: visits}). "
         "No Dirichlet -> deterministic, for parity with mcts_puct.run_mcts.");
+
+    m.def(
+        "run_mcts_native",
+        [](cc::Board board, const cc::ChesskersNet& net, int n_sims, double c_puct) {
+            const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
+            const double gamma = g ? std::atof(g) : 1.0;
+            auto root = std::make_unique<cc::PuctNode>();
+            root->board = std::move(board);
+            if (n_sims > 0 && !(root->expanded && !root->children.empty()))
+                mcts_simulate_native(root.get(), net, c_puct, gamma);
+            const int remaining = std::max(0, n_sims - root->visits);
+            for (int i = 0; i < remaining; ++i)
+                mcts_simulate_native(root.get(), net, c_puct, gamma);
+            py::dict visit_dist;
+            std::string chosen;
+            int best = -1;
+            for (auto& c : root->children) {
+                visit_dist[py::str(c->uci)] = c->visits;
+                if (c->visits > best) {
+                    best = c->visits;
+                    chosen = c->uci;
+                }
+            }
+            return py::make_tuple(chosen, visit_dist);
+        },
+        py::arg("board"), py::arg("net"), py::arg("n_sims") = 100, py::arg("c_puct") = 1.5,
+        "Slice 6d: FULLY-NATIVE PUCT search — native move-gen, apply, encode, and NN forward "
+        "(cc::ChesskersNet). Nothing crosses into Python per leaf. Returns (chosen_uci, "
+        "{uci: visits}).");
 }
