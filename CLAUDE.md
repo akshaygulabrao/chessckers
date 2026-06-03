@@ -56,7 +56,7 @@ The `slow` marker tags end-to-end tests that spawn subprocess workers (self-play
 ### Run / train
 
 - `python -m chessckers_engine.selfplay_az_loop [...]` — AlphaZero self-play + training loop.
-- Operational scripts live in `scripts/` (`launch_workers.sh`, `train_cloud*.sh`, `watchdog.sh`, `status.sh`, the launchd plist, remote-fleet sync). These drive multi-worker / cloud self-play.
+- Operational scripts live in `scripts/`. The fleet is lc0-style (server-side trainer + self-play clients over HTTP): `launch_local.sh` (trainer + arena + `fleet_server`), `launch_local_client.sh` (loopback self-play client), `launch_fleet_leena.sh` (leena/LAN client), `deploy_fresh.sh` (one-shot fresh redeploy), `stop_local.sh` to stop — with the shared client shape in `fleet.env`. See the `project-fleet-lc0-contract` memory.
 
 The legacy HTTP layer is gone: there is no Scala server, no `ServerClient`, and no `python -m chessckers_engine` HTTP server. All game logic runs in-process via `PyVariantClient`. Some launch scripts still pass `--use-pyvariant`/`--use-server`; those flags are accepted as no-ops.
 
