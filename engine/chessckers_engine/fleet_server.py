@@ -46,11 +46,22 @@ _NAME_RE = re.compile(r"^\d{3,}_\d{10}\.pkl(\.meta)?$")
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024  # a single game pkl is tens of KB; 64 MB is paranoia
 
 
+def _net_path(run_dir: Path) -> Path:
+    """The net file clients should pull: the gated champion `best.pt` if the
+    arena (fleet_arena) is maintaining one, else the trainer's raw `weights.pt`."""
+    best = run_dir / "best.pt"
+    return best if best.exists() else run_dir / "weights.pt"
+
+
 def _version(run_dir: Path) -> str:
-    """Net version the clients key off. Tracks the newest *checkpoint* so clients
-    refresh once per trainer iteration (not on every ~45s weights.pt republish);
-    falls back to weights.pt before the first checkpoint exists so the initial net
-    is still distributed promptly."""
+    """Net version the clients key off. When keep-best gating is active, tracks
+    `best.pt`'s promotion mtime — clients refresh once per PROMOTION. With no
+    arena running, falls back to the newest *checkpoint* (per-iteration cadence),
+    then to weights.pt before the first checkpoint, so behaviour is unchanged when
+    fleet_arena isn't deployed."""
+    best = run_dir / "best.pt"
+    if best.exists():
+        return f"best:{int(best.stat().st_mtime)}"
     ckpts = list(run_dir.glob("iter-async-*.pt"))
     if ckpts:
         newest = max(int(p.stat().st_mtime) for p in ckpts)
@@ -89,9 +100,8 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/control":
             self._send(200, b"STOP" if (rd / "STOP").exists() else b"RUN")
         elif self.path == "/weights":
-            w = rd / "weights.pt"
             try:
-                data = w.read_bytes()
+                data = _net_path(rd).read_bytes()
             except OSError:
                 self._send(404, b"no weights yet")
                 return
@@ -102,6 +112,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "version": _version(rd),
                 "weights": (rd / "weights.pt").exists(),
+                "best": (rd / "best.pt").exists(),
                 "buffer_backlog": backlog,
                 "control": "STOP" if (rd / "STOP").exists() else "RUN",
             }).encode()

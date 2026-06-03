@@ -1,0 +1,348 @@
+"""Fleet arena — lc0/AGZ-style keep-best gating for the continuous trainer.
+
+Runs on the trainer box, sharing the trainer's run-dir. `train_continuous` keeps
+publishing candidate checkpoints (`iter-async-*.pt`); this arena decides which
+candidate becomes the gated champion `best.pt` that self-play actually uses (the
+server versions on `best.pt`, so workers reload once per PROMOTION, not per
+iteration). It also archives every champion by timestamp and logs a per-side
+capacity signal, so we can read empirically when the network stops improving.
+
+Imbalance-aware promotion rule
+------------------------------
+Chessckers is structurally lopsided and the curriculum seeds are one-sided by
+construction (each seed is a position one side is *supposed* to win). A naive
+win-rate gate would reward a net for playing the favored side, not for being
+better. So the gate is built around the imbalance rather than ignoring it:
+
+  1. COLOR-SWAPPED SEED PAIRS. Each seed is played as pairs (candidate-as-White /
+     best-as-Black, then swapped). The seed's structural advantage is handed to
+     BOTH nets equally, so it cancels and the per-seed pair-score is bias-free
+     skill, not "who drew the winning side".
+  2. PER-SIDE CLASS BALANCE. Seeds are partitioned by which side they favor
+     (auto-labelled by playing best-vs-random both ways — the side that beats
+     random is the favored side; logged each cycle, self-correcting as best
+     strengthens). The promotion score is the BALANCED MEAN of the candidate's
+     score on White-favored vs Black-favored seeds — equal weight to each side's
+     task regardless of how many seeds fall in each class.
+  3. PROMOTE iff  balanced_score >= --threshold  AND  every populated class score
+     >= --side-floor. The floor is the no-side-regression guard: it refuses a net
+     that won overall by mastering one side while going backwards on the other.
+
+On promotion: best.pt <- candidate, archive nets/net-<unix_ts>.pt, bump the
+cumulative Elo by the gate margin, and benchmark the new best vs a FROZEN ANCHOR
+(the run's first champion) per side. Comparing to a *fixed* anchor (rather than
+the moving best, against which per-side advantage is not separable) gives two
+independent per-side strength curves over time — their plateaus are the per-side
+capacity answer. Everything is appended to gate_log.jsonl.
+
+Stdlib + torch only. Run on the trainer box, sharing its run-dir:
+
+    python -m chessckers_engine.fleet_arena --run-dir weights/run \\
+      --seed-mix-file ../scripts/seed_mix.txt --d-hidden 256 --c-filters 96 --n-blocks 4
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import os
+import shutil
+import time
+from pathlib import Path
+
+import torch
+
+from chessckers_engine.checkpoints import load_checkpoint
+from chessckers_engine.device import pick_device
+from chessckers_engine.evaluate import _state_to_outcome
+from chessckers_engine.mcts_puct import run_mcts
+from chessckers_engine.model import ChesskersScorer
+from chessckers_engine.random_player import pick_random
+from chessckers_engine.runtime import setup_logging
+from chessckers_engine.variant_py import PyVariantClient
+
+log = logging.getLogger("chessckers_engine.fleet_arena")
+
+
+# --- game runner ---------------------------------------------------------------
+
+def _play_from(white_picker, black_picker, client, start_fen: str, max_plies: int) -> str:
+    """Play one game from `start_fen`, returning 'white' | 'black' | 'draw'
+    (winner perspective). A picker raising / returning None ends the game as a
+    draw — gating never crashes on a single bad move."""
+    state = client.new_game(fen=start_fen)
+    ply = 0
+    while not state.get("status") and ply < max_plies:
+        picker = white_picker if state["turn"] == "white" else black_picker
+        chosen = picker(state)
+        if chosen is None:
+            break
+        try:
+            state = client.make_move(state["fen"], chosen["uci"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("gate game: make_move failed at ply %d (%s) — scoring draw", ply, e)
+            return "draw"
+        ply += 1
+    return _state_to_outcome(state)
+
+
+def _model_picker(model: ChesskersScorer, client, sims: int, c_puct: float,
+                  dir_alpha: float | None, dir_eps: float):
+    """A PUCT picker with a small root Dirichlet so repeated gate games diverge
+    (deterministic argmax play would make every pair an identical replay — no
+    sampling). The noise is much lighter than self-play's so play stays strong."""
+    def pick(state):
+        return run_mcts(state, client, model, n_sims=sims, c_puct=c_puct,
+                        dirichlet_alpha=dir_alpha, dirichlet_eps=dir_eps).chosen
+    return pick
+
+
+def _random_picker():
+    def pick(state):
+        return pick_random(state.get("legalMoves") or [])
+    return pick
+
+
+# --- favored-side labelling ----------------------------------------------------
+
+def _label_seeds(best_pick, rand_pick, client, seeds: list[str], max_plies: int) -> dict[str, str]:
+    """Label each seed by favored side: play best-as-White/random-Black and
+    random-White/best-as-Black. The side on which best beats random is the
+    favored side. 'balanced' if best wins on both sides (or neither) — a
+    balanced seed contributes equally to both class scores downstream."""
+    labels: dict[str, str] = {}
+    for seed in seeds:
+        w = _play_from(best_pick, rand_pick, client, seed, max_plies) == "white"
+        b = _play_from(rand_pick, best_pick, client, seed, max_plies) == "black"
+        labels[seed] = "white" if (w and not b) else "black" if (b and not w) else "balanced"
+    return labels
+
+
+# --- the gate ------------------------------------------------------------------
+
+def _score(outcome: str, cand_is_white: bool) -> float:
+    """Candidate's points for a single game (1 win / 0.5 draw / 0 loss)."""
+    if outcome == "draw":
+        return 0.5
+    cand_won = (outcome == "white") if cand_is_white else (outcome == "black")
+    return 1.0 if cand_won else 0.0
+
+
+def _gate(cand_pick, opp_pick, client, seeds: list[str], labels: dict[str, str],
+          pairs: int, max_plies: int) -> dict:
+    """Color-swapped seed-paired match: candidate vs opponent. Returns per-seed
+    pair-scores plus the imbalance-aware aggregate (balanced over favored-side
+    classes). Pure measurement — no promotion decision here."""
+    per_seed: dict[str, float] = {}
+    for seed in seeds:
+        pts = 0.0
+        for _ in range(pairs):
+            pts += _score(_play_from(cand_pick, opp_pick, client, seed, max_plies), True)   # candidate=White
+            pts += _score(_play_from(opp_pick, cand_pick, client, seed, max_plies), False)  # candidate=Black
+        per_seed[seed] = pts / (2 * pairs)
+
+    # Class scores: a 'balanced' seed counts toward BOTH classes.
+    w_scores = [per_seed[s] for s in seeds if labels.get(s) in ("white", "balanced")]
+    b_scores = [per_seed[s] for s in seeds if labels.get(s) in ("black", "balanced")]
+    class_w = sum(w_scores) / len(w_scores) if w_scores else None
+    class_b = sum(b_scores) / len(b_scores) if b_scores else None
+    populated = [c for c in (class_w, class_b) if c is not None]
+    balanced = sum(populated) / len(populated) if populated else 0.0  # equal weight per side
+    return {
+        "per_seed": {s: round(v, 3) for s, v in per_seed.items()},
+        "class_white": None if class_w is None else round(class_w, 3),
+        "class_black": None if class_b is None else round(class_b, 3),
+        "balanced_score": round(balanced, 3),
+        "min_class": round(min(populated), 3) if populated else 0.0,
+    }
+
+
+def _elo_delta(score: float, cap: float = 400.0) -> float:
+    """Elo points implied by a head-to-head score (logistic), clamped."""
+    s = min(max(score, 1e-3), 1 - 1e-3)
+    return max(-cap, min(cap, 400.0 * math.log10(s / (1 - s))))
+
+
+# --- persistence helpers -------------------------------------------------------
+
+def _load_model(path: Path, arch: dict, device) -> ChesskersScorer:
+    m = ChesskersScorer(**arch).to(device)
+    load_checkpoint(m, str(path))
+    m.eval()
+    return m
+
+
+def _atomic_copy(src: Path, dst: Path) -> None:
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+
+
+def _newest_candidate(run_dir: Path, settle_s: float) -> Path | None:
+    """Newest fully-written iter checkpoint (older than settle_s so we never read
+    a half-flushed torch.save)."""
+    now = time.time()
+    cands = []
+    for p in run_dir.glob("iter-async-*.pt"):
+        try:
+            mt = p.stat().st_mtime
+        except OSError:
+            continue
+        if now - mt >= settle_s:
+            cands.append((mt, p))
+    return max(cands)[1] if cands else None
+
+
+def _last_elo(log_path: Path) -> float:
+    """Resume the cumulative Elo from the last promoted line of the gate log."""
+    if not log_path.exists():
+        return 0.0
+    elo = 0.0
+    try:
+        for line in log_path.read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("promoted") and "best_elo" in rec:
+                elo = float(rec["best_elo"])
+    except OSError:
+        pass
+    return elo
+
+
+# --- main ----------------------------------------------------------------------
+
+def main() -> int:
+    setup_logging()
+    p = argparse.ArgumentParser(description="Keep-best gating arena (imbalance-aware).")
+    p.add_argument("--run-dir", required=True, type=Path, help="trainer's run-dir (shared)")
+    p.add_argument("--seed-mix-file", required=True, type=Path,
+                   help="curriculum seed mix (one FEN/line, '#'/blank ignored) — same file self-play uses")
+    p.add_argument("--d-hidden", type=int, default=256)
+    p.add_argument("--c-filters", type=int, default=96)
+    p.add_argument("--n-blocks", type=int, default=4)
+    p.add_argument("--sims", type=int, default=160, help="MCTS sims per move in gate games")
+    p.add_argument("--pairs", type=int, default=4, help="color-swapped pairs per seed (2x games/seed)")
+    p.add_argument("--threshold", type=float, default=0.55, help="balanced-score bar to promote")
+    p.add_argument("--side-floor", type=float, default=0.45, help="min per-class score (no-side-regression guard)")
+    p.add_argument("--c-puct", type=float, default=1.5)
+    p.add_argument("--dirichlet-alpha", type=float, default=0.5)
+    p.add_argument("--dirichlet-eps", type=float, default=0.15, help="root noise for gate-game diversity (light)")
+    p.add_argument("--max-plies", type=int, default=200)
+    p.add_argument("--gate-seconds", type=float, default=60.0, help="poll cadence between gate cycles")
+    p.add_argument("--device", default="cpu", help="arena device (cpu so it doesn't contend with the trainer's MPS)")
+    p.add_argument("--anchor-pairs", type=int, default=0, help="pairs for the vs-anchor per-side capacity bench (0 = use --pairs)")
+    p.add_argument("--seed", type=int, default=0)
+    args = p.parse_args()
+
+    run_dir: Path = args.run_dir.resolve()
+    weights_path = run_dir / "weights.pt"
+    best_path = run_dir / "best.pt"
+    nets_dir = run_dir / "nets"
+    anchor_path = nets_dir / "anchor.pt"
+    log_path = run_dir / "gate_log.jsonl"
+    stop_path = run_dir / "STOP"
+    nets_dir.mkdir(parents=True, exist_ok=True)
+
+    arch = {"d_hidden": args.d_hidden, "c_filters": args.c_filters, "n_blocks": args.n_blocks}
+    anchor_pairs = args.anchor_pairs or args.pairs
+    torch.manual_seed(args.seed)
+    device = pick_device(args.device)
+    client = PyVariantClient()
+    rand_pick = _random_picker()
+
+    seeds = [ln.strip() for ln in args.seed_mix_file.read_text().splitlines()
+             if ln.strip() and not ln.lstrip().startswith("#")]
+    if not seeds:
+        log.error("no seeds in %s", args.seed_mix_file)
+        return 2
+    log.info("arena up: device=%s seeds=%d sims=%d pairs=%d tau=%.2f floor=%.2f",
+             device, len(seeds), args.sims, args.pairs, args.threshold, args.side_floor)
+
+    # Establish best v0 (the gated champion) + the frozen anchor. Adopt the
+    # trainer's current weights as the first champion so self-play has something
+    # to pull immediately, before any gate has run.
+    while not best_path.exists():
+        if stop_path.exists():
+            return 0
+        if weights_path.exists():
+            ts0 = int(time.time())
+            _atomic_copy(weights_path, best_path)
+            _atomic_copy(weights_path, nets_dir / f"net-{ts0}.pt")
+            if not anchor_path.exists():
+                _atomic_copy(weights_path, anchor_path)
+            log.info("seeded best v0 from %s (anchor frozen) -> %s", weights_path.name, best_path.name)
+            break
+        log.info("waiting for trainer to publish weights.pt ...")
+        time.sleep(5.0)
+
+    best_model = _load_model(best_path, arch, device)
+    anchor_model = _load_model(anchor_path if anchor_path.exists() else best_path, arch, device)
+    best_elo = _last_elo(log_path)
+    last_cand: str | None = None
+    promotions = 0
+
+    def _picker(m):
+        return _model_picker(m, client, args.sims, args.c_puct, args.dirichlet_alpha, args.dirichlet_eps)
+
+    while not stop_path.exists():
+        cand_path = _newest_candidate(run_dir, settle_s=3.0)
+        if cand_path is None or cand_path.name == last_cand:
+            time.sleep(args.gate_seconds)
+            continue
+
+        cand_model = _load_model(cand_path, arch, device)
+        labels = _label_seeds(_picker(best_model), rand_pick, client, seeds, args.max_plies)
+        glyph = {"white": "W", "black": "B", "balanced": "~"}
+        log.info("gating %s (favored sides: %s)", cand_path.name,
+                 ", ".join(f"{_seed_tag(s)}={glyph[labels[s]]}" for s in seeds))
+
+        res = _gate(_picker(cand_model), _picker(best_model), client, seeds, labels, args.pairs, args.max_plies)
+        promoted = (res["balanced_score"] >= args.threshold and res["min_class"] >= args.side_floor)
+
+        rec = {
+            "ts": int(time.time()),
+            "candidate": cand_path.name,
+            "labels": {_seed_tag(s): labels[s] for s in seeds},
+            "promoted": promoted,
+            **res,
+        }
+
+        if promoted:
+            promotions += 1
+            ts = int(time.time())
+            _atomic_copy(cand_path, best_path)             # server versions on best.pt -> clients pull
+            _atomic_copy(cand_path, nets_dir / f"net-{ts}.pt")
+            best_model = cand_model
+            best_elo += _elo_delta(res["balanced_score"])
+            rec["best_elo"] = round(best_elo, 1)
+            # Per-side capacity: new best vs the FROZEN anchor (separable, unlike vs best).
+            cap = _gate(_picker(best_model), _picker(anchor_model), client, seeds, labels, anchor_pairs, args.max_plies)
+            rec["anchor_white"] = cap["class_white"]
+            rec["anchor_black"] = cap["class_black"]
+            log.info("PROMOTED %s -> best (#%d) | balanced=%.3f W=%s B=%s | elo=%.1f | vs-anchor W=%s B=%s",
+                     cand_path.name, promotions, res["balanced_score"], res["class_white"], res["class_black"],
+                     best_elo, cap["class_white"], cap["class_black"])
+        else:
+            log.info("rejected %s | balanced=%.3f (need %.2f) min_class=%.3f (need %.2f) W=%s B=%s",
+                     cand_path.name, res["balanced_score"], args.threshold, res["min_class"], args.side_floor,
+                     res["class_white"], res["class_black"])
+
+        with open(log_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        last_cand = cand_path.name
+
+    log.info("arena stopped (STOP). %d promotions, best_elo=%.1f", promotions, best_elo)
+    return 0
+
+
+def _seed_tag(fen: str) -> str:
+    """Short label for a seed FEN (reuse the trainer's compact tag)."""
+    from chessckers_engine.selfplay_az_loop import _seed_tag as _t
+    return _t(fen)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
