@@ -360,7 +360,7 @@ def main() -> int:
             n = _upload_games(server, buffer, args.min_age, args.timeout)
             if n:
                 total_up += n
-                log.info("uploaded %d game(s) (total %d)", n, total_up)
+                log.info("uploaded %d game(s) <%s> (total %d)", n, client_id, total_up)
             # 4. contribute gate games while a keep-best match is open (lc0-style).
             if not match_disabled:
                 if runner is None:

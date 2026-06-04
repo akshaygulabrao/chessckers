@@ -43,7 +43,6 @@ from chessckers_engine.checkpoints import load_checkpoint
 from chessckers_engine.device import pick_device
 from chessckers_engine.model import ChesskersScorer
 from chessckers_engine.runtime import setup_logging
-from chessckers_engine.selfplay_az_loop import _next_game_num, _seed_tag
 from chessckers_engine.train_az import _batch_loss, save_checkpoint
 
 log = logging.getLogger("chessckers_engine.train_continuous")
@@ -361,14 +360,8 @@ def main() -> int:
             buf.extend(new_ex)
             games_seen += len(metas)
             positions_ingested += len(new_ex)
-            for m in metas:  # log EVERY ingested game (local + leena) — single unified per-game logger
-                gn = _next_game_num()
+            for m in metas:  # tally per-machine self-play for the ~60s [selfplay] rollup
                 mach = m.get("machine", "?")
-                wid = m.get("worker_id")
-                src = f"{mach}/w{wid:02d}" if isinstance(wid, int) else mach
-                log.info("[selfplay] game #%d done <%s>: %s in %s plies (seed %s) [kept %s]",
-                         gn, src, m.get("outcome", "?"), m.get("plies", "?"),
-                         _seed_tag(m.get("seed_fen") or ""), m.get("kept", "?"))
                 sp_window[mach] = sp_window.get(mach, 0) + 1
             if len(buf) > args.buffer_cap:
                 del buf[: len(buf) - args.buffer_cap]  # drop oldest in place
