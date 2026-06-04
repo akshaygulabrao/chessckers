@@ -101,7 +101,8 @@ fi
 # Keep the Air awake with a STANDALONE detached caffeinate (survives ssh teardown; a
 # wrapping one does not). Needs leena on AC power.
 pkill -x caffeinate 2>/dev/null || true
-nohup caffeinate -ims >/dev/null 2>&1 </dev/null & disown
+nohup caffeinate -ims >/dev/null 2>&1 </dev/null &
+CAFF_PID=$!; disown
 
 # Never double-launch. The client owns the workers, so killing it is enough, but also reap
 # any stray workers left by an older (separate-launch) script.
@@ -136,15 +137,42 @@ UPDATE_CMD="cd '$REPO_ROOT' && git pull --ff-only && cd '$ENG' && PATH='$ENG/.ve
 # upload games, contribute gate games, self-update on a new server version. worker-id-base
 # 300 -> games attribute to [leena]. --sims is only a FALLBACK for the first-game window
 # before the server's selfplay.json is mirrored in; run-local/selfplay.json then governs.
-nohup "$PY" -m chessckers_engine.fleet_client \
-  --server "$SERVER" --run-dir "$RUN" --client-id leena --poll-seconds $FLEET_POLL_S \
-  --bind-interface en0 \
-  --update-cmd "$UPDATE_CMD" \
-  --spawn-workers -- \
-  --workers $FLEET_WORKERS --worker-id-base 300 --seed 4000 \
-  --device $FLEET_DEVICE --d-hidden $FLEET_DH --c-filters $FLEET_CF --n-blocks $FLEET_NB \
-  --max-plies $FLEET_MAX_PLIES --sims $FLEET_SIMS_FALLBACK --weights-poll-seconds $FLEET_WEIGHTS_POLL_S $NATIVE \
-  > "$RUN/fleet_client.log" 2>&1 &
+CLIENT_ARGS=(
+  -m chessckers_engine.fleet_client
+  --server "$SERVER" --run-dir "$RUN" --client-id leena --poll-seconds "$FLEET_POLL_S"
+  --bind-interface en0
+  --update-cmd "$UPDATE_CMD"
+  --spawn-workers --
+  --workers "$FLEET_WORKERS" --worker-id-base 300 --seed 4000
+  --device "$FLEET_DEVICE" --d-hidden "$FLEET_DH" --c-filters "$FLEET_CF" --n-blocks "$FLEET_NB"
+  --max-plies "$FLEET_MAX_PLIES" --sims "$FLEET_SIMS_FALLBACK" --weights-poll-seconds "$FLEET_WEIGHTS_POLL_S"
+)
+[ -n "$NATIVE" ] && CLIENT_ARGS+=("$NATIVE")
+
+# FOREGROUND=1 -> run the client ATTACHED to this (interactive ssh) session instead of
+# detaching it. This is the macOS Local-Network fix: a launchd-orphaned daemon (the default
+# nohup/&/disown path below) is DENIED LAN access by macOS privacy, so every connect to the
+# LAN server fails EHOSTUNREACH; a process that stays a child of a live, granted ssh session
+# reaches the LAN fine. Output streams to your terminal AND run-local/fleet_client.log; Ctrl-C
+# (run it under `ssh -t`) stops the client, its workers, and the caffeinate this script started.
+if [ -n "${FOREGROUND:-}" ]; then
+  rm -f "$RUN/client.pid" 2>/dev/null || true
+  cleanup() {
+    echo; echo "leena: foreground teardown — stopping workers + caffeinate…"
+    touch "$RUN/STOP" 2>/dev/null || true
+    pkill -f "chessckers_engine.selfplay_workers_only" 2>/dev/null || true
+    [ -n "${CAFF_PID:-}" ] && kill "$CAFF_PID" 2>/dev/null || true
+  }
+  trap 'cleanup; exit 0' INT TERM
+  echo "leena: FOREGROUND mode -> $SERVER  (Ctrl-C to stop everything). Log also at $RUN/fleet_client.log"
+  "$PY" "${CLIENT_ARGS[@]}" 2>&1 | tee "$RUN/fleet_client.log"
+  cleanup
+  exit 0
+fi
+
+# Background (detaches to launchd). NOTE: on a macOS box with Local Network privacy this path
+# leaves the client unable to reach a LAN server (orphaned daemons are denied) — use FOREGROUND=1.
+nohup "$PY" "${CLIENT_ARGS[@]}" > "$RUN/fleet_client.log" 2>&1 &
 echo $! > "$RUN/client.pid"; disown
 echo "leena fleet_client launched (pid $(cat "$RUN/client.pid")) -> $SERVER"
 echo "leena up: client owns $FLEET_WORKERS workers (spawned once weights land)."
