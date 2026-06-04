@@ -384,6 +384,12 @@ def main() -> int:
     p.add_argument("--pairs", type=int, default=4, help="color-swapped pairs per seed (2x games/seed)")
     p.add_argument("--threshold", type=float, default=0.55, help="balanced-score bar to promote")
     p.add_argument("--side-floor", type=float, default=0.45, help="min per-class score (no-side-regression guard)")
+    p.add_argument("--gate-opponents", type=int, default=3,
+                   help="gate the candidate against the last N champions (newest first; fewer if "
+                        "<N exist). N=1 restores the single-best gate.")
+    p.add_argument("--no-regress", type=float, default=0.50,
+                   help="min balanced-score vs each OLDER champion (beyond the immediate best) to "
+                        "promote — the across-time no-regression guard.")
     p.add_argument("--c-puct", type=float, default=1.5)
     p.add_argument("--dirichlet-alpha", type=float, default=0.5)
     p.add_argument("--dirichlet-eps", type=float, default=0.15, help="root noise for gate-game diversity (light)")
@@ -490,43 +496,71 @@ def main() -> int:
         cand_net = _make_net(cand_path, arch, arena_dir / "cand.bin", device)
         labels = _label_seeds(_picker(best_net), rand_pick, client, seeds, args.max_plies)
         glyph = {"white": "W", "black": "B", "balanced": "~"}
-        log.info("GATE START %s vs best | favored: %s | %d seeds x %d pairs x2 = %d games (clients may contribute)",
-                 cand_path.name, ", ".join(f"{_seed_tag(s)}={glyph[labels[s]]}" for s in seeds),
-                 len(seeds), args.pairs, len(seeds) * args.pairs * 2)
+        # Opponent panel: the last --gate-opponents champions, newest first. Opponent 0 is
+        # the current best (reuse best_net); the rest are older champions from nets/. Fewer
+        # than N early in a run ("all of them if <"). Promotion needs the full bar vs the
+        # immediate best AND no regression (>= --no-regress) vs each older champion — the
+        # regression ladder folded into the gate, so strength can't cycle backwards.
+        champ_paths = list(reversed(sorted(nets_dir.glob("net-*.pt"), key=_net_ts)))  # newest first
+        opponents = [("best", best_net)]
+        for oi, cp in enumerate(champ_paths[1:args.gate_opponents], start=1):
+            opponents.append((cp.name, _make_net(cp, arch, arena_dir / f"opp{oi}.bin", device)))
+        per_opp = len(seeds) * args.pairs * 2
+        log.info("GATE START %s vs last %d champion(s) | favored: %s | %d x %d games = %d total (clients contribute the vs-best games)",
+                 cand_path.name, len(opponents),
+                 ", ".join(f"{_seed_tag(s)}={glyph[labels[s]]}" for s in seeds),
+                 len(opponents), per_opp, len(opponents) * per_opp)
 
-        # Publish this gate so self-play clients can contribute its games (lc0-style):
-        # copy the candidate to a served path, clear stale results, write the manifest.
-        # The arena still plays every unit no client supplied, so with no clients this
-        # is identical to a local gate — the fleet only offloads work.
-        match_id = int(time.time())
-        if results_dir.exists():
-            shutil.rmtree(results_dir, ignore_errors=True)
-        results_dir.mkdir(parents=True, exist_ok=True)
-        _atomic_copy(cand_path, cand_served)
-        _write_json(match_path, {
-            "match_id": match_id,
-            "seeds": seeds,
-            "arch": arch,
-            "params": {"sims": args.sims, "c_puct": args.c_puct,
-                       "dir_alpha": args.dirichlet_alpha, "dir_eps": args.dirichlet_eps,
-                       "max_plies": args.max_plies},
-        })
-        remote = _RemoteGate(results_dir, match_id)
-        res = _gate(_picker(cand_net), _picker(best_net), client, seeds, labels,
-                    args.pairs, args.max_plies, tag="gate", remote=remote, log_games=True)
-        try:
-            match_path.unlink()                    # close the gate: clients fall back to self-play
-        except OSError:
-            pass
-        if remote.popped:
-            log.info("  %d/%d gate games contributed by clients", remote.popped,
-                     len(seeds) * args.pairs * 2)
-        promoted = (res["balanced_score"] >= args.threshold and res["min_class"] >= args.side_floor)
+        opp_results = []
+        for oi, (oname, onet) in enumerate(opponents):
+            if oi == 0:
+                # Primary (vs current best): publish the gate so self-play clients can
+                # contribute its games (lc0-style) — clients play cand vs THEIR best.pt,
+                # exactly this matchup. The arena plays every unit no client supplied, so
+                # with no clients this is identical to a local gate.
+                match_id = int(time.time())
+                if results_dir.exists():
+                    shutil.rmtree(results_dir, ignore_errors=True)
+                results_dir.mkdir(parents=True, exist_ok=True)
+                _atomic_copy(cand_path, cand_served)
+                _write_json(match_path, {
+                    "match_id": match_id,
+                    "seeds": seeds,
+                    "arch": arch,
+                    "params": {"sims": args.sims, "c_puct": args.c_puct,
+                               "dir_alpha": args.dirichlet_alpha, "dir_eps": args.dirichlet_eps,
+                               "max_plies": args.max_plies},
+                })
+                remote = _RemoteGate(results_dir, match_id)
+                r = _gate(_picker(cand_net), _picker(onet), client, seeds, labels,
+                          args.pairs, args.max_plies, tag="gate", remote=remote, log_games=True)
+                try:
+                    match_path.unlink()                # close the gate: clients fall back to self-play
+                except OSError:
+                    pass
+                if remote.popped:
+                    log.info("  %d/%d vs-best gate games contributed by clients", remote.popped, per_opp)
+            else:
+                # Older champions: local-only (clients only hold best.pt, so no offload).
+                r = _gate(_picker(cand_net), _picker(onet), client, seeds, labels,
+                          args.pairs, args.max_plies, tag=f"gate-prev{oi}", remote=None, log_games=True)
+            opp_results.append((oname, r))
+            log.info("  panel %d/%d vs %-14s -> balanced=%.3f min_class=%.3f (cand W%d-L%d-D%d)",
+                     oi + 1, len(opponents), oname, r["balanced_score"], r["min_class"],
+                     r["record"]["w"], r["record"]["l"], r["record"]["d"])
+
+        res = opp_results[0][1]                         # vs immediate best — drives elo + the promote bar
+        primary_ok = res["balanced_score"] >= args.threshold and res["min_class"] >= args.side_floor
+        regress = [(n, rr["balanced_score"]) for n, rr in opp_results[1:]
+                   if rr["balanced_score"] < args.no_regress]
+        promoted = primary_ok and not regress
 
         rec = {
             "ts": int(time.time()),
             "candidate": cand_path.name,
             "labels": {_seed_tag(s): labels[s] for s in seeds},
+            "panel": [{"net": n, "balanced": rr["balanced_score"], "min_class": rr["min_class"],
+                       "record": rr["record"]} for n, rr in opp_results],
             "promoted": promoted,
             **res,
         }
@@ -584,9 +618,15 @@ def main() -> int:
                 if gone:
                     log.info("  pruned %d old champion net(s) (kept newest %d)", gone, keep_floor)
         else:
-            log.info("rejected %s | record W%d-L%d-D%d (score=%.3f, need %.2f) min_class=%.3f (need %.2f) W=%s B=%s",
-                     cand_path.name, res["record"]["w"], res["record"]["l"], res["record"]["d"],
-                     res["balanced_score"], args.threshold, res["min_class"], args.side_floor,
+            why = []
+            if not primary_ok:
+                why.append(f"vs-best score={res['balanced_score']:.3f} (need {args.threshold:.2f}) "
+                           f"min_class={res['min_class']:.3f} (need {args.side_floor:.2f})")
+            if regress:
+                why.append("regressed vs " + ", ".join(f"{n}={s:.3f}<{args.no_regress:.2f}" for n, s in regress))
+            log.info("rejected %s | %s | record W%d-L%d-D%d W=%s B=%s",
+                     cand_path.name, " ; ".join(why),
+                     res["record"]["w"], res["record"]["l"], res["record"]["d"],
                      res["class_white"], res["class_black"])
 
         with open(log_path, "a") as f:

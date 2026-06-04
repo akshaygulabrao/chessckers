@@ -71,6 +71,7 @@ nohup "$PY" -m chessckers_engine.fleet_arena \
   --run-dir "$RUN" --seed-mix-file "$SEED_MIX" \
   --d-hidden $FLEET_DH --c-filters $FLEET_CF --n-blocks $FLEET_NB \
   --sims 160 --pairs 4 --threshold 0.55 --side-floor 0.45 \
+  --gate-opponents 3 --no-regress 0.50 \
   --max-plies $FLEET_MAX_PLIES --gate-seconds 60 --device cpu \
   >>"$LOG" 2>&1 &
 say "arena    pid $!"
