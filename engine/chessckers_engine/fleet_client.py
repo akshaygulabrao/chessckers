@@ -55,6 +55,7 @@ client injects --run-dir/--weights, so the launcher only passes box-specific con
 from __future__ import annotations
 
 import argparse
+import errno
 import http.client
 import logging
 import os
@@ -74,6 +75,7 @@ log = logging.getLogger("chessckers_engine.fleet_client")
 
 UPDATE_RETRY_S = 300.0  # re-attempt a failed/too-early self-update to a given sha no more often than this
 HEARTBEAT_S = 600.0     # while healthy, log a "still alive" health line no more often than this (transitions log immediately)
+DEEP_DIAG_S = 60.0      # while unreachable, emit the kitchen-sink _deep_diag at most this often (onset always dumps)
 
 _IP_BOUND_IF = 25  # macOS <netinet/in.h>: pins a socket to an interface, overriding VPN/tunnel scoping
 _opener: urllib.request.OpenerDirector | None = None  # set by --bind-interface; None = default routing
@@ -99,7 +101,7 @@ def _build_bound_opener(ifname: str) -> urllib.request.OpenerDirector:
         def http_open(self, req):
             return self.do_open(_BoundConn, req)
 
-    return urllib.request.build_opener(_BoundHandler)
+    return urllib.request.build_opener(_BoundHandler), idx  # idx = the cached iface index, for drift checks
 
 
 def _urlopen(req: urllib.request.Request, timeout: float):
@@ -173,6 +175,98 @@ def _net_diag(server: str, bind_iface: str) -> str:
     except Exception:  # noqa: BLE001
         pass
     return " ".join(parts)
+
+
+def _err_detail(e: BaseException) -> str:
+    """'<ExcType>/<ERRNONAME>(<n>): <msg>' — unwraps urllib.error.URLError to the underlying
+    OSError so the symbolic errno (EHOSTUNREACH, ENETUNREACH, ETIMEDOUT, ECONNREFUSED …) is
+    explicit in the log rather than a bare number you have to look up."""
+    inner = getattr(e, "reason", None) or e
+    en = getattr(inner, "errno", None)
+    name = errno.errorcode.get(en, "?") if isinstance(en, int) else "?"
+    return f"{type(e).__name__}/{name}({en}): {inner}"
+
+
+def _raw_connect(host: str, port: int, ifname: str | None, timeout: float = 2.0) -> str:
+    """Fresh in-process TCP connect attempt (optionally IP_BOUND_IF-pinned) so a failure dump
+    records whether a brand-new socket reaches the server AT THIS INSTANT and which local
+    address the kernel picks. Never raises."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        if ifname:
+            s.setsockopt(socket.IPPROTO_IP, _IP_BOUND_IF, struct.pack("I", socket.if_nametoindex(ifname)))
+        t0 = time.time()
+        s.connect((host, port))
+        return "OK src=%s:%d %.0fms" % (*s.getsockname(), (time.time() - t0) * 1000)
+    except OSError as e:
+        return f"FAIL {errno.errorcode.get(e.errno, '?')}({e.errno}) {e.strerror}"
+    finally:
+        s.close()
+
+
+def _sh(cmd: list, timeout: float = 3.0) -> str:
+    """Best-effort capture of a short shell command's stdout; '(err …)' instead of raising."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout.strip()
+    except Exception as e:  # noqa: BLE001 — diagnostics only
+        return f"(err {e})"
+
+
+def _deep_diag(server: str, bind_iface: str, cached_idx) -> str:
+    """Kitchen-sink egress snapshot for a 'No route to host' (EHOSTUNREACH) that only bites the
+    long-running client. Best-effort, never raises; macOS tools, no sudo. Captures the things
+    that actually explain an L2/route-unreachable: the ARP/neighbor entry for the server (the
+    crux), the full host route (flags/expire), the bound interface's link state, AWDL radio
+    status, the TCP socket-state census (TIME_WAIT / ephemeral-port pile-up), memory+swap
+    pressure (the 8GB Air runs 4 torch workers), the live-vs-cached iface index, and fresh
+    pinned+unpinned connects with the errno + local address the kernel picks right now."""
+    u = urlparse(server)
+    host = u.hostname or server
+    port = u.port or 80
+    iface = bind_iface or "en0"
+    L = []
+    # ARP / neighbor — the crux for EHOSTUNREACH on a directly-connected LAN
+    L.append("arp:     " + (_sh(["arp", "-n", host]) or "(no entry)"))
+    # full host route — keep the informative fields
+    rt = _sh(["route", "-n", "get", host])
+    L.append("route:   " + " ".join(s.strip() for s in rt.splitlines()
+             if any(k in s for k in ("interface:", "gateway:", "flags:", "expire:"))))
+    # bound interface link state — UP/RUNNING/ACTIVE? still owns its inet? status active/inactive?
+    eg = _sh(["ifconfig", iface])
+    head = eg.splitlines()[0] if eg else ""
+    inet = next((s.strip() for s in eg.splitlines() if s.strip().startswith("inet ")), "(no inet)")
+    status = next((s.strip() for s in eg.splitlines() if "status:" in s), "")
+    L.append(f"{iface}:    {head.split('mtu')[0].strip()} | {inet} | {status}")
+    # AWDL radio — AirDrop/Handoff/Continuity time-shares the Wi-Fi channel
+    aw = _sh(["ifconfig", "awdl0"])
+    awf = aw.split("flags=")[1].split("<")[0] if "flags=" in aw else "?"
+    aws = next((s.strip() for s in aw.splitlines() if "status:" in s), "")
+    L.append(f"awdl0:   flags={awf} {aws}")
+    # TCP socket census + conns to the server (TIME_WAIT churn / ephemeral-port exhaustion)
+    ns = _sh(["netstat", "-an", "-p", "tcp"])
+    states: dict = {}
+    nsrv = 0
+    for r in (s.split() for s in ns.splitlines()):
+        if len(r) >= 6 and r[-1].isupper():
+            states[r[-1]] = states.get(r[-1], 0) + 1
+        if any(f"{host}.{port}" in tok for tok in r):
+            nsrv += 1
+    L.append(f"tcp:     {states}  conns->{host}.{port}={nsrv}")
+    # memory + swap pressure (4 torch workers on an 8GB box — level 1=normal 2=warn 4=critical)
+    L.append("mem:     pressure_lvl=" + _sh(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]) +
+             "  " + _sh(["sysctl", "-n", "vm.swapusage"]))
+    # iface index now vs the value the bound opener cached at startup
+    try:
+        live = socket.if_nametoindex(iface)
+        L.append(f"idx:     {iface} live={live} cached={cached_idx}" +
+                 ("  <-- DRIFTED" if cached_idx is not None and live != cached_idx else ""))
+    except OSError as e:
+        L.append(f"idx:     err {e}")
+    # fresh connects RIGHT NOW: does a brand-new socket reach the server, pinned and not?
+    L.append(f"connect unpin:     {_raw_connect(host, port, None)}")
+    L.append(f"connect pin {iface}: {_raw_connect(host, port, bind_iface or 'en0')}")
+    return "\n    ".join(L)
 
 
 def _split_worker_argv(argv: list) -> tuple:
@@ -369,11 +463,12 @@ def main() -> int:
     args = p.parse_args(argv)
 
     server = args.server.rstrip("/")
+    bound_idx = None  # the iface index the bound opener cached at startup (for drift checks in _deep_diag)
     if args.bind_interface:
         global _opener
         try:
-            _opener = _build_bound_opener(args.bind_interface)
-            log.info("pinned outbound HTTP to interface %s (IP_BOUND_IF)", args.bind_interface)
+            _opener, bound_idx = _build_bound_opener(args.bind_interface)
+            log.info("pinned outbound HTTP to interface %s (IP_BOUND_IF, idx=%s)", args.bind_interface, bound_idx)
         except OSError as e:
             log.warning("could not bind to %s (%s) — using default routing", args.bind_interface, e)
     client_id = args.client_id or socket.gethostname()
@@ -404,6 +499,7 @@ def main() -> int:
     consecutive_fail = 0
     first_fail_t = 0.0
     last_heartbeat_t = 0.0
+    last_deep_t = 0.0
     while True:
         try:
             now = time.time()
@@ -427,10 +523,14 @@ def main() -> int:
                 consecutive_fail += 1
                 if consecutive_fail == 1:
                     first_fail_t = now
-                # Snapshot egress state AT THE MOMENT OF FAILURE — which interface the kernel
-                # would route on now, whether en0 still owns its IP, what tunnels are up.
-                log.warning("control GET failed (heartbeat dropped; %d in a row): %r | %s",
-                            consecutive_fail, e, _net_diag(server, args.bind_interface))
+                # One-line egress snapshot every failing tick; the full kitchen-sink _deep_diag
+                # on the FIRST failing tick of an outage and every DEEP_DIAG_S thereafter.
+                log.warning("control GET failed (heartbeat dropped; %d in a row): %s | %s",
+                            consecutive_fail, _err_detail(e), _net_diag(server, args.bind_interface))
+                if consecutive_fail == 1 or now - last_deep_t >= DEEP_DIAG_S:
+                    last_deep_t = now
+                    log.warning("deep-diag @ unreachable:\n    %s",
+                                _deep_diag(server, args.bind_interface, bound_idx))
             # Reachability transitions: log recovery (with how long we were down) the first
             # healthy tick after a flap; otherwise emit a periodic "still alive" health line.
             if control_ok:
