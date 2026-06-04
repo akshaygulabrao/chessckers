@@ -205,6 +205,23 @@ def _raw_connect(host: str, port: int, ifname: str | None, timeout: float = 2.0)
         s.close()
 
 
+def _raw_connect_idx(host: str, port: int, idx: int, timeout: float = 2.0) -> str:
+    """Like _raw_connect but pinned to an explicit interface INDEX (not re-resolved from a name) —
+    i.e. the EXACT value the bound opener cached at startup. If this FAILS while the fresh-name
+    pin SUCCEEDS, the cached index is stale and that's the bug (the opener holds the only copy)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.setsockopt(socket.IPPROTO_IP, _IP_BOUND_IF, struct.pack("I", idx))
+        t0 = time.time()
+        s.connect((host, port))
+        return "OK src=%s:%d %.0fms" % (*s.getsockname(), (time.time() - t0) * 1000)
+    except OSError as e:
+        return f"FAIL {errno.errorcode.get(e.errno, '?')}({e.errno}) {e.strerror}"
+    finally:
+        s.close()
+
+
 def _sh(cmd: list, timeout: float = 3.0) -> str:
     """Best-effort capture of a short shell command's stdout; '(err …)' instead of raising."""
     try:
@@ -263,9 +280,14 @@ def _deep_diag(server: str, bind_iface: str, cached_idx) -> str:
                  ("  <-- DRIFTED" if cached_idx is not None and live != cached_idx else ""))
     except OSError as e:
         L.append(f"idx:     err {e}")
-    # fresh connects RIGHT NOW: does a brand-new socket reach the server, pinned and not?
-    L.append(f"connect unpin:     {_raw_connect(host, port, None)}")
-    L.append(f"connect pin {iface}: {_raw_connect(host, port, bind_iface or 'en0')}")
+    # fresh connects RIGHT NOW — the discriminator. unpinned; pinned by NAME (re-resolves the
+    # index live); and pinned to the EXACT index the opener cached at startup. cached-FAIL +
+    # fresh-OK == stale cached index (the opener is the only holder); both-OK == not the socket
+    # layer at all (the urllib opener state is suspect instead).
+    L.append(f"connect unpin:           {_raw_connect(host, port, None)}")
+    L.append(f"connect pin {iface}(fresh):  {_raw_connect(host, port, iface)}")
+    if cached_idx is not None:
+        L.append(f"connect pin idx={cached_idx}(cached): {_raw_connect_idx(host, port, cached_idx)}")
     return "\n    ".join(L)
 
 
