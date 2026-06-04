@@ -171,24 +171,27 @@ def _score(outcome: str, cand_is_white: bool) -> float:
 
 
 def _obtain(cand_pick, opp_pick, client, seed: str, cand_white: bool, max_plies: int,
-            remote) -> str:
-    """One gate game's outcome ('white'|'black'|'draw'). If a `remote` source has a
-    matching client-played outcome queued, use it; otherwise play it locally. With
-    `remote=None` this is just a local game — so a gate with no clients is identical
-    to the old all-local gate."""
+            remote) -> tuple[str, str]:
+    """One gate game's (outcome, source). source is 'client' if a self-play box
+    already played this unit and POSTed it (consumed from `remote`), else 'local'
+    (the arena plays it here). With `remote=None` it's always local — a gate with
+    no clients is identical to the old all-local gate."""
     if remote is not None:
         out = remote.pop(seed, cand_white)
         if out is not None:
-            return out
+            return out, "client"
     white_pick, black_pick = (cand_pick, opp_pick) if cand_white else (opp_pick, cand_pick)
-    return _play_from(white_pick, black_pick, client, seed, max_plies)
+    return _play_from(white_pick, black_pick, client, seed, max_plies), "local"
 
 
 def _gate(cand_pick, opp_pick, client, seeds: list[str], labels: dict[str, str],
-          pairs: int, max_plies: int, tag: str = "gate", remote=None) -> dict:
+          pairs: int, max_plies: int, tag: str = "gate", remote=None,
+          log_games: bool = False) -> dict:
     """Color-swapped seed-paired match: candidate vs opponent. Returns per-seed
     pair-scores plus the imbalance-aware aggregate (balanced over favored-side
-    classes). Logs a line per seed so a long gate is visibly progressing.
+    classes). Logs a line per seed so a long gate is visibly progressing; with
+    `log_games` it also logs each individual game's completion (g/total, outcome,
+    and whether the arena host or a self-play client computed it).
 
     `remote` (optional): a source of client-played outcomes for this same match.
     Each unit a client already supplied is consumed instead of played locally, so
@@ -196,15 +199,21 @@ def _gate(cand_pick, opp_pick, client, seeds: list[str], labels: dict[str, str],
     unchanged (still exactly 2*pairs games/seed)."""
     per_seed: dict[str, float] = {}
     rec = [0, 0, 0]  # candidate's aggregate [W, L, D] vs opponent across all gate games
+    total = len(seeds) * pairs * 2  # games in the whole gate (for the g/total progress)
+    g = 0
     for si, seed in enumerate(seeds, 1):
         pts = 0.0
         wld = [0, 0, 0]  # this seed's [W, L, D] from the candidate's perspective
         for _ in range(pairs):
             for cand_white in (True, False):
-                s = _score(_obtain(cand_pick, opp_pick, client, seed, cand_white, max_plies, remote),
-                           cand_white)
+                outcome, gsrc = _obtain(cand_pick, opp_pick, client, seed, cand_white, max_plies, remote)
+                s = _score(outcome, cand_white)
+                g += 1
                 pts += s
                 wld[0 if s == 1.0 else 1 if s == 0.0 else 2] += 1
+                if log_games:
+                    log.info("  [%s] game %d/%d %-16s cand=%s -> %-5s [%s]",
+                             tag, g, total, _seed_tag(seed), "W" if cand_white else "B", outcome, gsrc)
         per_seed[seed] = pts / (2 * pairs)
         for i in range(3):
             rec[i] += wld[i]
@@ -481,7 +490,7 @@ def main() -> int:
         cand_net = _make_net(cand_path, arch, arena_dir / "cand.bin", device)
         labels = _label_seeds(_picker(best_net), rand_pick, client, seeds, args.max_plies)
         glyph = {"white": "W", "black": "B", "balanced": "~"}
-        log.info("gating %s vs best | favored: %s | %d seeds x %d pairs x2 = %d games",
+        log.info("GATE START %s vs best | favored: %s | %d seeds x %d pairs x2 = %d games (clients may contribute)",
                  cand_path.name, ", ".join(f"{_seed_tag(s)}={glyph[labels[s]]}" for s in seeds),
                  len(seeds), args.pairs, len(seeds) * args.pairs * 2)
 
@@ -504,7 +513,7 @@ def main() -> int:
         })
         remote = _RemoteGate(results_dir, match_id)
         res = _gate(_picker(cand_net), _picker(best_net), client, seeds, labels,
-                    args.pairs, args.max_plies, tag="gate", remote=remote)
+                    args.pairs, args.max_plies, tag="gate", remote=remote, log_games=True)
         try:
             match_path.unlink()                    # close the gate: clients fall back to self-play
         except OSError:
@@ -562,6 +571,12 @@ def main() -> int:
                              lr["balanced_score"], gap,
                              "  <-- REGRESSION" if lr["balanced_score"] < 0.5 else "")
                 rec["ladder"] = ladder
+                if ladder:
+                    summ = "  ".join(
+                        f"-{d['back']}={d['score']:.3f}({d['elo_gap']:+.0f}elo"
+                        + (" REGRESSED" if d['score'] < 0.5 else "") + ")"
+                        for d in ladder)
+                    log.info("  regression ladder vs past champions (now best #%d): %s", promotions, summ)
             # Retention: cap nets/ at the newest keep_floor champions (>= the deepest
             # ladder rung, so rungs survive). anchor.pt is a separate filename, untouched.
             if keep_floor:

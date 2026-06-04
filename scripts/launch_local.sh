@@ -18,6 +18,7 @@
 #   then:  scripts/launch_local_client.sh   # add loopback self-play (its own run-dir)
 #
 # Tunables (env): SIMS(=fleet fallback) PORT(=8000) LOG(=/tmp/cc_train.log)
+#                 PER_GAME_KEEP(=0.5) — per-game downsample frac for the replay window (1.0=off)
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$REPO_ROOT/scripts/fleet.env"
@@ -27,6 +28,7 @@ RUN="$ENG/weights/run"
 LOG="${LOG:-/tmp/cc_train.log}"
 SEED_MIX="$REPO_ROOT/scripts/seed_mix.txt"
 SIMS="${SIMS:-$FLEET_SIMS_FALLBACK}"; PORT="${PORT:-8000}"
+PER_GAME_KEEP="${PER_GAME_KEEP:-0.5}"   # keep ~half of each game's plies in the live window (lc0-style SKIP decorrelation)
 
 say(){ echo "[launch-local] $*" >&2; }
 
@@ -58,10 +60,11 @@ cd "$ENG"
 nohup "$PY" -m chessckers_engine.train_continuous \
   --run-dir "$RUN" --no-prime \
   --buffer-cap 300000 --min-buffer 2000 --replay-factor 8 --batch-size 256 \
+  --per-game-keep "$PER_GAME_KEEP" \
   --publish-seconds 45 --ckpt-seconds 120 \
   --d-hidden $FLEET_DH --c-filters $FLEET_CF --n-blocks $FLEET_NB --seed 1000 \
   >>"$LOG" 2>&1 &
-say "trainer  pid $!"
+say "trainer  pid $!  (per-game-keep=$PER_GAME_KEEP)"
 
 # 2. arena — seeds best v0 from weights.pt, then gates each new checkpoint.
 nohup "$PY" -m chessckers_engine.fleet_arena \

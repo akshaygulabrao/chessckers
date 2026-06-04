@@ -185,13 +185,27 @@ class _GameArchive:
         self._manifest = open(path, "a")
 
 
-def _drain(buffer_dir: Path, archive: "_GameArchive | None" = None) -> tuple[list, list]:
+def _downsample_game(exs: list, keep_frac: float, rng: "random.Random | None") -> list:
+    """Per-game downsampling (lc0-style SKIP): keep each position of a game
+    independently with probability `keep_frac`. Consecutive plies of one game are
+    near-duplicates, so taking ~1 in 1/keep_frac of them decorrelates the replay
+    window without biasing it. keep_frac>=1 (or no rng) keeps everything; a
+    non-empty game never downsamples to nothing (keeps >=1 position)."""
+    if rng is None or keep_frac >= 1.0 or not exs:
+        return exs
+    kept = [e for e in exs if rng.random() < keep_frac]
+    return kept or [rng.choice(exs)]
+
+
+def _drain(buffer_dir: Path, archive: "_GameArchive | None" = None,
+           keep_frac: float = 1.0, rng: "random.Random | None" = None) -> tuple[list, list]:
     """Load + consume every COMPLETE game pkl in buffer_dir. Each pkl is a
     list[AZExample] (what selfplay_worker_async writes), with a sibling .meta
-    JSON (machine/outcome/plies/seed_fen). Returns (examples, metas) — one meta
-    dict per ingested game; skips partial/mid-rsync pkls (retried next tick),
-    archives the game (if `archive` set) before unlinking the consumed pkl + its
-    .meta sidecar."""
+    JSON (worker_id/machine/outcome/plies/seed_fen). Returns (examples, metas) —
+    one meta dict per ingested game (stamped with meta['kept'] = positions taken
+    into the live window); skips partial/mid-rsync pkls (retried next tick). The
+    game is archived IN FULL (the cold tier keeps every position) BEFORE the live
+    window is downsampled by `keep_frac`, then the pkl + .meta are unlinked."""
     examples: list = []
     metas: list = []
     if not buffer_dir.exists():
@@ -202,16 +216,18 @@ def _drain(buffer_dir: Path, archive: "_GameArchive | None" = None) -> tuple[lis
                 exs = pickle.load(f)
         except (EOFError, pickle.UnpicklingError, OSError, ValueError):
             continue  # mid-write / partial rsync — retry next tick
-        examples.extend(exs)
         meta_path = Path(str(pkl) + ".meta")
         meta: dict = {}
         try:
             meta = json.loads(meta_path.read_text())
         except (OSError, ValueError):
             pass
-        metas.append(meta)
         if archive is not None:
-            archive.append(exs, meta)  # durable cold tier before the pkl is gone
+            archive.append(exs, meta)  # durable cold tier gets the WHOLE game (pre-downsample)
+        kept = _downsample_game(exs, keep_frac, rng)
+        meta["kept"] = len(kept)
+        examples.extend(kept)
+        metas.append(meta)
         for fp in (pkl, meta_path):
             try:
                 fp.unlink()
@@ -249,6 +265,13 @@ def main() -> int:
     p.add_argument("--replay-factor", type=float, default=8.0,
                    help="cap total samples at this x positions-ingested (prevents overfitting a small buffer "
                         "when self-play is slower than SGD); 0 = unthrottled")
+    p.add_argument("--per-game-keep", type=float, default=1.0,
+                   help="per-game downsampling (lc0-style SKIP): keep each position of a game with this "
+                        "probability before it enters the live replay window — consecutive plies are "
+                        "near-duplicates, so this decorrelates the buffer. 1.0 = keep all (default); the "
+                        "durable archive is unaffected. E.g. 0.25 keeps ~1/4, widening the window's "
+                        "game-diversity ~4x (positions_ingested grows ~4x slower, so the replay-factor "
+                        "throttle permits proportionally fewer steps; raise --replay-factor to offset).")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--grad-clip", type=float, default=1.0)
@@ -325,27 +348,45 @@ def main() -> int:
     ckpt_n = 0
     win_p = win_v = win_m = 0.0
     win_steps = 0
+    sp_window: dict[str, int] = {}      # self-play games per machine since the last [selfplay] rollup
+    last_sp_log = time.time()
     log.info("[train] continuous trainer up: device=%s buffer_cap=%d min=%d batch=%d "
-             "replay_factor=%.1f publish=%.0fs ckpt=%.0fs",
+             "replay_factor=%.1f per_game_keep=%.2f publish=%.0fs ckpt=%.0fs",
              device, args.buffer_cap, args.min_buffer, args.batch_size,
-             args.replay_factor, args.publish_seconds, args.ckpt_seconds)
+             args.replay_factor, args.per_game_keep, args.publish_seconds, args.ckpt_seconds)
 
     while not stop_path.exists():
-        new_ex, metas = _drain(buffer_dir, archive)
+        new_ex, metas = _drain(buffer_dir, archive, args.per_game_keep, rng)
         if metas:
             buf.extend(new_ex)
             games_seen += len(metas)
             positions_ingested += len(new_ex)
             for m in metas:  # log EVERY ingested game (local + leena) — single unified per-game logger
                 gn = _next_game_num()
-                log.info("[selfplay] game #%d [%s]: %s in %s plies (seed %s)",
-                         gn, m.get("machine", "?"), m.get("outcome", "?"),
-                         m.get("plies", "?"), _seed_tag(m.get("seed_fen") or ""))
+                mach = m.get("machine", "?")
+                wid = m.get("worker_id")
+                src = f"{mach}/w{wid:02d}" if isinstance(wid, int) else mach
+                log.info("[selfplay] game #%d done <%s>: %s in %s plies (seed %s) [kept %s]",
+                         gn, src, m.get("outcome", "?"), m.get("plies", "?"),
+                         _seed_tag(m.get("seed_fen") or ""), m.get("kept", "?"))
+                sp_window[mach] = sp_window.get(mach, 0) + 1
             if len(buf) > args.buffer_cap:
                 del buf[: len(buf) - args.buffer_cap]  # drop oldest in place
             if args.max_games and games_seen >= args.max_games:
                 log.info("[train] reached --max-games %d (games_seen=%d) — stopping run", args.max_games, games_seen)
                 break
+
+        # Per-machine self-play throughput rollup (~60s): one glance shows every box
+        # (local + leena) producing games concurrently — the "harmonious fleet" signal,
+        # alongside the arena's [arena] gate lines in the same /tmp/cc_train.log stream.
+        sp_now = time.time()
+        if sp_window and sp_now - last_sp_log >= 60.0:
+            backlog = sum(1 for _ in buffer_dir.glob("*.pkl"))
+            split = " ".join(f"{k}:{v}" for k, v in sorted(sp_window.items()))
+            log.info("[selfplay] +%d games/%ds across workers | %s | buffer backlog=%d",
+                     sum(sp_window.values()), int(sp_now - last_sp_log), split, backlog)
+            sp_window = {}
+            last_sp_log = sp_now
 
         if len(buf) < args.min_buffer:
             time.sleep(1.0)
