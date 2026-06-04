@@ -34,17 +34,13 @@ Each tick (`--poll-seconds`):
   3. Upload finished games: each `*.pkl` older than --min-age with its `.meta`
      present is POSTed (meta first, then pkl, so the server-side trainer sees a
      complete pair), then deleted locally — each game uploaded exactly once.
-  4. If a keep-best gate is open, contribute up to --match-games-per-tick gate
-     games (GET /next_game, play, POST /match_result) via `fleet_match`. This is
-     the only heavy step (torch + move-gen ext), imported lazily and only while a
-     match is open; a box without those deps logs once and stays self-play-only.
-  5. (--spawn-workers) Supervise the self-play worker subprocess: spawn it once
+  4. (--spawn-workers) Supervise the self-play worker subprocess: spawn it once
      weights.pt has landed, restart it on unexpected exit, and heartbeat its state
      (X-Client-Workers: up/down/off) on steps 1/2b so /status can flag a zombie box.
 
-The sync path is stdlib only (urllib) — no requests/aiohttp dep, so it runs on a
-bare volunteer venv; only the optional step 4 pulls in the engine. Step 5 shells
-out to the worker (never imports it), so the client itself stays stdlib-only.
+The client is stdlib only (urllib) — no requests/aiohttp dep, so it runs on a
+bare volunteer venv. Step 4 shells out to the worker (never imports it), so the
+client never pulls in torch / the move-gen ext.
 
 Run (on a self-play box):
 
@@ -87,6 +83,21 @@ def _git_version() -> str:
         return out.stdout.strip() or "unknown"
     except Exception:  # noqa: BLE001 — version is diagnostics-only; never block the client on it
         return "unknown"
+
+
+def _head_contains(sha: str) -> bool:
+    """True if the running tree already CONTAINS `sha` (it's an ancestor of HEAD) — i.e.
+    this box is AT or AHEAD of that commit. Used to suppress a self-update that would
+    DOWNGRADE the box: a freshly-deployed client (new sha) polling a server still on an
+    older boot sha sees the drift BACKWARDS and must ignore it (a downgrade would also
+    needlessly thrash the owned workers). Conservative — any git error returns False, so a
+    genuinely-behind box still updates forward."""
+    try:
+        r = subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"],
+                           capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001 — best-effort; fall through to the normal update path
+        return False
 
 
 def _split_worker_argv(argv: list) -> tuple:
@@ -240,7 +251,7 @@ def _upload_games(server: str, buffer: Path, min_age: float, timeout: float) -> 
                 _post(f"{server}/game/{meta.name}", meta.read_bytes(), timeout)
             _post(f"{server}/game/{pkl.name}", pkl.read_bytes(), timeout)
         except (urllib.error.URLError, OSError) as e:
-            log.debug("upload %s failed (retry next tick): %s", pkl.name, e)
+            log.warning("upload %s failed (retry next tick): %r", pkl.name, e)
             break  # server down — stop this tick, keep games for retry
         for fp in (meta, pkl):
             try:
@@ -265,9 +276,6 @@ def main() -> int:
     p.add_argument("--min-age", type=float, default=2.0,
                    help="Only upload pkls older than this (s) so their .meta has flushed.")
     p.add_argument("--timeout", type=float, default=30.0, help="per-request HTTP timeout (s)")
-    p.add_argument("--match-games-per-tick", type=int, default=1,
-                   help="keep-best gate games to contribute per tick while a match is open "
-                        "(0 = self-play only; needs torch + the move-gen ext, degrades gracefully)")
     p.add_argument("--client-id", default="",
                    help="fleet liveness id sent as X-Client-Id (default: this box's hostname)")
     p.add_argument("--spawn-workers", action="store_true",
@@ -301,12 +309,10 @@ def main() -> int:
     last_version = ""
     last_selfplay = b""
     total_up = 0
-    runner = None
     worker_proc = None
     worker_log = None
     update_cmd = args.update_cmd
     update_backoff: dict = {}  # sha -> last attempt time, so a self-update isn't retried every tick
-    match_disabled = args.match_games_per_tick <= 0
     while True:
         try:
             now = time.time()
@@ -322,8 +328,9 @@ def main() -> int:
             # 1. control (also the per-tick liveness heartbeat via the X-Client-Id header)
             try:
                 control = _get(f"{server}/control", args.timeout, hb_tick).decode().strip()
-            except (urllib.error.URLError, OSError):
+            except (urllib.error.URLError, OSError) as e:
                 control = "RUN"  # server unreachable — keep self-playing on current weights
+                log.warning("control GET failed (heartbeat dropped this tick): %r", e)
             if control == "STOP":
                 log.info("server signaled STOP -> stopping local workers + exiting")
                 try:
@@ -342,9 +349,11 @@ def main() -> int:
             #     here just after the server starts advertising it.
             try:
                 want = _get(f"{server}/client-version", args.timeout, hb_tick).decode().strip()
-            except (urllib.error.URLError, OSError):
+            except (urllib.error.URLError, OSError) as e:
                 want = ""
+                log.warning("client-version GET failed: %r", e)
             if (want and want not in ("unknown", client_version)
+                    and not _head_contains(want)  # never DOWNGRADE: server briefly behind a fresh client
                     and now - update_backoff.get(want, 0.0) > UPDATE_RETRY_S):
                 update_backoff[want] = now
                 if not update_cmd:
@@ -361,31 +370,7 @@ def main() -> int:
             if n:
                 total_up += n
                 log.info("uploaded %d game(s) <%s> (total %d)", n, client_id, total_up)
-            # 4. contribute gate games while a keep-best match is open (lc0-style).
-            if not match_disabled:
-                if runner is None:
-                    try:
-                        from chessckers_engine.fleet_match import MatchRunner
-                        runner = MatchRunner(run_dir)
-                    except Exception as e:  # noqa: BLE001 — torch/native ext absent: self-play only
-                        log.info("gate-game contribution unavailable (%s) — self-play only", e)
-                        match_disabled = True
-                if runner is not None:
-                    played = 0
-                    for _ in range(args.match_games_per_tick):
-                        try:
-                            if runner.step(server, args.timeout) == 0:
-                                break  # no match open right now
-                        except (urllib.error.URLError, OSError) as e:
-                            log.debug("match step failed (retry next tick): %s", e)
-                            break
-                        except Exception as e:  # noqa: BLE001 — one bad game shouldn't kill the loop
-                            log.warning("match step error (retry next tick): %s", e)
-                            break
-                        played += 1
-                    if played:
-                        log.info("contributed %d gate game(s)", played)
-            # 5. own the worker subprocess (lc0 client-owns-engine). Spawn once weights
+            # 4. own the worker subprocess (lc0 client-owns-engine). Spawn once weights
             #    have landed; restart on unexpected exit (self-heal). STOP is handled
             #    above, so reaching here always means a (re)start is wanted.
             if args.spawn_workers:
