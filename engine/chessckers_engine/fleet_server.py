@@ -39,10 +39,15 @@ Endpoints:
 Keep-best gate distribution (lc0-style; active only while the arena has a gate open,
 i.e. `match.json` is present in the run-dir):
   GET  /next_game        -> {"mode":"selfplay"} normally, else a match assignment
-                            {"mode":"match", match_id, seed, cand_white, arch, params}.
-                            Units (seed x side) are handed out round-robin; the arena
+                            {"mode":"match", match_id, opp, seed, cand_white, arch, params}.
+                            Units (opponent x seed x side) are handed out round-robin over the
+                            whole gate panel (candidate vs the last N champions); the arena
                             tolerates duplicates and plays whatever the fleet didn't.
-  GET  /net/best,/net/cand -> octet-stream of best.pt / cand.pt (the two gate nets).
+  GET  /net/cand         -> octet-stream of the candidate net (cand.pt).
+  GET  /net/opp/<id>     -> octet-stream of one gate opponent net (match_nets/<id>.pt; <id> is
+                            'best' or 'net-<ts>'). The candidate is played against each, so the
+                            older-champion ladder games offload just like the vs-best games.
+                            (/net/best kept as a best.pt alias for older clients.)
   POST /match_result     -> ingest one client-played gate outcome (JSON) into
                             match_results/ for the arena to tally. Outcomes whose
                             match_id != the open gate's are acked and dropped (stale).
@@ -73,6 +78,9 @@ log = logging.getLogger("chessckers_engine.fleet_server")
 # sidecar) by ReplayBuffer.append_game / the worker. worker_id may exceed 3 digits
 # (volunteer bases), so allow 3+. Anchored — rejects any path traversal.
 _NAME_RE = re.compile(r"^\d{3,}_\d{10}\.pkl(\.meta)?$")
+# Gate opponent ids served at /net/opp/<id> — 'best' or an archived champion 'net-<ts>'.
+# Anchored so the id can never escape the match_nets/ dir (no path traversal).
+_OPPID_RE = re.compile(r"^(best|net-\d+)$")
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024  # a single game pkl is tens of KB; 64 MB is paranoia
 CLIENT_ACTIVE_WINDOW = 120  # s — a client last-seen within this counts as "active" in /status
 
@@ -239,19 +247,31 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/next_game":
             m = _read_match(rd)
             seeds = (m or {}).get("seeds") or []
+            opps = (m or {}).get("opponents") or ["best"]
             if not m or not seeds:
                 self._send(200, b'{"mode": "selfplay"}', "application/json")
                 return
-            units = [(s, cw) for s in seeds for cw in (True, False)]
-            seed, cand_white = units[next(self.server.match_cursor) % len(units)]  # type: ignore[attr-defined]
+            units = [(o, s, cw) for o in opps for s in seeds for cw in (True, False)]
+            opp, seed, cand_white = units[next(self.server.match_cursor) % len(units)]  # type: ignore[attr-defined]
             self._send(200, json.dumps({
-                "mode": "match", "match_id": m["match_id"], "seed": seed,
+                "mode": "match", "match_id": m["match_id"], "opp": opp, "seed": seed,
                 "cand_white": cand_white, "arch": m["arch"], "params": m["params"],
             }).encode(), "application/json")
         elif self.path in ("/net/best", "/net/cand"):
             fname = "best.pt" if self.path.endswith("best") else "cand.pt"
             try:
                 data = (rd / fname).read_bytes()
+            except OSError:
+                self._send(404, b"no net")
+                return
+            self._send(200, data, "application/octet-stream")
+        elif self.path.startswith("/net/opp/"):
+            oppid = self.path[len("/net/opp/"):]
+            if not _OPPID_RE.match(oppid):
+                self._send(400, b"bad opp")
+                return
+            try:
+                data = (rd / "match_nets" / f"{oppid}.pt").read_bytes()
             except OSError:
                 self._send(404, b"no net")
                 return
@@ -329,7 +349,8 @@ class _Handler(BaseHTTPRequestHandler):
         n = next(self.server.result_counter)  # type: ignore[attr-defined]
         target = mrd / f"{m['match_id']}_{n}.json"
         body = json.dumps({"seed": r.get("seed"), "cand_white": bool(r.get("cand_white")),
-                           "outcome": r["outcome"], "match_id": m["match_id"]}).encode()
+                           "opp": str(r.get("opp") or "best")[:64], "outcome": r["outcome"],
+                           "match_id": m["match_id"]}).encode()
         tmp = target.with_name(target.name + ".part")
         try:
             with open(tmp, "wb") as f:
