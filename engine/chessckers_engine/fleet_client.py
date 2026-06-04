@@ -34,12 +34,9 @@ Each tick (`--poll-seconds`):
   3. Upload finished games: each `*.pkl` older than --min-age with its `.meta`
      present is POSTed (meta first, then pkl, so the server-side trainer sees a
      complete pair), then deleted locally — each game uploaded exactly once.
-  4. If a keep-best gate is open, DRAIN it: contribute gate games (GET /next_game,
-     play, POST /match_result) via `fleet_match` until the per-tick budget
-     (--match-burst-seconds) elapses or the gate closes — the box helps carry the
-     whole gate instead of trickling one game per poll, WITHOUT pausing self-play
-     (the workers are a separate process; this is a side task on the poll thread).
-     The only heavy step (torch + move-gen ext), imported lazily and only while a
+  4. If a keep-best gate is open, contribute up to --match-games-per-tick gate
+     games (GET /next_game, play, POST /match_result) via `fleet_match`. This is
+     the only heavy step (torch + move-gen ext), imported lazily and only while a
      match is open; a box without those deps logs once and stays self-play-only.
   5. (--spawn-workers) Supervise the self-play worker subprocess: spawn it once
      weights.pt has landed, restart it on unexpected exit, and heartbeat its state
@@ -268,16 +265,9 @@ def main() -> int:
     p.add_argument("--min-age", type=float, default=2.0,
                    help="Only upload pkls older than this (s) so their .meta has flushed.")
     p.add_argument("--timeout", type=float, default=30.0, help="per-request HTTP timeout (s)")
-    p.add_argument("--match-burst-seconds", type=float, default=10.0,
-                   help="per-tick wall-clock budget for contributing keep-best gate games while a "
-                        "gate is open: the client DRAINS the open gate (lc0 lets a worker dedicate "
-                        "itself to a match) WITHOUT pausing self-play — the self-play workers are a "
-                        "separate process, this runs on the poll thread. 0 disables gate contribution. "
-                        "Keep < --poll-seconds so heartbeats/uploads stay on cadence. (needs torch + "
-                        "the move-gen ext; degrades to self-play-only if absent)")
-    p.add_argument("--match-games-per-tick", type=int, default=0,
-                   help="optional hard cap on gate games contributed per tick (0 = no cap; bounded "
-                        "only by --match-burst-seconds). A ceiling for when individual games are fast.")
+    p.add_argument("--match-games-per-tick", type=int, default=1,
+                   help="keep-best gate games to contribute per tick while a match is open "
+                        "(0 = self-play only; needs torch + the move-gen ext, degrades gracefully)")
     p.add_argument("--client-id", default="",
                    help="fleet liveness id sent as X-Client-Id (default: this box's hostname)")
     p.add_argument("--spawn-workers", action="store_true",
@@ -316,7 +306,7 @@ def main() -> int:
     worker_log = None
     update_cmd = args.update_cmd
     update_backoff: dict = {}  # sha -> last attempt time, so a self-update isn't retried every tick
-    match_disabled = args.match_burst_seconds <= 0
+    match_disabled = args.match_games_per_tick <= 0
     while True:
         try:
             now = time.time()
@@ -371,10 +361,7 @@ def main() -> int:
             if n:
                 total_up += n
                 log.info("uploaded %d game(s) (total %d)", n, total_up)
-            # 4. DRAIN an open keep-best gate (lc0-style): keep contributing gate games
-            #    until the per-tick budget elapses or the gate closes, so the box helps
-            #    carry the whole gate instead of trickling one game per poll. Self-play is
-            #    a SEPARATE process and is never paused for this — it's a side task here.
+            # 4. contribute gate games while a keep-best match is open (lc0-style).
             if not match_disabled:
                 if runner is None:
                     try:
@@ -384,12 +371,11 @@ def main() -> int:
                         log.info("gate-game contribution unavailable (%s) — self-play only", e)
                         match_disabled = True
                 if runner is not None:
-                    played, t0 = 0, time.time()
-                    cap = args.match_games_per_tick
-                    while time.time() - t0 < args.match_burst_seconds and (cap <= 0 or played < cap):
+                    played = 0
+                    for _ in range(args.match_games_per_tick):
                         try:
                             if runner.step(server, args.timeout) == 0:
-                                break  # no match open right now -> back to the normal loop
+                                break  # no match open right now
                         except (urllib.error.URLError, OSError) as e:
                             log.debug("match step failed (retry next tick): %s", e)
                             break
@@ -398,7 +384,7 @@ def main() -> int:
                             break
                         played += 1
                     if played:
-                        log.info("contributed %d gate game(s) in %.0fs", played, time.time() - t0)
+                        log.info("contributed %d gate game(s)", played)
             # 5. own the worker subprocess (lc0 client-owns-engine). Spawn once weights
             #    have landed; restart on unexpected exit (self-heal). STOP is handled
             #    above, so reaching here always means a (re)start is wanted.
