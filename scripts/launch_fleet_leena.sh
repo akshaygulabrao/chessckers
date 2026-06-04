@@ -68,6 +68,7 @@ UPDATE_CMD="cd '$REPO_ROOT' && git pull --ff-only && cd '$ENG' && PATH='$ENG/.ve
 # before the server's selfplay.json is mirrored in; run-local/selfplay.json then governs.
 nohup "$PY" -m chessckers_engine.fleet_client \
   --server "$SERVER" --run-dir "$RUN" --client-id leena --poll-seconds $FLEET_POLL_S \
+  --bind-interface en0 \
   --update-cmd "$UPDATE_CMD" \
   --spawn-workers -- \
   --workers $FLEET_WORKERS --worker-id-base 300 --seed 4000 \

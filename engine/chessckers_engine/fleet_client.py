@@ -55,9 +55,11 @@ client injects --run-dir/--weights, so the launcher only passes box-specific con
 from __future__ import annotations
 
 import argparse
+import http.client
 import logging
 import os
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -70,6 +72,39 @@ from chessckers_engine.runtime import setup_logging
 log = logging.getLogger("chessckers_engine.fleet_client")
 
 UPDATE_RETRY_S = 300.0  # re-attempt a failed/too-early self-update to a given sha no more often than this
+
+_IP_BOUND_IF = 25  # macOS <netinet/in.h>: pins a socket to an interface, overriding VPN/tunnel scoping
+_opener: urllib.request.OpenerDirector | None = None  # set by --bind-interface; None = default routing
+
+
+def _build_bound_opener(ifname: str) -> urllib.request.OpenerDirector:
+    """An opener whose HTTP connections are pinned to `ifname` via macOS IP_BOUND_IF. On a box
+    where a VPN / Private Relay scopes the process's outbound TCP onto a `utun` (which can't reach
+    the LAN server -> 'No route to host' / 'Network is unreachable'), this forces the socket onto
+    the real LAN interface so the server stays reachable. macOS-only; opt-in per box."""
+    idx = socket.if_nametoindex(ifname)
+
+    class _BoundConn(http.client.HTTPConnection):
+        def connect(self):  # type: ignore[override]
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.IPPROTO_IP, _IP_BOUND_IF, struct.pack("I", idx))
+            if self.timeout is not None and self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                s.settimeout(self.timeout)
+            s.connect((self.host, self.port))
+            self.sock = s
+
+    class _BoundHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_BoundConn, req)
+
+    return urllib.request.build_opener(_BoundHandler)
+
+
+def _urlopen(req: urllib.request.Request, timeout: float):
+    """urlopen via the interface-bound opener when --bind-interface is set, else the stdlib default."""
+    if _opener is not None:
+        return _opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 def _git_version() -> str:
@@ -166,14 +201,14 @@ def _self_update(want: str, current: str, update_cmd: str, run_dir: Path,
 
 def _get(url: str, timeout: float, headers: dict | None = None) -> bytes:
     req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _urlopen(req, timeout) as r:
         return r.read()
 
 
 def _post(url: str, data: bytes, timeout: float) -> None:
     req = urllib.request.Request(url, data=data, method="POST",
                                  headers={"Content-Type": "application/octet-stream"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _urlopen(req, timeout) as r:
         r.read()
 
 
@@ -278,6 +313,10 @@ def main() -> int:
     p.add_argument("--timeout", type=float, default=30.0, help="per-request HTTP timeout (s)")
     p.add_argument("--client-id", default="",
                    help="fleet liveness id sent as X-Client-Id (default: this box's hostname)")
+    p.add_argument("--bind-interface", default="",
+                   help="pin outbound HTTP to this interface via macOS IP_BOUND_IF (e.g. en0) — "
+                        "use where a VPN scopes sockets onto a tunnel and the LAN server becomes "
+                        "unreachable; empty = default routing.")
     p.add_argument("--spawn-workers", action="store_true",
                    help="Own the self-play worker subprocess (lc0-style): launch "
                         "selfplay_workers_only, restart it if it dies, report liveness. "
@@ -290,6 +329,13 @@ def main() -> int:
     args = p.parse_args(argv)
 
     server = args.server.rstrip("/")
+    if args.bind_interface:
+        global _opener
+        try:
+            _opener = _build_bound_opener(args.bind_interface)
+            log.info("pinned outbound HTTP to interface %s (IP_BOUND_IF)", args.bind_interface)
+        except OSError as e:
+            log.warning("could not bind to %s (%s) — using default routing", args.bind_interface, e)
     client_id = args.client_id or socket.gethostname()
     client_version = _git_version()
     # per-tick heartbeat headers: id + code version (server tracks last-seen + version)
