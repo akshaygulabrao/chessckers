@@ -28,6 +28,76 @@ export CHESSCKERS_START_FEN="$(fleet_seed_fens "$SEED_MIX")"
 mkdir -p "$RUN/buffer"
 rm -f "$RUN/STOP" 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# Visibility (observe-only — never blocks the launch). Before the long-lived client
+# loop starts we (a) snapshot leena's network/power state and (b) run a one-shot
+# connectivity preflight to the server — exactly the GET /control the client makes,
+# both unpinned and pinned to en0. A broken box then gives feedback in SECONDS
+# instead of "launch, tail the log, and guess". Everything is timestamped and tee'd
+# to $DIAG so successive launches can be diff'd when the connection flaps.
+# ---------------------------------------------------------------------------
+DIAG="$RUN/launch_diag.log"
+SERVER_HOST="$(printf '%s' "$SERVER" | sed -E 's#^https?://##; s#[:/].*$##')"
+diag(){ printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$DIAG"; }
+
+diag "================ launch_fleet_leena $(date '+%F %T') ================"
+diag "host=$(hostname)  up=$(uptime | sed -E 's/^.*up //; s/, *[0-9]* users?.*$//')"
+diag "git=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')  server=$SERVER (host $SERVER_HOST)"
+diag "en0 ipv4=$(ipconfig getifaddr en0 2>/dev/null || echo NONE)"
+diag "route->server: $(route -n get "$SERVER_HOST" 2>/dev/null | awk '/interface:/{i=$2}/gateway:/{g=$2}END{print "dev="(i?i:"?")" gw="(g?g:"-")}')"
+# VPN / tunnel interfaces present — the documented socket-scoping failure mode where a
+# utun captures outbound flows and the LAN server becomes unreachable.
+diag "tunnels up: $(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep -E '^(utun|ipsec|ppp)' | paste -sd, - | sed 's/^$/none/')"
+command -v scutil >/dev/null 2>&1 && diag "vpn(nc) connected: $(scutil --nc list 2>/dev/null | grep -c '^\* .*Connected')"
+# Power — idle-sleep is the #1 way this box goes unreachable; confirm it's on AC and that
+# the standalone caffeinate (started below) is actually fighting the configured sleep timers.
+diag "power: $(pmset -g batt 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]*//')"
+diag "sleep cfg: $(pmset -g 2>/dev/null | grep -E '^[[:space:]]*(sleep|displaysleep|disksleep)[[:space:]]' | tr -s ' \n' '  ' | sed 's/^ //')"
+
+diag "--- connectivity preflight (GET /control — exactly what the client does) ---"
+if "$PY" - "$SERVER" en0 <<'PY' 2>&1 | tee -a "$DIAG"
+import socket, struct, sys, time
+from urllib.parse import urlparse
+IP_BOUND_IF = 25  # macOS: pin a socket to a named interface (the --bind-interface mechanism)
+server, ifname = sys.argv[1], sys.argv[2]
+u = urlparse(server); host = socket.gethostbyname(u.hostname); port = u.port or 80
+def probe(pin):
+    s = socket.socket(); s.settimeout(4.0)
+    try:
+        if pin:
+            s.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, struct.pack("I", socket.if_nametoindex(pin)))
+        t0 = time.time()
+        s.connect((host, port))
+        src = s.getsockname()
+        s.sendall(f"GET /control HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                  f"X-Client-Id: leena-preflight\r\nConnection: close\r\n\r\n".encode())
+        buf = b""
+        while len(buf) < 4096:
+            c = s.recv(4096)
+            if not c: break
+            buf += c
+        dt = (time.time() - t0) * 1000
+        line = buf.split(b"\r\n", 1)[0].decode(errors="replace") if buf else "(no data)"
+        body = buf.split(b"\r\n\r\n", 1)[1][:16] if b"\r\n\r\n" in buf else b""
+        return True, f"OK  {line}  body={body!r}  src={src[0]}:{src[1]}  {dt:.0f}ms"
+    except OSError as e:
+        return False, f"FAIL errno={e.errno} {e.strerror}"
+    finally:
+        s.close()
+uok, ud = probe(None)
+pok, pd = probe(ifname)
+print(f"   UNPINNED (default route): {ud}")
+print(f"   PINNED   ({ifname} IP_BOUND_IF): {pd}")
+sys.exit(0 if pok else 1)
+PY
+then
+  diag "PREFLIGHT OK: en0-pinned GET /control reached $SERVER"
+else
+  diag "PREFLIGHT FAIL: en0-pinned GET /control did NOT reach $SERVER — launching anyway"
+  diag "  (client self-heals when the LAN returns; for a per-interface sweep run:"
+  diag "   REPEAT=8 $PY scripts/leena_net_probe.py $SERVER)"
+fi
+
 # Keep the Air awake with a STANDALONE detached caffeinate (survives ssh teardown; a
 # wrapping one does not). Needs leena on AC power.
 pkill -x caffeinate 2>/dev/null || true

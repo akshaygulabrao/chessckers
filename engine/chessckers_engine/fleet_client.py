@@ -66,12 +66,14 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 from chessckers_engine.runtime import setup_logging
 
 log = logging.getLogger("chessckers_engine.fleet_client")
 
 UPDATE_RETRY_S = 300.0  # re-attempt a failed/too-early self-update to a given sha no more often than this
+HEARTBEAT_S = 600.0     # while healthy, log a "still alive" health line no more often than this (transitions log immediately)
 
 _IP_BOUND_IF = 25  # macOS <netinet/in.h>: pins a socket to an interface, overriding VPN/tunnel scoping
 _opener: urllib.request.OpenerDirector | None = None  # set by --bind-interface; None = default routing
@@ -133,6 +135,44 @@ def _head_contains(sha: str) -> bool:
         return r.returncode == 0
     except Exception:  # noqa: BLE001 — best-effort; fall through to the normal update path
         return False
+
+
+def _net_diag(server: str, bind_iface: str) -> str:
+    """Best-effort one-line snapshot of THIS box's egress state, captured at the moment a
+    request to `server` FAILS — the single most useful signal for the intermittent
+    LAN-unreachable / VPN-socket-scoping class we're chasing. Reports the default route the
+    kernel would now pick to the server host, whether the pinned interface still owns an
+    IPv4, and any tunnels up. macOS tools (route/ifconfig); never raises — returns '' when it
+    can't be gathered (non-mac / tool missing) so it can be dropped straight into a log line."""
+    try:
+        host = urlparse(server).hostname or server
+    except Exception:  # noqa: BLE001 — diagnostics only; never let this perturb the tick
+        host = server
+    parts = []
+    try:
+        out = subprocess.run(["route", "-n", "get", host],
+                             capture_output=True, text=True, timeout=3).stdout
+        dev = next((l.split(":", 1)[1].strip() for l in out.splitlines()
+                    if l.strip().startswith("interface:")), "?")
+        parts.append(f"route->{host}=dev:{dev}")
+    except Exception:  # noqa: BLE001
+        pass
+    if bind_iface:
+        try:
+            out = subprocess.run(["ifconfig", bind_iface],
+                                 capture_output=True, text=True, timeout=3).stdout
+            ip = next((l.split()[1] for l in out.splitlines()
+                       if l.strip().startswith("inet ") and "inet6" not in l), None)
+            parts.append(f"{bind_iface}={ip or 'NO-IP'}")
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        out = subprocess.run(["ifconfig", "-l"], capture_output=True, text=True, timeout=3).stdout
+        tuns = [n for n in out.split() if n.startswith(("utun", "ipsec", "ppp"))]
+        parts.append("tun:" + (",".join(tuns) if tuns else "none"))
+    except Exception:  # noqa: BLE001
+        pass
+    return " ".join(parts)
 
 
 def _split_worker_argv(argv: list) -> tuple:
@@ -218,14 +258,14 @@ def _pull_weights_if_new(server: str, weights: Path, last_version: str, timeout:
     try:
         version = _get(f"{server}/version", timeout).decode().strip()
     except (urllib.error.URLError, OSError) as e:
-        log.debug("version poll failed (server down/restarting?): %s", e)
+        log.warning("version poll failed (server down/restarting?): %r", e)
         return last_version
     if version == last_version or version == "none":
         return version
     try:
         data = _get(f"{server}/weights", timeout)
     except (urllib.error.URLError, OSError) as e:
-        log.debug("weights fetch failed: %s", e)
+        log.warning("weights fetch failed: %r", e)
         return last_version  # retry next tick
     tmp = weights.with_suffix(".pt.tmp")
     try:
@@ -248,7 +288,7 @@ def _pull_selfplay_if_new(server: str, params_path: Path, last: bytes, timeout: 
     try:
         data = _get(f"{server}/selfplay", timeout, headers)
     except (urllib.error.URLError, OSError) as e:
-        log.debug("selfplay poll failed (server down/restarting?): %s", e)
+        log.warning("selfplay poll failed (server down/restarting?): %r", e)
         return last
     if data == last:
         return last
@@ -359,6 +399,11 @@ def main() -> int:
     worker_log = None
     update_cmd = args.update_cmd
     update_backoff: dict = {}  # sha -> last attempt time, so a self-update isn't retried every tick
+    # Reachability timeline (the intermittent-failure signal): count consecutive control
+    # failures so a flap logs its onset, duration on recovery, and a periodic "still alive".
+    consecutive_fail = 0
+    first_fail_t = 0.0
+    last_heartbeat_t = 0.0
     while True:
         try:
             now = time.time()
@@ -370,13 +415,33 @@ def main() -> int:
                       else "up" if worker_proc is not None else "off")
                 hb_tick = {**hb, "X-Client-Workers": ws}
             else:
+                ws = "n/a"
                 hb_tick = hb
             # 1. control (also the per-tick liveness heartbeat via the X-Client-Id header)
             try:
                 control = _get(f"{server}/control", args.timeout, hb_tick).decode().strip()
+                control_ok = True
             except (urllib.error.URLError, OSError) as e:
                 control = "RUN"  # server unreachable — keep self-playing on current weights
-                log.warning("control GET failed (heartbeat dropped this tick): %r", e)
+                control_ok = False
+                consecutive_fail += 1
+                if consecutive_fail == 1:
+                    first_fail_t = now
+                # Snapshot egress state AT THE MOMENT OF FAILURE — which interface the kernel
+                # would route on now, whether en0 still owns its IP, what tunnels are up.
+                log.warning("control GET failed (heartbeat dropped; %d in a row): %r | %s",
+                            consecutive_fail, e, _net_diag(server, args.bind_interface))
+            # Reachability transitions: log recovery (with how long we were down) the first
+            # healthy tick after a flap; otherwise emit a periodic "still alive" health line.
+            if control_ok:
+                if consecutive_fail:
+                    log.info("recovered: control reachable after %d failed tick(s) (~%.0fs down)",
+                             consecutive_fail, now - first_fail_t)
+                    consecutive_fail = 0
+                elif now - last_heartbeat_t >= HEARTBEAT_S:
+                    last_heartbeat_t = now
+                    log.info("health: control=%s net=%s workers=%s uploaded=%d",
+                             control, last_version or "none", ws, total_up)
             if control == "STOP":
                 log.info("server signaled STOP -> stopping local workers + exiting")
                 try:
