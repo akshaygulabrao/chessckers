@@ -322,9 +322,10 @@ def main() -> int:
     p.add_argument("--pairs", type=int, default=4, help="color-swapped pairs per seed per opponent (2x games/seed)")
     p.add_argument("--threshold", type=float, default=0.55, help="win-rate vs current best to promote (lc0 gate)")
     p.add_argument("--ladder-rungs", default="1,4,16",
-                   help="comma offsets of PAST champions to ALSO play the candidate against in the gate "
-                        "(the regression ladder; empty = lc0 single-best gate). Each is a BLOCKING "
-                        "no-regress rung — see --no-regress.")
+                   help="regression ladder: PAST champions to ALSO play the candidate against in the gate, "
+                        "each a BLOCKING no-regress rung (see --no-regress). 'all' = EVERY previous champion "
+                        "(unbounded — gate cost grows with history and nets/ is never GC'd); a comma list = "
+                        "those offsets back (e.g. 1,4,16); empty = lc0 single-best gate.")
     p.add_argument("--no-regress", type=float, default=0.50,
                    help="min win-rate vs each ladder rung (older champion) to promote — the blocking "
                         "anti-rock-paper-scissors guard the single-best gate is blind to.")
@@ -353,9 +354,14 @@ def main() -> int:
         match_path.unlink()                       # no gate open at startup; drop any stale manifest
 
     arch = {"d_hidden": args.d_hidden, "c_filters": args.c_filters, "n_blocks": args.n_blocks}
-    ladder_offsets = [int(x) for x in args.ladder_rungs.split(",") if x.strip()]
-    # Keep enough champions that every ladder rung still exists after GC.
-    keep_floor = max(args.keep_nets, max(ladder_offsets) + 1) if (args.keep_nets and ladder_offsets) else args.keep_nets
+    ladder_all = args.ladder_rungs.strip().lower() == "all"
+    ladder_offsets = [] if ladder_all else [int(x) for x in args.ladder_rungs.split(",") if x.strip()]
+    # Keep enough champions that every ladder rung still exists after GC. Under `all` the
+    # ladder IS the full history, so never GC (keep_floor=0 -> _gc_nets keeps everything).
+    if ladder_all:
+        keep_floor = 0
+    else:
+        keep_floor = max(args.keep_nets, max(ladder_offsets) + 1) if (args.keep_nets and ladder_offsets) else args.keep_nets
 
     seeds = [ln.strip() for ln in args.seed_mix_file.read_text().splitlines()
              if ln.strip() and not ln.lstrip().startswith("#")]
@@ -365,7 +371,8 @@ def main() -> int:
     log.info("arena up (dispatch+tally, plays no game): seeds=%d sims=%d pairs=%d threshold=%.2f no_regress=%.2f max_plies=%d",
              len(seeds), args.sims, args.pairs, args.threshold, args.no_regress, args.max_plies)
     log.info("regression ladder offsets=%s (BLOCKING) | keep-nets=%s",
-             ladder_offsets or "off", keep_floor or "all")
+             "all (every previous champion)" if ladder_all else (ladder_offsets or "off"),
+             keep_floor or "all")
 
     # Establish best v0 (the gated champion). Adopt the trainer's current weights as the
     # first champion so self-play has something to pull immediately, before any gate runs.
@@ -403,19 +410,26 @@ def main() -> int:
 
         log.info("new candidate %s — opening gate over %d seed(s)", cand_path.name, len(seeds))
         # Opponent panel: the current best (PRIMARY — the candidate must beat it, lc0's gate) +
-        # the regression-ladder rungs: past champions at --ladder-rungs offsets back (1/4/16),
-        # each a BLOCKING no-regress guard so strength can't cycle backwards (the one chessckers
-        # deviation from lc0's single-best gate). The arena plays NONE of it — it serves the
+        # the regression-ladder rungs: past champions selected by --ladder-rungs (offsets back like
+        # 1/4/16, or 'all' = every previous champion), each a BLOCKING no-regress guard so strength
+        # can't cycle backwards (the one chessckers deviation from lc0's single-best gate). The
+        # panel grows by one rung per promotion under 'all'. The arena plays NONE of it — it serves the
         # candidate + every opponent net (clients fetch both by sha via /get_network) and the
         # FLEET plays every game, so the panel is just (id, file) to serve; no net is loaded here.
         champ_paths = sorted(nets_dir.glob("net-*.pt"), key=_net_ts, reverse=True)  # newest first; [0]==best
-        rungs = [(champ_paths[k].stem, champ_paths[k]) for k in ladder_offsets if 0 < k < len(champ_paths)]
+        if ladder_all:
+            rungs = [(p.stem, p) for p in champ_paths[1:]]   # EVERY previous champion (unbounded ladder)
+        else:
+            rungs = [(champ_paths[k].stem, champ_paths[k]) for k in ladder_offsets if 0 < k < len(champ_paths)]
         panel = [("best", best_path)] + rungs
         panel_oppids = [oppid for oppid, _src in panel]
         per_opp = len(seeds) * args.pairs * 2
         need = len(panel) * per_opp
+        rung_names = ", ".join(n for n, _ in rungs[:6])
+        if len(rungs) > 6:
+            rung_names += f", ... (+{len(rungs) - 6} more)"
         log.info("GATE START %s | primary=best + %d ladder rung(s) [%s] | %d opponents x %d games = %d total (the fleet plays them; the arena tallies)",
-                 cand_path.name, len(rungs), ", ".join(n for n, _ in rungs) or "none yet",
+                 cand_path.name, len(rungs), rung_names or "none yet",
                  len(panel), per_opp, need)
 
         # Open ONE gate covering the whole panel: clear stale results, serve the candidate and

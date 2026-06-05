@@ -79,7 +79,7 @@ pids+=($!); say "trainer  pid $!  -> $TLOG  (per-game-keep=$PER_GAME_KEEP)"
   --run-dir "$RUN" --seed-mix-file "$SEED_MIX" \
   --d-hidden $FLEET_DH --c-filters $FLEET_CF --n-blocks $FLEET_NB \
   --sims 160 --pairs 4 --threshold 0.55 \
-  --ladder-rungs 1,4,16 --no-regress 0.50 \
+  --ladder-rungs all --no-regress 0.50 \
   --max-plies $FLEET_MAX_PLIES --gate-seconds 60 \
   >"$ALOG" 2>&1 &
 pids+=($!); say "arena    pid $!  -> $ALOG"
