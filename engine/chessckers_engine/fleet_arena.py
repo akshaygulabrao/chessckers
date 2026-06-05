@@ -154,15 +154,12 @@ def _score_opp(collected: dict, seeds: list[str], pairs: int) -> dict:
     rec = [0, 0, 0]  # candidate's aggregate [W, L, D] vs opponent across all games
     for seed in seeds:
         pts = 0.0
-        wld = [0, 0, 0]  # this seed's [W, L, D] from the candidate's perspective
         for cand_white in (True, False):
             for outcome in collected.get((seed, cand_white), [])[:pairs]:
                 s = _score(outcome, cand_white)
                 pts += s
-                wld[0 if s == 1.0 else 1 if s == 0.0 else 2] += 1
+                rec[0 if s == 1.0 else 1 if s == 0.0 else 2] += 1  # candidate's W/L/D
         per_seed[seed] = pts / (2 * pairs)
-        for i in range(3):
-            rec[i] += wld[i]
     score = sum(per_seed.values()) / len(per_seed) if per_seed else 0.0
     return {
         "per_seed": {s: round(v, 3) for s, v in per_seed.items()},
@@ -411,7 +408,7 @@ def main() -> int:
         # deviation from lc0's single-best gate). The arena plays NONE of it — it serves the
         # candidate + every opponent net (clients fetch both by sha via /get_network) and the
         # FLEET plays every game, so the panel is just (id, file) to serve; no net is loaded here.
-        champ_paths = list(reversed(sorted(nets_dir.glob("net-*.pt"), key=_net_ts)))  # newest first; [0]==best
+        champ_paths = sorted(nets_dir.glob("net-*.pt"), key=_net_ts, reverse=True)  # newest first; [0]==best
         rungs = [(champ_paths[k].stem, champ_paths[k]) for k in ladder_offsets if 0 < k < len(champ_paths)]
         panel = [("best", best_path)] + rungs
         panel_oppids = [oppid for oppid, _src in panel]
@@ -477,7 +474,7 @@ def main() -> int:
         res = opp_results[0][1]                         # vs immediate best — drives elo + the promote bar
         primary_ok = res["score"] >= args.threshold
         regress = [(n, rr["score"]) for n, rr in opp_results[1:] if rr["score"] < args.no_regress]
-        promoted = primary_ok and not regress           # B: a rung regression BLOCKS promotion
+        promoted = primary_ok and not regress           # a rung regression BLOCKS promotion
 
         ladder_rec = [{"net": n, "score": rr["score"], "elo_gap": round(_elo_delta(rr["score"]), 1)}
                       for n, rr in opp_results[1:]]
@@ -539,7 +536,7 @@ def _net_ts(path: Path) -> int:
 
 def _gc_nets(nets_dir: Path, keep: int) -> int:
     """Delete all but the newest `keep` archived champions (`net-*.pt`); returns the
-    count removed. anchor.pt is a different filename and is never matched."""
+    count removed."""
     champs = sorted(nets_dir.glob("net-*.pt"), key=_net_ts)
     removed = 0
     for p in (champs[:-keep] if keep else []):
