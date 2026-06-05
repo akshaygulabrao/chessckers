@@ -94,8 +94,7 @@ then
   diag "PREFLIGHT OK: en0-pinned GET /control reached $SERVER"
 else
   diag "PREFLIGHT FAIL: en0-pinned GET /control did NOT reach $SERVER — launching anyway"
-  diag "  (client self-heals when the LAN returns; for a per-interface sweep run:"
-  diag "   REPEAT=8 $PY scripts/leena_net_probe.py $SERVER)"
+  diag "  (client self-heals when the LAN returns)"
 fi
 
 # Keep the Air awake with a STANDALONE detached caffeinate (survives ssh teardown; a
