@@ -15,7 +15,10 @@ Endpoints:
                             — same per-iteration cadence as the rsync sidecar it
                             replaces, now generalized to every client.
   GET  /weights          -> octet-stream of the freshest weights.pt + X-Version hdr.
-  GET  /control          -> "RUN" or "STOP" (STOP once the trainer touches run/STOP).
+  GET  /control          -> "RUN" or "STOP" (STOP once the trainer touches run/STOP),
+                            + an `X-Network-Sha` header = the current net's content
+                            address, so a client syncs the net on the heartbeat tick it
+                            already makes (content-addressed sync; fetch via /get_network).
   GET  /client-version   -> the trainer host's own git sha (resolved at server start).
                             Self-updating clients (fleet_client --update-cmd) compare it
                             to the sha they booted on and, on drift, pull + rebuild the
@@ -29,9 +32,10 @@ Endpoints:
   GET  /status           -> small JSON: version, weights present, buffer backlog, fleet
                             throughput (games ingested this run, promotions, best_elo,
                             open match_id), and the fleet's live clients with their code
-                            version + worker-subprocess liveness (any box whose request
-                            carried an `X-Client-Id` within the last CLIENT_ACTIVE_WINDOW
-                            seconds; a box heartbeating with workers=down is a zombie).
+                            version, worker-subprocess liveness, and the net sha they
+                            report running (X-Client-Net — so fleet net-consistency is
+                            visible: any box whose request carried an `X-Client-Id` within
+                            the last CLIENT_ACTIVE_WINDOW seconds; workers=down is a zombie).
   POST /game/<filename>  -> ingest one game artifact (`NNN_..pkl` or its `.pkl.meta`)
                             into buffer/ for the trainer to drain. pkl written
                             atomically; filename validated (no path traversal).
@@ -288,12 +292,14 @@ class _Handler(BaseHTTPRequestHandler):
         cid = cid[:64]
         ver = self.headers.get("X-Client-Version")
         wk = self.headers.get("X-Client-Workers")
+        net = self.headers.get("X-Client-Net")  # content sha of the net this box reports running
         with self.server.clients_lock:  # type: ignore[attr-defined]
             prev = self.server.clients.get(cid)  # type: ignore[attr-defined]
             self.server.clients[cid] = (  # type: ignore[attr-defined]
                 time.time(),
                 ver or (prev[1] if prev else None),
                 wk or (prev[2] if prev else None),
+                net or (prev[3] if prev else None),
             )
 
     def log_message(self, fmt: str, *a) -> None:  # silence default stderr access log
@@ -340,7 +346,11 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/version":
             self._send(200, _version(rd).encode())
         elif self.path == "/control":
-            self._send(200, b"STOP" if (rd / "STOP").exists() else b"RUN")
+            # X-Network-Sha rides the heartbeat tick the client already makes: the current
+            # net's content address, so the client fetches it via /get_network without an
+            # extra round-trip (lc0 content-addressed sync). '' before the first net exists.
+            body = b"STOP" if (rd / "STOP").exists() else b"RUN"
+            self._send(200, body, extra={"X-Network-Sha": _file_sha(_net_path(rd)) or ""})
         elif self.path == "/client-version":
             self._send(200, self.server.code_version.encode())  # type: ignore[attr-defined]
         elif self.path == "/selfplay":
@@ -364,8 +374,8 @@ class _Handler(BaseHTTPRequestHandler):
             promotions, best_elo = _gate_stats(rd)
             now = time.time()
             with self.server.clients_lock:  # type: ignore[attr-defined]
-                clients = {cid: {"age": round(now - ts, 1), "version": ver, "workers": wk}
-                           for cid, (ts, ver, wk) in self.server.clients.items()  # type: ignore[attr-defined]
+                clients = {cid: {"age": round(now - ts, 1), "version": ver, "workers": wk, "net": net}
+                           for cid, (ts, ver, wk, net) in self.server.clients.items()  # type: ignore[attr-defined]
                            if now - ts <= CLIENT_ACTIVE_WINDOW}
             with self.server.stats_lock:  # type: ignore[attr-defined]
                 games_ingested = self.server.games_ingested  # type: ignore[attr-defined]
@@ -382,7 +392,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "promotions": promotions,
                 "best_elo": round(best_elo, 1),
                 "clients_active": len(clients),
-                "clients": clients,  # {id: {age: s-since-seen, version: git-sha, workers: up/down/off}}, active window only
+                "clients": clients,  # {id: {age: s-since-seen, version: git-sha, workers: up/down/off, net: sha}}, active window only
             }).encode()
             self._send(200, body, "application/json")
         elif self.path == "/next_game":
@@ -591,7 +601,7 @@ def main() -> int:
     httpd.run_dir = run_dir  # type: ignore[attr-defined]
     httpd.match_cursor = itertools.count()    # round-robins gate units in /next_game
     httpd.result_counter = itertools.count()  # unique filenames for /match_result writes
-    httpd.clients = {}                        # X-Client-Id -> (last-seen epoch, version, workers) (fleet liveness)
+    httpd.clients = {}                        # X-Client-Id -> (last-seen epoch, version, workers, net sha) (fleet liveness)
     httpd.clients_lock = threading.Lock()     # guards clients across handler threads
     httpd.games_ingested = 0                  # cumulative game pkls ingested this process (/status throughput)
     httpd.stats_lock = threading.Lock()       # guards games_ingested across handler threads

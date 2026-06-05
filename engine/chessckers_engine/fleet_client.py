@@ -24,9 +24,12 @@ Each tick (`--poll-seconds`):
      and an os.execv re-exec onto the fresh code (retried with backoff so it self-
      corrects even if the code lands here just after the server advertises it). Without
      --update-cmd the drift is only logged, so a stale box stays visible in /status.
-  2. GET /version — if changed, GET /weights and write run-dir/weights.pt atomically.
-     The local workers hot-reload it on their own mtime poll. Version tracks the
-     trainer's newest checkpoint, so this fires once per trainer ITERATION.
+  2. Net sync (content-addressed, lc0 get_network): /control's response carries an
+     X-Network-Sha header (the current net's sha256); on a change, GET /get_network?sha=
+     and write run-dir/weights.pt atomically (the workers hot-reload on their own mtime
+     poll). The client gets back exactly the bytes it asked for, keyed by hash, not an
+     opaque version. Falls back to the legacy /version+/weights poll against a server
+     that doesn't advertise the sha. Fires once per trainer ITERATION / promotion.
   2b. GET /selfplay — mirror the server's canonical self-play params into
      run-dir/selfplay.json (only on a content change). The workers re-read it each
      game, so the whole fleet self-plays with the SAME, operator-tunable params and
@@ -368,6 +371,15 @@ def _post(url: str, data: bytes, timeout: float) -> None:
         r.read()
 
 
+def _get2(url: str, timeout: float, headers: dict | None = None):
+    """Like _get but also returns the response headers (the case-insensitive
+    http.client.HTTPMessage) — used to read X-Network-Sha off /control so the net's
+    content address rides the heartbeat tick the client already makes."""
+    req = urllib.request.Request(url, headers=headers or {})
+    with _urlopen(req, timeout) as r:
+        return r.read(), r.headers
+
+
 def _pull_weights_if_new(server: str, weights: Path, last_version: str, timeout: float) -> str:
     """Pull weights.pt iff the server's version changed. Returns the (possibly
     unchanged) current version so the caller can track it."""
@@ -392,6 +404,33 @@ def _pull_weights_if_new(server: str, weights: Path, last_version: str, timeout:
         return last_version
     log.info("pulled net %s -> %s (%d KB)", version, weights, len(data) // 1024)
     return version
+
+
+def _pull_net_by_sha(server: str, weights: Path, want_sha: str | None, have_sha: str,
+                     timeout: float) -> str:
+    """Content-addressed net sync (lc0 get_network): fetch the net whose sha256 is
+    `want_sha` only when it differs from what we last wrote, and materialize it at
+    weights.pt (atomic; bumps mtime -> the local workers hot-reload). `want_sha` comes
+    from the X-Network-Sha header on /control, so an unchanged net costs nothing. Unlike
+    the opaque /version, the client gets back EXACTLY the bytes it asked for (or a 404 if
+    the net rotated mid-fetch -> retry next tick). Returns the sha now on disk (unchanged
+    on empty want / no-op / fetch failure)."""
+    if not want_sha or want_sha == have_sha:
+        return have_sha
+    try:
+        data = _get(f"{server}/get_network?sha={want_sha}", timeout)
+    except (urllib.error.URLError, OSError) as e:
+        log.warning("net fetch (sha %s) failed: %r", want_sha[:12], e)
+        return have_sha  # 404 (rotated) or server blip — retry next tick on the new sha
+    tmp = weights.with_suffix(".pt.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, weights)  # atomic; bumps mtime -> local workers hot-reload
+    except OSError as e:
+        log.warning("weights write failed: %s", e)
+        return have_sha
+    log.info("pulled net sha %s -> %s (%d KB)", want_sha[:12], weights, len(data) // 1024)
+    return want_sha
 
 
 def _pull_selfplay_if_new(server: str, params_path: Path, last: bytes, timeout: float,
@@ -509,7 +548,8 @@ def main() -> int:
     if args.spawn_workers:
         log.info("owning workers (lc0-style): selfplay_workers_only %s",
                  " ".join(worker_argv) or "(no extra args)")
-    last_version = ""
+    last_version = ""        # legacy /version fallback tracking (servers without X-Network-Sha)
+    have_sha = ""            # content sha of the net currently materialized at weights.pt
     last_selfplay = b""
     total_up = 0
     worker_proc = None
@@ -534,11 +574,18 @@ def main() -> int:
                 hb_tick = {**hb, "X-Client-Workers": ws}
             else:
                 ws = "n/a"
-                hb_tick = hb
-            # 1. control (also the per-tick liveness heartbeat via the X-Client-Id header)
+                hb_tick = dict(hb)  # fresh copy so the per-tick net header never mutates `hb`
+            if have_sha:  # report the net we're running -> /status fleet net-consistency view
+                hb_tick["X-Client-Net"] = have_sha
+            # 1. control (also the per-tick liveness heartbeat via the X-Client-Id header).
+            #    /control's X-Network-Sha header carries the current net's content address, so
+            #    step 2 syncs the net off this same request (None = control failed / legacy server).
+            want_sha = None
             try:
-                control = _get(f"{server}/control", args.timeout, hb_tick).decode().strip()
+                cbody, chdrs = _get2(f"{server}/control", args.timeout, hb_tick)
+                control = cbody.decode().strip()
                 control_ok = True
+                want_sha = chdrs.get("X-Network-Sha")
             except (urllib.error.URLError, OSError) as e:
                 control = "RUN"  # server unreachable — keep self-playing on current weights
                 control_ok = False
@@ -563,7 +610,7 @@ def main() -> int:
                 elif now - last_heartbeat_t >= HEARTBEAT_S:
                     last_heartbeat_t = now
                     log.info("health: control=%s net=%s workers=%s uploaded=%d",
-                             control, last_version or "none", ws, total_up)
+                             control, (have_sha[:12] if have_sha else last_version) or "none", ws, total_up)
             if control == "STOP":
                 log.info("server signaled STOP -> stopping local workers + exiting")
                 try:
@@ -594,8 +641,14 @@ def main() -> int:
                                 "(no --update-cmd; update manually)", want, client_version)
                 else:
                     _self_update(want, client_version, update_cmd, run_dir, stop_path, worker_proc)
-            # 2. net
-            last_version = _pull_weights_if_new(server, weights, last_version, args.timeout)
+            # 2. net — content-addressed sync off /control's X-Network-Sha (preferred), or the
+            #    legacy /version+/weights poll for a server that doesn't advertise the sha.
+            #    Skipped when control failed (server unreachable — nothing to pull this tick).
+            if control_ok:
+                if want_sha is not None:
+                    have_sha = _pull_net_by_sha(server, weights, want_sha, have_sha, args.timeout)
+                else:
+                    last_version = _pull_weights_if_new(server, weights, last_version, args.timeout)
             # 2b. self-play params (server-published; workers live-apply per game)
             last_selfplay = _pull_selfplay_if_new(server, params_path, last_selfplay, args.timeout, hb_tick)
             # 3. games

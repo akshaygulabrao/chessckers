@@ -1,4 +1,4 @@
-"""Wire-contract tests for the lc0-canonical fleet endpoints (Phase A).
+"""Wire-contract tests for the lc0-canonical fleet endpoints (Phase A + B).
 
 These cover the additive lc0-shaped surface laid over the existing fleet_server:
   - GET  /get_network?sha=  content-addressed net fetch (+ X-Network-Sha on /weights, net_sha in /status)
@@ -6,8 +6,13 @@ These cover the additive lc0-shaped surface laid over the existing fleet_server:
   - POST /upload_game       multipart/form-data game upload -> buffer/ (stdlib parser; py3.13 has no cgi)
   - _parse_multipart        the hand-rolled parser, incl. binary payloads ending in CRLF
 
-and assert the LEGACY endpoints (POST /game, GET /version) still work — Phase A must not
-break the existing fleet_client / fleet_match clients. Stdlib HTTP only: fast, no torch/nets.
+Phase B (content-addressed net sync, client side):
+  - GET  /control           advertises X-Network-Sha (the current net's content address)
+  - GET  /status            reports each client's running net sha (X-Client-Net)
+  - fleet_client._pull_net_by_sha  fetches by sha, no-ops when unchanged/empty
+
+and assert the LEGACY endpoints (POST /game, GET /version) still work — the lc0 mirror must
+not break the existing fleet_client / fleet_match clients. Stdlib HTTP only: fast, no torch/nets.
 """
 from __future__ import annotations
 
@@ -21,7 +26,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from chessckers_engine import fleet_server
+from chessckers_engine import fleet_client, fleet_server
 
 
 # --- in-process server fixture (same wiring as fleet_server.main) ---------------
@@ -50,8 +55,9 @@ def server(tmp_path):
         httpd.server_close()
 
 
-def _get(url: str):
-    with urllib.request.urlopen(url, timeout=5) as r:
+def _get(url: str, headers: dict | None = None):
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=5) as r:
         return r.status, r.read(), dict(r.headers)
 
 
@@ -199,3 +205,59 @@ def test_version_endpoint_unchanged(server):
     (rd / "weights.pt").write_bytes(b"W")
     status, body, _ = _get(f"{base}/version")
     assert status == 200 and body.decode().startswith("init:")
+
+
+# --- Phase B: content-addressed net sync (client side) -------------------------
+
+def test_control_advertises_net_sha(server):
+    """GET /control carries X-Network-Sha so a client syncs the net on its heartbeat tick."""
+    base, rd = server
+    # before any net exists: header present but empty (nothing to pull)
+    _, body, hdrs = _get(f"{base}/control")
+    assert body == b"RUN" and hdrs.get("X-Network-Sha") == ""
+    # once weights.pt lands: /control advertises its content address (same sha /weights serves)
+    (rd / "weights.pt").write_bytes(b"NET-ABC")
+    sha = hashlib.sha256(b"NET-ABC").hexdigest()
+    _, _, hdrs = _get(f"{base}/control")
+    assert hdrs.get("X-Network-Sha") == sha
+    _, _, whdrs = _get(f"{base}/weights")
+    assert whdrs.get("X-Network-Sha") == sha
+    # best.pt is the preferred servable net, so the advertised sha tracks it
+    (rd / "best.pt").write_bytes(b"BEST-NET")
+    best_sha = hashlib.sha256(b"BEST-NET").hexdigest()
+    _, _, hdrs = _get(f"{base}/control")
+    assert hdrs.get("X-Network-Sha") == best_sha
+
+
+def test_status_reports_client_net(server):
+    """A heartbeat carrying X-Client-Net surfaces that box's running net sha in /status."""
+    base, rd = server
+    sha = hashlib.sha256(b"W").hexdigest()
+    _get(f"{base}/control", {"X-Client-Id": "leena", "X-Client-Net": sha, "X-Client-Workers": "up"})
+    _, sbody, _ = _get(f"{base}/status")
+    client = json.loads(sbody)["clients"]["leena"]
+    assert client["net"] == sha and client["workers"] == "up"
+
+
+def test_client_pull_net_by_sha(server, tmp_path):
+    """fleet_client._pull_net_by_sha: fetch-by-sha materializes weights.pt; no-op on
+    unchanged sha and on empty want (the content-addressed sync the client now runs)."""
+    base, rd = server
+    blob = b"NET-WEIGHTS-xyz"
+    (rd / "weights.pt").write_bytes(blob)
+    sha = hashlib.sha256(blob).hexdigest()
+    w = tmp_path / "client" / "weights.pt"
+    w.parent.mkdir()
+
+    # empty want -> no-op, nothing written
+    assert fleet_client._pull_net_by_sha(base, w, "", "", 5) == ""
+    assert not w.exists()
+
+    # fetch by sha -> materializes the net at weights.pt, returns the sha now on disk
+    assert fleet_client._pull_net_by_sha(base, w, sha, "", 5) == sha
+    assert w.read_bytes() == blob
+
+    # unchanged sha -> no-op: returns the same sha and does NOT re-fetch/rewrite
+    w.write_bytes(b"SENTINEL")  # if the no-op path re-fetched, this would be overwritten
+    assert fleet_client._pull_net_by_sha(base, w, sha, sha, 5) == sha
+    assert w.read_bytes() == b"SENTINEL"
