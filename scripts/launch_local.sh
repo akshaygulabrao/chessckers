@@ -1,88 +1,75 @@
 #!/usr/bin/env bash
-# Local TRAINING-SERVER side of the fleet (lc0-style): trainer + arena + fleet_server.
-# This box NO LONGER self-plays directly — self-play is a CLIENT now. For loopback local
-# self-play run scripts/launch_local_client.sh (exactly the path leena uses over the LAN).
+# LOCAL self-play CLIENT (lc0-style client-owns-engine), over loopback to the local
+# fleet_server. Runs in the FOREGROUND, owning this terminal tab — the client + its workers
+# stream here and Ctrl-C winds them down. The SAME path leena uses (launch_leena.sh ->
+# launch_fleet_leena.sh), minus self-update, since this box IS the code source. It uses its
+# OWN run-dir so its buffer/weights don't collide with the trainer's run/: the workers write
+# games into run-local/buffer, the client uploads them over HTTP to the server, which lands
+# them in the trainer's run/buffer.
 #
-#   trainer (MPS)  --run-dir run   random init, drains buffer/, publishes weights.pt + ckpts
-#   arena   (CPU)  --run-dir run   seeds best.pt, gates ckpts -> best.pt (keep-best)
-#   server  (HTTP) --run-dir run   :PORT — serves gated best.pt + live selfplay.json,
-#                                   ingests client games (local + leena) into buffer/
+# Run the SERVER side first (other tab):  scripts/launch_server.sh
 #
-# Self-play params live in run/selfplay.json (the ONE source of truth; served at /selfplay,
-# mirrored onto every client, applied live per game). Arch comes from scripts/fleet.env so
-# trainer / arena / clients can't drift.
+# Usage (in its own tab):
+#   scripts/launch_local.sh           # start loopback self-play
+#   FRESH=1 scripts/launch_local.sh   # rm -rf run-local/ first (drop stale games)
 #
-# Usage:
-#   scripts/launch_local.sh            # launch the server side (aborts if a fleet proc is up)
-#   FRESH=1 scripts/launch_local.sh    # rm -rf run/ first -> completely new random weights
-#   then:  scripts/launch_local_client.sh   # add loopback self-play (its own run-dir)
-#
-# Tunables (env): SIMS(=fleet fallback) PORT(=8000) LOG(=/tmp/cc_train.log)
-#                 PER_GAME_KEEP(=0.5) — per-game downsample frac for the replay window (1.0=off)
-set -euo pipefail
+# Tunables (env): SERVER(=http://127.0.0.1:8000) WORKERS(=fleet default)
+set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$REPO_ROOT/scripts/fleet.env"
 ENG="$REPO_ROOT/engine"
 PY="$ENG/.venv/bin/python"
-RUN="$ENG/weights/run"
-LOG="${LOG:-/tmp/cc_train.log}"
+SERVER="${SERVER:-http://127.0.0.1:8000}"
+RUN="$ENG/weights/run-local"          # the CLIENT's own run-dir (NOT the trainer's run/)
 SEED_MIX="$REPO_ROOT/scripts/seed_mix.txt"
-SIMS="${SIMS:-$FLEET_SIMS_FALLBACK}"; PORT="${PORT:-8000}"
-PER_GAME_KEEP="${PER_GAME_KEEP:-0.5}"   # keep ~half of each game's plies in the live window (lc0-style SKIP decorrelation)
+WORKERS="${WORKERS:-$FLEET_WORKERS}"
 
 say(){ echo "[launch-local] $*" >&2; }
+cd "$ENG"
 
-if pgrep -f 'chessckers_engine\.(train_continuous|fleet_server|fleet_arena|fleet_client|selfplay_workers_only)' >/dev/null; then
-  say "ABORT: a fleet process is already running. Stop it first:  scripts/stop_local.sh"
-  exit 1
-fi
+fleet_export_env
+export MACHINE=local
+export CHESSCKERS_START_FEN="$(fleet_seed_fens "$SEED_MIX")"
 
 if [ -n "${FRESH:-}" ]; then
-  say "FRESH: rm -rf $RUN  (completely new random weights)"
+  say "FRESH: rm -rf $RUN  (drop any stale client games)"
   rm -rf "$RUN"
 fi
 mkdir -p "$RUN/buffer"
+rm -f "$RUN/STOP" 2>/dev/null || true
 
-say "seed mix: $(grep -cvE '^[[:space:]]*(#|$)' "$SEED_MIX") positions from $SEED_MIX"
+# Never double-launch the local client (it owns the workers); reap any stray local workers.
+pkill -f 'chessckers_engine\.fleet_client .*run-local' 2>/dev/null || true
+sleep 1
 
-# Canonical self-play params -> run/selfplay.json: the ONE source of truth. fleet_server
-# serves it at /selfplay; every client (local + leena) mirrors it and applies it live per
-# game. Anneal the fleet by editing this file (no relaunch); a client's CLI --sims is only
-# the fallback before its first mirror.
-cat > "$RUN/selfplay.json" <<JSON
-{"sims": $SIMS, "c_puct": 1.5, "temperature": 1.0, "dirichlet_alpha": 0.5, "dirichlet_eps": 0.40, "max_plies": $FLEET_MAX_PLIES}
-JSON
-say "self-play params -> $RUN/selfplay.json (sims=$SIMS)"
+# Native ext is already built on the dev box; pass --native iff it imports (else fall back
+# to the slower-but-correct Python engine rather than running a stale ext).
+NATIVE=""
+if "$PY" -c "import chessckers_cpp" 2>/dev/null; then
+  NATIVE="--native"; say "native C++ engine -> --native"
+else
+  say "Python engine (no --native) — ext not importable (build: cd engine && cpp/build.sh)"
+fi
 
-cd "$ENG"
+# fleet_client owns the workers: pull net + live params from the server, spawn + supervise
+# selfplay_workers_only, upload finished games, contribute keep-best gate games. No
+# --update-cmd (this box is the code source). worker-id-base 0 -> games attribute to [local].
+CLIENT_ARGS=(
+  -m chessckers_engine.fleet_client
+  --server "$SERVER" --run-dir "$RUN" --client-id local --poll-seconds "$FLEET_POLL_S"
+  --spawn-workers --
+  --workers "$WORKERS" --worker-id-base 0 --seed 1000
+  --device "$FLEET_DEVICE" --d-hidden "$FLEET_DH" --c-filters "$FLEET_CF" --n-blocks "$FLEET_NB"
+  --max-plies "$FLEET_MAX_PLIES" --sims "$FLEET_SIMS_FALLBACK" --weights-poll-seconds "$FLEET_WEIGHTS_POLL_S"
+)
+[ -n "$NATIVE" ] && CLIENT_ARGS+=("$NATIVE")
 
-# 1. trainer — random init (no --base), MPS, archive off.
-nohup "$PY" -m chessckers_engine.train_continuous \
-  --run-dir "$RUN" --no-prime \
-  --buffer-cap 300000 --min-buffer 2000 --replay-factor 8 --batch-size 256 \
-  --per-game-keep "$PER_GAME_KEEP" \
-  --publish-seconds 45 --ckpt-seconds 120 \
-  --d-hidden $FLEET_DH --c-filters $FLEET_CF --n-blocks $FLEET_NB --seed 1000 \
-  >>"$LOG" 2>&1 &
-say "trainer  pid $!  (per-game-keep=$PER_GAME_KEEP)"
-
-# 2. arena — seeds best v0 from weights.pt, then gates each new checkpoint.
-nohup "$PY" -m chessckers_engine.fleet_arena \
-  --run-dir "$RUN" --seed-mix-file "$SEED_MIX" \
-  --d-hidden $FLEET_DH --c-filters $FLEET_CF --n-blocks $FLEET_NB \
-  --sims 160 --pairs 4 --threshold 0.55 --side-floor 0.45 \
-  --gate-opponents 3 --no-regress 0.50 \
-  --max-plies $FLEET_MAX_PLIES --gate-seconds 60 --device cpu \
-  >>"$LOG" 2>&1 &
-say "arena    pid $!"
-
-# 3. server — network face of run/: serves gated best.pt + live selfplay.json, ingests
-#    client games into buffer/. Local self-play (launch_local_client.sh) and leena both
-#    talk to it over HTTP. 0.0.0.0 so leena can reach it on the LAN.
-nohup "$PY" -m chessckers_engine.fleet_server \
-  --run-dir "$RUN" --host 0.0.0.0 --port "$PORT" \
-  >>"$LOG" 2>&1 &
-say "server   pid $!  (:$PORT)"
-
-say "up (server side). one log to watch:  tail -f $LOG"
-say "add local self-play:  scripts/launch_local_client.sh"
+# Foreground: this tab OWNS the local workers. Ctrl-C winds them down (STOP + reap) and exits.
+# Loopback (127.0.0.1) is never "local network", so this isn't the macOS TCC fix leena needs
+# — here foreground is just for in-tab logs + clean teardown. Streams to the tab AND the log.
+cleanup(){ echo; say "stopping local workers…"; touch "$RUN/STOP" 2>/dev/null || true; pkill -f 'chessckers_engine\.selfplay_workers_only' 2>/dev/null || true; }
+trap 'cleanup; exit 0' INT TERM
+say "local client -> $SERVER  ($WORKERS workers, run-dir $RUN). Ctrl-C stops everything."
+say "  worker self-play output also at: $RUN/workers.log"
+"$PY" "${CLIENT_ARGS[@]}" 2>&1 | tee "$RUN/fleet_client.log"
+cleanup

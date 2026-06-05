@@ -6,7 +6,7 @@
 # server code version, and reports worker liveness to the server. Shared shape (arch,
 # max-plies, seed mix, sims fallback) comes from scripts/fleet.env so leena CANNOT drift
 # from local; only box-specific bits (LAN server, client-id, worker-id-base 300, caffeinate,
-# self-update) live here. This is the SAME client path as launch_local_client.sh.
+# self-update) live here. This is the SAME client path as launch_local.sh (loopback).
 #
 # Deploy: from local  `git push leena main`  then on leena
 #   cd ~/chessckers && git pull --ff-only && bash scripts/launch_fleet_leena.sh
