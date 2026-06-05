@@ -1,13 +1,13 @@
 """Fleet match player — plays one keep-best GATE game for the client.
 
-When `fleet_arena` opens a gate it publishes a panel (the candidate vs the last N
-champions). The server hands each (opponent, seed, side) unit to a self-play box as
-a `match` job over `POST /next_game` (lc0-shaped; nets identified by sha256). The box
-fetches the two nets by content address (`GET /get_network?sha=`), plays the unit with
-the SAME search the arena uses (native C++ if built, else Python MCTS), and POSTs the
-outcome to `/match_result`. The arena tallies these and plays locally only the units no
-client supplied, so idle boxes share the gating cost instead of the trainer host
-carrying all of it.
+When `fleet_arena` opens a gate it publishes a panel (the candidate vs the current best
+plus the regression-ladder rungs). The server hands each (opponent, seed, side) unit to a
+self-play box as a `match` job over `POST /next_game` (lc0-shaped; nets identified by
+sha256). The box fetches the two nets by content address (`GET /get_network?sha=`), plays
+the unit with the SAME search defined in `fleet_arena` (native C++ if built, else Python
+MCTS), and POSTs the outcome to `/match_result`. The arena only TALLIES these — it plays
+no gate game itself (lc0's server/client split: the host dispatches + tallies, the clients
+play every game).
 
 This module is the in-process PLAYER only. `fleet_client` owns all the HTTP (it has the
 interface-bound opener + the heartbeat headers), so it fetches the nets and hands this

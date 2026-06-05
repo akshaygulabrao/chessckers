@@ -6,7 +6,7 @@
 # tab. Open this tab first.
 #
 #   trainer (MPS)  --run-dir run   random init, drains buffer/, publishes weights.pt + ckpts
-#   arena   (CPU)  --run-dir run   seeds best.pt, gates ckpts -> best.pt (keep-best)
+#   arena   (tally) --run-dir run   seeds best.pt, gates ckpts -> best.pt (keep-best; plays no game)
 #   server  (HTTP) --run-dir run   :PORT — serves gated best.pt + live selfplay.json,
 #                                   ingests client games (local + leena) into buffer/
 #
@@ -77,9 +77,9 @@ pids+=($!); say "trainer  pid $!  -> $TLOG  (per-game-keep=$PER_GAME_KEEP)"
 "$PY" -m chessckers_engine.fleet_arena \
   --run-dir "$RUN" --seed-mix-file "$SEED_MIX" \
   --d-hidden $FLEET_DH --c-filters $FLEET_CF --n-blocks $FLEET_NB \
-  --sims 160 --pairs 4 --threshold 0.55 --side-floor 0.45 \
-  --gate-opponents 3 --no-regress 0.50 \
-  --max-plies $FLEET_MAX_PLIES --gate-seconds 60 --device cpu \
+  --sims 160 --pairs 4 --threshold 0.55 \
+  --ladder-rungs 1,4,16 --no-regress 0.50 \
+  --max-plies $FLEET_MAX_PLIES --gate-seconds 60 \
   >"$ALOG" 2>&1 &
 pids+=($!); say "arena    pid $!  -> $ALOG"
 
