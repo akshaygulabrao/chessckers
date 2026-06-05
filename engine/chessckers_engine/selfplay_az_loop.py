@@ -439,16 +439,16 @@ def _ingest_remote(
     Returns the loaded AZExamples; consumes (unlinks) processed files; skips
     partial/mid-rsync files (retried next iter)."""
     import json
-    import pickle
+
+    from chessckers_engine.training_chunk import ChunkDecodeError, decode_chunk
     out: list = []
     if ingest_dir is None or not ingest_dir.exists():
         return out
     for pkl in sorted(ingest_dir.glob("*.pkl")):
         try:
-            with open(pkl, "rb") as f:
-                exs = pickle.load(f)
-        except (EOFError, pickle.UnpicklingError, OSError, ValueError):
-            continue  # mid-rsync / partial; retry next iter
+            exs = decode_chunk(pkl.read_bytes())
+        except (OSError, ChunkDecodeError):
+            continue  # mid-rsync / partial / foreign bytes; retry next iter
         meta: dict = {}
         meta_path = Path(str(pkl) + ".meta")
         try:

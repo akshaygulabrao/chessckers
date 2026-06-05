@@ -11,6 +11,10 @@ Phase B (content-addressed net sync, client side):
   - GET  /status            reports each client's running net sha (X-Client-Net)
   - fleet_client._pull_net_by_sha  fetches by sha, no-ops when unchanged/empty
 
+Phase C (gzipped-chunk records + client upload migration):
+  - fleet_client._build_multipart  ↔ fleet_server._parse_multipart  agree on the wire
+  - fleet_client._upload_games     posts each game to /upload_game (multipart), not /game
+
 and assert the LEGACY endpoints (POST /game, GET /version) still work — the lc0 mirror must
 not break the existing fleet_client / fleet_match clients. Stdlib HTTP only: fast, no torch/nets.
 """
@@ -261,3 +265,46 @@ def test_client_pull_net_by_sha(server, tmp_path):
     w.write_bytes(b"SENTINEL")  # if the no-op path re-fetched, this would be overwritten
     assert fleet_client._pull_net_by_sha(base, w, sha, sha, 5) == sha
     assert w.read_bytes() == b"SENTINEL"
+
+
+# --- Phase C: client uploads via multipart /upload_game ------------------------
+
+def test_client_multipart_matches_server_parser():
+    """The client's multipart builder and the server's hand-rolled parser agree on
+    the wire — incl. a binary payload ending in CRLF (the strip() trap) and a
+    value-only part with no filename."""
+    blob = b"\x1f\x8bbinary\x00chunk\r\n"  # gzip-magic + binary, CRLF-terminated
+    ctype, body = fleet_client._build_multipart([
+        ("filename", None, b"300_0000000009.pkl"),
+        ("trainingdata", "g.pkl", blob),
+        ("meta", "g.pkl.meta", b'{"machine":"local"}'),
+    ])
+    parts = fleet_server._parse_multipart(ctype, body)
+    assert parts["filename"][1] == b"300_0000000009.pkl"
+    assert parts["trainingdata"][1] == blob          # byte-exact, CRLF preserved
+    assert parts["meta"][1] == b'{"machine":"local"}'
+
+
+def test_client_uploads_via_multipart_endpoint(server, tmp_path):
+    """fleet_client._upload_games posts each game to /upload_game as ONE multipart
+    request and deletes it locally; the bytes (a ccz chunk, opaque to the client)
+    land in the server's buffer/ with the .meta, counted once."""
+    base, rd = server
+    buf = tmp_path / "client_buf"
+    buf.mkdir()
+    name = "300_0000000005.pkl"
+    game_bytes = b"\x1f\x8b" + b"opaque-ccz-chunk-bytes\r\n"  # client never parses these
+    meta_bytes = b'{"machine": "leena", "outcome": "white"}'
+    (buf / name).write_bytes(game_bytes)
+    (buf / (name + ".meta")).write_bytes(meta_bytes)
+
+    n = fleet_client._upload_games(base, buf, min_age=0.0, timeout=5)
+    assert n == 1
+    # landed server-side byte-identical, with its meta, counted once
+    assert (rd / "buffer" / name).read_bytes() == game_bytes
+    assert (rd / "buffer" / (name + ".meta")).read_bytes() == meta_bytes
+    _, sbody, _ = _get(f"{base}/status")
+    assert json.loads(sbody)["games_ingested"] == 1
+    # consumed locally — uploaded exactly once
+    assert not (buf / name).exists()
+    assert not (buf / (name + ".meta")).exists()

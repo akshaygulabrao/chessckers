@@ -469,7 +469,7 @@ class _Handler(BaseHTTPRequestHandler):
         buf = self._run_dir() / "buffer"
         buf.mkdir(parents=True, exist_ok=True)
         # Atomic for the .pkl so the trainer's drain never sees a half-written game
-        # (it globs *.pkl and pickle.loads each). The .meta is a small single write.
+        # (it globs *.pkl and decodes each ccz chunk; see training_chunk). .meta: small write.
         if not self._atomic_write(buf / name, data):
             self._send(500, b"write failed")
             return
@@ -550,9 +550,10 @@ class _Handler(BaseHTTPRequestHandler):
         """lc0-canonical multipart game upload (POST /upload_game). Parses multipart/form-data
         (stdlib; py3.13 dropped cgi) and lands the game into buffer/ exactly like POST /game,
         so the trainer's drain is unchanged. Parts: filename (NNN_..pkl, validated — no path
-        traversal), trainingdata (the .pkl bytes), meta (optional .pkl.meta). Phase A keeps the
-        existing pickled payload; the gzipped-chunk schema is Phase C, a payload swap behind
-        this same endpoint."""
+        traversal), trainingdata (the game bytes — a gzipped-JSON `ccz` chunk since Phase C),
+        meta (optional .pkl.meta). This endpoint is a byte pipe: it never parses the payload,
+        so the record schema lives entirely in the worker (write) + trainer (drain; see
+        training_chunk)."""
         rd = self._run_dir()
         body = self._read_body()
         if not body:

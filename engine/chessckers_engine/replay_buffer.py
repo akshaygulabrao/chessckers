@@ -1,6 +1,7 @@
 """File-backed replay buffer for async AlphaZero training.
 
-Each finished game is pickled to its own file under `root/`. Workers append;
+Each finished game is serialized (see `training_chunk`) to its own file under
+`root/`. Workers append;
 the trainer samples positions uniformly across all games in the buffer.
 
 Cross-process coordination is filesystem-only — no locks, no shared memory.
@@ -15,16 +16,17 @@ Layout:
         001_0000000001.pkl    # worker_id=1, game_id=1
         ...
 
-Each .pkl is a `list[AZExample]` (one game's positions).
+Each `.pkl` is one game's positions as a gzipped-JSON `ccz` chunk (see
+`training_chunk`); the name is historical — the bytes are no longer a pickle.
 """
 from __future__ import annotations
 
 import os
-import pickle
 import random
 from pathlib import Path
 
 from chessckers_engine.selfplay_az import AZExample
+from chessckers_engine.training_chunk import ChunkDecodeError, decode_chunk, encode_chunk
 
 
 class ReplayBuffer:
@@ -48,7 +50,7 @@ class ReplayBuffer:
         target = self.root / name
         tmp = target.with_suffix(".pkl.tmp")
         with open(tmp, "wb") as f:
-            pickle.dump(examples, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.write(encode_chunk(examples))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, target)  # atomic on POSIX
@@ -87,11 +89,9 @@ class ReplayBuffer:
             if p.name in self._cache:
                 continue
             try:
-                with open(p, "rb") as f:
-                    self._cache[p.name] = pickle.load(f)
-            except (EOFError, pickle.UnpicklingError, FileNotFoundError,
-                    ValueError, MemoryError, OSError):
-                # Partial write or vanished file — skip; we'll retry next refresh.
+                self._cache[p.name] = decode_chunk(p.read_bytes())
+            except (OSError, ChunkDecodeError):
+                # Partial write, vanished file, or foreign bytes — skip; retry next refresh.
                 continue
         self._flat = [ex for examples in self._cache.values() for ex in examples]
         self._last_mtime = cur_mtime

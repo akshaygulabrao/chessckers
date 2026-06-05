@@ -34,9 +34,11 @@ Each tick (`--poll-seconds`):
      run-dir/selfplay.json (only on a content change). The workers re-read it each
      game, so the whole fleet self-plays with the SAME, operator-tunable params and
      can be annealed mid-run without a relaunch.
-  3. Upload finished games: each `*.pkl` older than --min-age with its `.meta`
-     present is POSTed (meta first, then pkl, so the server-side trainer sees a
-     complete pair), then deleted locally — each game uploaded exactly once.
+  3. Upload finished games: each `*.pkl` older than --min-age is POSTed with its
+     `.meta` in ONE multipart /upload_game request (server lands meta-before-pkl, so
+     the trainer never sees a meta-less game), then deleted locally — each game
+     uploaded exactly once. (The .pkl is now a gzipped-JSON `ccz` chunk, not a
+     pickle; the client moves the bytes opaquely.)
   4. (--spawn-workers) Supervise the self-play worker subprocess: spawn it once
      weights.pt has landed, restart it on unexpected exit, and heartbeat its state
      (X-Client-Workers: up/down/off) on steps 1/2b so /status can flag a zombie box.
@@ -364,11 +366,29 @@ def _get(url: str, timeout: float, headers: dict | None = None) -> bytes:
         return r.read()
 
 
-def _post(url: str, data: bytes, timeout: float) -> None:
+def _post(url: str, data: bytes, timeout: float,
+          content_type: str = "application/octet-stream") -> None:
     req = urllib.request.Request(url, data=data, method="POST",
-                                 headers={"Content-Type": "application/octet-stream"})
+                                 headers={"Content-Type": content_type})
     with _urlopen(req, timeout) as r:
         r.read()
+
+
+def _build_multipart(parts: list[tuple[str, str | None, bytes]]) -> tuple[str, bytes]:
+    """Build a multipart/form-data (content_type, body) from (name, filename, bytes)
+    parts. Mirrors exactly what fleet_server._parse_multipart expects — stdlib only
+    (no `requests`), so the client stays torch/dep-free. CRLF framing; the binary
+    payload is embedded verbatim (no transfer-encoding). The boundary is a fixed
+    ASCII token — a gzip game chunk won't contain it."""
+    boundary = "----ccFleetUpload7Q2x"
+    out = bytearray()
+    for name, filename, data in parts:
+        disp = f'Content-Disposition: form-data; name="{name}"'
+        if filename is not None:
+            disp += f'; filename="{filename}"'
+        out += f"--{boundary}\r\n".encode() + disp.encode() + b"\r\n\r\n" + data + b"\r\n"
+    out += f"--{boundary}--\r\n".encode()
+    return f"multipart/form-data; boundary={boundary}", bytes(out)
 
 
 def _get2(url: str, timeout: float, headers: dict | None = None):
@@ -460,9 +480,10 @@ def _pull_selfplay_if_new(server: str, params_path: Path, last: bytes, timeout: 
 
 
 def _upload_games(server: str, buffer: Path, min_age: float, timeout: float) -> int:
-    """POST each complete, settled game (pkl + .meta) to the server, then delete it
-    locally. meta first so the server-side trainer never globs a pkl whose meta has
-    not landed. Returns the number of games uploaded this tick."""
+    """POST each complete, settled game to the server via the lc0-canonical multipart
+    /upload_game (parts: filename + trainingdata=the ccz chunk + optional meta), then
+    delete it locally. The single request lands meta-before-pkl server-side, so the
+    trainer never drains a pkl whose .meta is missing. Returns the count uploaded."""
     if not buffer.exists():
         return 0
     now = time.time()
@@ -475,11 +496,14 @@ def _upload_games(server: str, buffer: Path, min_age: float, timeout: float) -> 
             continue
         meta = Path(str(pkl) + ".meta")
         try:
-            # meta is best-effort on the worker side; upload it first when present,
-            # else upload the pkl alone (attribution lost, data kept).
-            if meta.exists():
-                _post(f"{server}/game/{meta.name}", meta.read_bytes(), timeout)
-            _post(f"{server}/game/{pkl.name}", pkl.read_bytes(), timeout)
+            parts: list[tuple[str, str | None, bytes]] = [
+                ("filename", None, pkl.name.encode()),
+                ("trainingdata", pkl.name, pkl.read_bytes()),
+            ]
+            if meta.exists():  # best-effort on the worker side; carry it when present
+                parts.append(("meta", meta.name, meta.read_bytes()))
+            ctype, body = _build_multipart(parts)
+            _post(f"{server}/upload_game", body, timeout, ctype)
         except (urllib.error.URLError, OSError) as e:
             log.warning("upload %s failed (retry next tick): %r", pkl.name, e)
             break  # server down — stop this tick, keep games for retry

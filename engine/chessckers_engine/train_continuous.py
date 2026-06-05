@@ -44,6 +44,7 @@ from chessckers_engine.device import pick_device
 from chessckers_engine.model import ChesskersScorer
 from chessckers_engine.runtime import setup_logging
 from chessckers_engine.train_az import _batch_loss, save_checkpoint
+from chessckers_engine.training_chunk import ChunkDecodeError, decode_chunk
 
 log = logging.getLogger("chessckers_engine.train_continuous")
 
@@ -198,9 +199,10 @@ def _downsample_game(exs: list, keep_frac: float, rng: "random.Random | None") -
 
 def _drain(buffer_dir: Path, archive: "_GameArchive | None" = None,
            keep_frac: float = 1.0, rng: "random.Random | None" = None) -> tuple[list, list]:
-    """Load + consume every COMPLETE game pkl in buffer_dir. Each pkl is a
-    list[AZExample] (what selfplay_worker_async writes), with a sibling .meta
-    JSON (worker_id/machine/outcome/plies/seed_fen). Returns (examples, metas) —
+    """Load + consume every COMPLETE game pkl in buffer_dir. Each pkl is one game's
+    AZExamples as a gzipped-JSON `ccz` chunk (training_chunk; data-only, never
+    pickle.load on uploaded bytes), with a sibling .meta JSON
+    (worker_id/machine/outcome/plies/seed_fen). Returns (examples, metas) —
     one meta dict per ingested game (stamped with meta['kept'] = positions taken
     into the live window); skips partial/mid-rsync pkls (retried next tick). The
     game is archived IN FULL (the cold tier keeps every position) BEFORE the live
@@ -211,10 +213,9 @@ def _drain(buffer_dir: Path, archive: "_GameArchive | None" = None,
         return examples, metas
     for pkl in sorted(buffer_dir.glob("*.pkl")):
         try:
-            with open(pkl, "rb") as f:
-                exs = pickle.load(f)
-        except (EOFError, pickle.UnpicklingError, OSError, ValueError):
-            continue  # mid-write / partial rsync — retry next tick
+            exs = decode_chunk(pkl.read_bytes())
+        except (OSError, ChunkDecodeError):
+            continue  # mid-write / partial upload / foreign bytes — retry next tick
         meta_path = Path(str(pkl) + ".meta")
         meta: dict = {}
         try:
