@@ -11,3 +11,6 @@ engine/rust/*/uv.lock
 # Training run artifacts (data, not code)
 engine/runs/
 engine/engine/
+
+# lc0 reference clones (read-only architecture reference, not our code)
+reference/

@@ -36,6 +36,21 @@ Endpoints:
                             into buffer/ for the trainer to drain. pkl written
                             atomically; filename validated (no path traversal).
 
+lc0-canonical wire (Phase A — additive mirror of the above in lc0's vocabulary; the
+legacy endpoints stay, so existing clients are unaffected):
+  GET  /get_network?sha= -> content-addressed net fetch: the servable net (best/weights/
+                            cand/opponent) whose sha256 == <sha>, else 404. /weights and
+                            /status also carry the current net's sha (X-Network-Sha header /
+                            net_sha field) so a client knows what to ask for.
+  POST /next_game        -> lc0-shaped job JSON: {"type":"train"|"match","sha":<net sha>,
+                            "params":...,+match fields}. Same assignment as GET /next_game
+                            but content-addressed; the request body (client identity) is
+                            accepted and ignored.
+  POST /upload_game      -> multipart/form-data game upload (parts: filename, trainingdata,
+                            optional meta). Lands into buffer/ exactly like POST /game.
+                            Phase A keeps the pickled payload; the gzipped-chunk schema is
+                            Phase C, a payload swap behind this endpoint.
+
 Keep-best gate distribution (lc0-style; active only while the arena has a gate open,
 i.e. `match.json` is present in the run-dir):
   GET  /next_game        -> {"mode":"selfplay"} normally, else a match assignment
@@ -59,6 +74,7 @@ Run (on the trainer host, same run-dir as train_continuous):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import logging
@@ -69,6 +85,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from chessckers_engine.runtime import setup_logging
 
@@ -154,6 +171,104 @@ def _gate_stats(run_dir: Path) -> tuple[int, float]:
     return promotions, best_elo
 
 
+# --- content-addressed nets + lc0 multipart upload (Phase A: lc0-canonical wire) -------
+_SHA_CACHE: dict = {}          # path -> ((mtime, size), sha256hex) — avoid rehashing the net every poll
+_SHA_LOCK = threading.Lock()
+
+
+def _file_sha(path: Path) -> str | None:
+    """sha256 hex of a file, cached by (mtime, size) so repeat polls don't rehash the net.
+    None if the file is absent/unreadable. This is the content address lc0 keys networks by."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (st.st_mtime, st.st_size)
+    with _SHA_LOCK:
+        c = _SHA_CACHE.get(path)
+        if c is not None and c[0] == key:
+            return c[1]
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    sha = h.hexdigest()
+    with _SHA_LOCK:
+        _SHA_CACHE[path] = (key, sha)
+    return sha
+
+
+def _net_files(run_dir: Path) -> list:
+    """Every net the server can serve by sha: the gated champion, the raw weights, the
+    candidate, and each archived gate opponent. Order is the preferred-match order."""
+    files = []
+    for name in ("best.pt", "weights.pt", "cand.pt"):
+        p = run_dir / name
+        if p.exists():
+            files.append(p)
+    mn = run_dir / "match_nets"
+    if mn.exists():
+        files.extend(sorted(mn.glob("*.pt")))
+    return files
+
+
+def _resolve_sha(run_dir: Path, sha: str) -> Path | None:
+    """The servable net file whose content sha256 == `sha`, else None — lc0's get_network:
+    a client asks for a net by hash, immune to which filename it currently lives under."""
+    for p in _net_files(run_dir):
+        if _file_sha(p) == sha:
+            return p
+    return None
+
+
+def _selfplay_params(run_dir: Path) -> dict:
+    """run_dir/selfplay.json as a dict ({} if missing/invalid). Embedded in the `train` job
+    so a client gets net sha + params in a single next_game round-trip (lc0-style)."""
+    try:
+        return json.loads((run_dir / "selfplay.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _parse_multipart(content_type: str, body: bytes) -> dict:
+    """Minimal multipart/form-data parser (stdlib only — py3.13 removed `cgi`). Returns
+    {field_name: (filename_or_None, raw_bytes)}. Sufficient for the fixed parts the fleet
+    client posts (filename / trainingdata / meta); not a general RFC 7578 implementation."""
+    if "multipart/form-data" not in content_type:
+        raise ValueError("not multipart/form-data")
+    m = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', content_type)
+    if not m:
+        raise ValueError("no boundary")
+    boundary = (m.group(1) or m.group(2)).strip().encode()
+    out: dict = {}
+    for seg in body.split(b"--" + boundary):
+        # Each part is framed by a CRLF after the delimiter line and a CRLF before the next
+        # delimiter. Trim EXACTLY those two (never strip(), which would eat a binary payload's
+        # own trailing \r/\n). Skip the preamble / closing '--' terminator.
+        if not seg or seg in (b"--", b"--\r\n", b"\r\n"):
+            continue
+        if seg.startswith(b"\r\n"):
+            seg = seg[2:]
+        if seg.endswith(b"\r\n"):
+            seg = seg[:-2]
+        head, sep, content = seg.partition(b"\r\n\r\n")
+        if not sep:
+            continue
+        name = filename = None
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-disposition"):
+                hn = re.search(rb'name="([^"]*)"', line)
+                hf = re.search(rb'filename="([^"]*)"', line)
+                name = hn.group(1).decode("utf-8", "replace") if hn else None
+                filename = hf.group(1).decode("utf-8", "replace") if hf else None
+        if name is not None:
+            out[name] = (filename, content)
+    return out
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "ChesskersFleet/1.0"
     run_dir: Path  # set on the server instance below; bound per-request via self.server
@@ -195,6 +310,30 @@ class _Handler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(body)
 
+    def _read_body(self) -> bytes:
+        """The request body, bounded by Content-Length (<= MAX_UPLOAD_BYTES). b'' if absent,
+        non-positive, or over the cap — callers treat b'' as 'nothing to ingest'."""
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return b""
+        if n <= 0 or n > MAX_UPLOAD_BYTES:
+            return b""
+        return self.rfile.read(n)
+
+    def _atomic_write(self, target: Path, data: bytes) -> bool:
+        """Write `data` to `target` atomically (tmp `.part` + os.replace) so the trainer's
+        drain never globs a half-written file. True on success; logs + False on OSError."""
+        tmp = target.with_name(target.name + ".part")
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, target)
+            return True
+        except OSError as e:
+            log.warning("write %s failed: %s", target.name, e)
+            return False
+
     def do_GET(self) -> None:
         self._note_client()
         rd = self._run_dir()
@@ -211,13 +350,14 @@ class _Handler(BaseHTTPRequestHandler):
                 data = b"{}"  # nothing published -> clients keep their launch defaults
             self._send(200, data, "application/json")
         elif self.path == "/weights":
+            net = _net_path(rd)
             try:
-                data = _net_path(rd).read_bytes()
+                data = net.read_bytes()
             except OSError:
                 self._send(404, b"no weights yet")
                 return
             self._send(200, data, "application/octet-stream",
-                       {"X-Version": _version(rd)})
+                       {"X-Version": _version(rd), "X-Network-Sha": _file_sha(net) or ""})
         elif self.path == "/status":
             backlog = sum(1 for _ in (rd / "buffer").glob("*.pkl")) if (rd / "buffer").exists() else 0
             m = _read_match(rd)
@@ -231,6 +371,7 @@ class _Handler(BaseHTTPRequestHandler):
                 games_ingested = self.server.games_ingested  # type: ignore[attr-defined]
             body = json.dumps({
                 "version": _version(rd),
+                "net_sha": _file_sha(_net_path(rd)) or "",  # content address of the served net (lc0 get_network)
                 "weights": (rd / "weights.pt").exists(),
                 "best": (rd / "best.pt").exists(),
                 "buffer_backlog": backlog,
@@ -276,6 +417,20 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(404, b"no net")
                 return
             self._send(200, data, "application/octet-stream")
+        elif self.path.split("?", 1)[0] == "/get_network":
+            # lc0-canonical content-addressed fetch: GET /get_network?sha=<sha256>. Serves
+            # whichever servable net hashes to <sha> (best/weights/cand/opponents); 404 on miss.
+            sha = parse_qs(urlsplit(self.path).query).get("sha", [""])[0]
+            p = _resolve_sha(rd, sha) if sha else None
+            if p is None:
+                self._send(404, b"no such network")
+                return
+            try:
+                data = p.read_bytes()
+            except OSError:
+                self._send(404, b"no such network")
+                return
+            self._send(200, data, "application/octet-stream", {"X-Network-Sha": sha})
         else:
             self._send(404, b"not found")
 
@@ -284,6 +439,12 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/match_result":
             self._match_result()
             return
+        if self.path == "/next_game":      # lc0-canonical job assignment (alongside GET /next_game)
+            self._next_game_post()
+            return
+        if self.path == "/upload_game":    # lc0-canonical multipart upload (alongside POST /game)
+            self._upload_game()
+            return
         if not self.path.startswith("/game/"):
             self._send(404, b"not found")
             return
@@ -291,27 +452,15 @@ class _Handler(BaseHTTPRequestHandler):
         if not _NAME_RE.match(name):
             self._send(400, b"bad filename")
             return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
+        data = self._read_body()
+        if not data:
             self._send(400, b"bad length")
             return
-        if length <= 0 or length > MAX_UPLOAD_BYTES:
-            self._send(400, b"bad length")
-            return
-        data = self.rfile.read(length)
         buf = self._run_dir() / "buffer"
         buf.mkdir(parents=True, exist_ok=True)
-        target = buf / name
         # Atomic for the .pkl so the trainer's drain never sees a half-written game
         # (it globs *.pkl and pickle.loads each). The .meta is a small single write.
-        tmp = target.with_name(target.name + ".part")
-        try:
-            with open(tmp, "wb") as f:
-                f.write(data)
-            os.replace(tmp, target)
-        except OSError as e:
-            log.warning("write %s failed: %s", name, e)
+        if not self._atomic_write(buf / name, data):
             self._send(500, b"write failed")
             return
         if name.endswith(".pkl"):  # count games (not the .meta sidecar) for /status throughput
@@ -351,15 +500,78 @@ class _Handler(BaseHTTPRequestHandler):
         body = json.dumps({"seed": r.get("seed"), "cand_white": bool(r.get("cand_white")),
                            "opp": str(r.get("opp") or "best")[:64], "outcome": r["outcome"],
                            "match_id": m["match_id"]}).encode()
-        tmp = target.with_name(target.name + ".part")
-        try:
-            with open(tmp, "wb") as f:
-                f.write(body)
-            os.replace(tmp, target)
-        except OSError as e:
-            log.warning("match_result write failed: %s", e)
+        if not self._atomic_write(target, body):
             self._send(500, b"write failed")
             return
+        self._send(200, b"ok")
+
+    def _next_game_post(self) -> None:
+        """lc0-canonical job assignment (POST /next_game). Same selection as the legacy
+        GET /next_game (match.json + round-robin over the gate panel, via the shared
+        match_cursor) but in lc0's vocabulary: {"type":"train"|"match","sha":<net sha>,
+        "params":...}. Nets are identified by sha256 so the client fetches them with
+        GET /get_network?sha=. Any POSTed body (lc0 clients send their identity) is drained
+        and ignored — liveness still rides the X-Client-Id header. GET /next_game is left
+        byte-for-byte intact for fleet_match."""
+        rd = self._run_dir()
+        self._read_body()  # drain/ignore posted form fields
+        m = _read_match(rd)
+        seeds = (m or {}).get("seeds") or []
+        opps = (m or {}).get("opponents") or ["best"]
+        if not m or not seeds:
+            job = {"type": "train", "sha": _file_sha(_net_path(rd)) or "",
+                   "params": _selfplay_params(rd)}
+            self._send(200, json.dumps(job).encode(), "application/json")
+            return
+        units = [(o, s, cw) for o in opps for s in seeds for cw in (True, False)]
+        opp, seed, cand_white = units[next(self.server.match_cursor) % len(units)]  # type: ignore[attr-defined]
+        cand = rd / "cand.pt"
+        opp_path = (rd / "best.pt") if opp == "best" else (rd / "match_nets" / f"{opp}.pt")
+        job = {
+            "type": "match", "match_id": m["match_id"],
+            "sha": _file_sha(cand) or "", "candidate_sha": _file_sha(cand) or "",
+            "opponent": opp, "opponent_sha": _file_sha(opp_path) or "",
+            "seed": seed, "cand_white": cand_white,
+            "arch": m["arch"], "params": m["params"],
+        }
+        self._send(200, json.dumps(job).encode(), "application/json")
+
+    def _upload_game(self) -> None:
+        """lc0-canonical multipart game upload (POST /upload_game). Parses multipart/form-data
+        (stdlib; py3.13 dropped cgi) and lands the game into buffer/ exactly like POST /game,
+        so the trainer's drain is unchanged. Parts: filename (NNN_..pkl, validated — no path
+        traversal), trainingdata (the .pkl bytes), meta (optional .pkl.meta). Phase A keeps the
+        existing pickled payload; the gzipped-chunk schema is Phase C, a payload swap behind
+        this same endpoint."""
+        rd = self._run_dir()
+        body = self._read_body()
+        if not body:
+            self._send(400, b"empty body")
+            return
+        try:
+            parts = _parse_multipart(self.headers.get("Content-Type", ""), body)
+        except ValueError:
+            self._send(400, b"bad multipart")
+            return
+        fn = parts.get("filename")
+        filename = fn[1].decode("utf-8", "replace").strip() if fn else ""
+        if not _NAME_RE.match(filename) or not filename.endswith(".pkl"):
+            self._send(400, b"bad filename")
+            return
+        td = parts.get("trainingdata") or parts.get("file")
+        if not td or not td[1]:
+            self._send(400, b"no trainingdata")
+            return
+        buf = rd / "buffer"
+        buf.mkdir(parents=True, exist_ok=True)
+        meta = parts.get("meta")
+        if meta and meta[1]:  # meta first, like /game, so the drain never sees a meta-less pkl
+            self._atomic_write(buf / (filename + ".meta"), meta[1])
+        if not self._atomic_write(buf / filename, td[1]):
+            self._send(500, b"write failed")
+            return
+        with self.server.stats_lock:  # type: ignore[attr-defined]
+            self.server.games_ingested += 1  # type: ignore[attr-defined]
         self._send(200, b"ok")
 
 
