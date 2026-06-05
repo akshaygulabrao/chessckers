@@ -15,14 +15,21 @@ Phase C (gzipped-chunk records + client upload migration):
   - fleet_client._build_multipart  ↔ fleet_server._parse_multipart  agree on the wire
   - fleet_client._upload_games     posts each game to /upload_game (multipart), not /game
 
-and assert the LEGACY endpoints (POST /game, GET /version) still work — the lc0 mirror must
-not break the existing fleet_client / fleet_match clients. Stdlib HTTP only: fast, no torch/nets.
+Phase D (gate assignment folded into the client; the legacy GET /next_game + /net/* serving
+were RETIRED — POST /next_game is now the sole assignment path):
+  - fleet_client._play_gate_job    plays one `match` job: fetch cand+opp nets by sha
+    (/get_network), play (lazy MatchRunner — stubbed here), POST /match_result
+  - run-dir/PAUSE                  sentinel the client touches so its owned workers idle mid-gate
+
+and assert the LEGACY self-play endpoints (POST /game, GET /version) still work — the lc0 mirror
+must not break the existing fleet_client self-play path. Stdlib HTTP only: fast, no torch/nets.
 """
 from __future__ import annotations
 
 import hashlib
 import itertools
 import json
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -308,3 +315,89 @@ def test_client_uploads_via_multipart_endpoint(server, tmp_path):
     # consumed locally — uploaded exactly once
     assert not (buf / name).exists()
     assert not (buf / (name + ".meta")).exists()
+
+
+# --- Phase D: client plays gate jobs over POST /next_game ----------------------
+
+def test_client_plays_gate_job_over_post(server, tmp_path, monkeypatch):
+    """fleet_client._play_gate_job: given an open gate's `match` job, the client fetches the
+    candidate + opponent nets by content address (/get_network?sha=) and POSTs /match_result.
+    The heavy player is stubbed so the wire test stays torch-free; we assert it received the
+    right nets (content-addressed, cached on disk) and that the outcome landed for the arena."""
+    import types
+
+    base, rd = server
+    (rd / "cand.pt").write_bytes(b"CANDNET")
+    (rd / "best.pt").write_bytes(b"BESTNET")
+    (rd / "match.json").write_text(json.dumps({
+        "match_id": 11, "seeds": ["fenX"], "opponents": ["best"],
+        "arch": {"d_hidden": 8}, "params": {"sims": 1, "c_puct": 1.5,
+                                            "dir_alpha": 0.5, "dir_eps": 0.15, "max_plies": 10},
+    }))
+
+    # the match job the client would receive from POST /next_game (nets identified by sha)
+    _, body = _post(f"{base}/next_game", b"")
+    job = json.loads(body)
+    assert job["type"] == "match" and job["candidate_sha"] and job["opponent_sha"]
+
+    # stub the heavy player (no torch); capture the nets it's handed
+    seen = {}
+
+    class _FakeRunner:
+        def __init__(self, cache_dir, device="cpu"):
+            seen["device"] = device
+
+        def play(self, j, cand_path, opp_path):
+            seen["job_mid"] = j["match_id"]
+            seen["cand"] = cand_path.read_bytes()
+            seen["opp"] = opp_path.read_bytes()
+            return "white"
+
+    fake = types.ModuleType("chessckers_engine.fleet_match")
+    fake.MatchRunner = _FakeRunner
+    monkeypatch.setitem(sys.modules, "chessckers_engine.fleet_match", fake)
+
+    gate_dir = tmp_path / "_gate"
+    runner, disabled = fleet_client._play_gate_job(base, job, gate_dir, None, "cpu", 5)
+    assert disabled is False and runner is not None
+
+    # fetched the right nets by content address, and cached them sha-named on disk
+    assert seen["cand"] == b"CANDNET" and seen["opp"] == b"BESTNET" and seen["job_mid"] == 11
+    assert (gate_dir / f"{job['candidate_sha']}.pt").read_bytes() == b"CANDNET"
+    # the outcome landed (tagged with the opponent) for the arena to tally
+    files = list((rd / "match_results").glob("11_*.json"))
+    assert len(files) == 1
+    rec = json.loads(files[0].read_text())
+    assert rec["outcome"] == "white" and rec["match_id"] == 11 and rec["opp"] == job["opponent"]
+
+
+def test_play_gate_job_disables_when_engine_missing(server, tmp_path, monkeypatch):
+    """A box without torch/the native ext disables gating (returns disabled=True) instead of
+    crashing, so a bare volunteer stays self-play-only — the lazy-import guard."""
+    base, rd = server
+    (rd / "cand.pt").write_bytes(b"C")
+    (rd / "best.pt").write_bytes(b"B")
+    (rd / "match.json").write_text(json.dumps({
+        "match_id": 1, "seeds": ["s"], "opponents": ["best"], "arch": {},
+        "params": {"sims": 1, "c_puct": 1.5, "dir_alpha": 0.5, "dir_eps": 0.15, "max_plies": 5},
+    }))
+    _, body = _post(f"{base}/next_game", b"")
+    job = json.loads(body)
+
+    # a None entry in sys.modules makes `from ... import MatchRunner` raise ImportError
+    monkeypatch.setitem(sys.modules, "chessckers_engine.fleet_match", None)
+    runner, disabled = fleet_client._play_gate_job(base, job, tmp_path / "_gate", None, "cpu", 5)
+    assert runner is None and disabled is True
+
+
+def test_worker_pause_sentinel_semantics(tmp_path):
+    """The self-play worker idles while run-dir/PAUSE exists (the client's gate-pause). PAUSE is
+    derived from the STOP path the worker already receives, so it sits in the same run-dir."""
+    from chessckers_engine.selfplay_worker_async import _pause_requested
+    pause = tmp_path / "PAUSE"
+    assert _pause_requested(None) is False
+    assert _pause_requested(pause) is False
+    pause.touch()
+    assert _pause_requested(pause) is True
+    # contract: the client touches run-dir/PAUSE; the worker derives it as stop_path.with_name("PAUSE")
+    assert (tmp_path / "STOP").with_name("PAUSE") == pause

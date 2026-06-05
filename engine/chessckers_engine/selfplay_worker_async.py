@@ -31,6 +31,13 @@ def _stop_requested(stop_path: Path | None) -> bool:
     return stop_path is not None and stop_path.exists()
 
 
+def _pause_requested(pause_path: Path | None) -> bool:
+    """True while a PAUSE sentinel is present. fleet_client touches run_dir/PAUSE
+    while it plays a keep-best gate game on this box, so the workers it owns idle at
+    the next game boundary instead of contending for CPU; cleared when the gate closes."""
+    return pause_path is not None and pause_path.exists()
+
+
 # Self-play knobs that may be live-overridden mid-run via run_dir/selfplay.json
 # (server-published, mirrored onto each box by fleet_client, or written directly by
 # the operator on the trainer host). JSON key -> type. A missing file or a missing
@@ -141,6 +148,9 @@ def play_forever(payload: dict) -> int:
     if "pin_cpu" in payload and payload["pin_cpu"] is not None:
         _pin_to_cpu(int(payload["pin_cpu"]))
     stop_path = Path(payload["stop_path"]) if payload.get("stop_path") else None
+    # PAUSE shares run_dir with STOP (derived, not plumbed through the payload): fleet_client
+    # touches it to idle these workers while it plays a gate game on the same box.
+    pause_path = stop_path.with_name("PAUSE") if stop_path is not None else None
     buffer = ReplayBuffer(payload["buffer_root"])
     max_games = payload.get("max_games")
     max_plies = int(payload.get("max_plies", 400))
@@ -222,6 +232,13 @@ def play_forever(payload: dict) -> int:
     try:
         while not _stop_requested(stop_path):
             if max_games is not None and games_played >= int(max_games):
+                break
+
+            # Gate pause: idle at the game boundary while PAUSE is present (fleet_client is
+            # playing a gate game on this box). STOP still wins, so a paused worker exits cleanly.
+            while _pause_requested(pause_path) and not _stop_requested(stop_path):
+                time.sleep(0.5)
+            if _stop_requested(stop_path):
                 break
 
             # Per-worker mode: refresh local model from weights file when newer.

@@ -40,36 +40,28 @@ Endpoints:
                             into buffer/ for the trainer to drain. pkl written
                             atomically; filename validated (no path traversal).
 
-lc0-canonical wire (Phase A — additive mirror of the above in lc0's vocabulary; the
-legacy endpoints stay, so existing clients are unaffected):
+lc0-canonical wire (mirrors lc0's server/client vocabulary; the self-play legacy
+endpoints — POST /game, GET /version+/weights — stay for non-breaking):
   GET  /get_network?sha= -> content-addressed net fetch: the servable net (best/weights/
                             cand/opponent) whose sha256 == <sha>, else 404. /weights and
                             /status also carry the current net's sha (X-Network-Sha header /
-                            net_sha field) so a client knows what to ask for.
-  POST /next_game        -> lc0-shaped job JSON: {"type":"train"|"match","sha":<net sha>,
-                            "params":...,+match fields}. Same assignment as GET /next_game
-                            but content-addressed; the request body (client identity) is
-                            accepted and ignored.
-  POST /upload_game      -> multipart/form-data game upload (parts: filename, trainingdata,
-                            optional meta). Lands into buffer/ exactly like POST /game.
-                            Phase A keeps the pickled payload; the gzipped-chunk schema is
-                            Phase C, a payload swap behind this endpoint.
-
-Keep-best gate distribution (lc0-style; active only while the arena has a gate open,
-i.e. `match.json` is present in the run-dir):
-  GET  /next_game        -> {"mode":"selfplay"} normally, else a match assignment
-                            {"mode":"match", match_id, opp, seed, cand_white, arch, params}.
-                            Units (opponent x seed x side) are handed out round-robin over the
-                            whole gate panel (candidate vs the last N champions); the arena
-                            tolerates duplicates and plays whatever the fleet didn't.
-  GET  /net/cand         -> octet-stream of the candidate net (cand.pt).
-  GET  /net/opp/<id>     -> octet-stream of one gate opponent net (match_nets/<id>.pt; <id> is
-                            'best' or 'net-<ts>'). The candidate is played against each, so the
-                            older-champion ladder games offload just like the vs-best games.
-                            (/net/best kept as a best.pt alias for older clients.)
-  POST /match_result     -> ingest one client-played gate outcome (JSON) into
-                            match_results/ for the arena to tally. Outcomes whose
-                            match_id != the open gate's are acked and dropped (stale).
+                            net_sha field) so a client knows what to ask for. This is also how
+                            a gate client fetches the candidate + each opponent net (by the
+                            candidate_sha/opponent_sha the match job carries).
+  POST /next_game        -> the SOLE job-assignment path (the legacy GET /next_game + /net/*
+                            serving endpoints were retired in Phase D). lc0-shaped job JSON:
+                            {"type":"train","sha":<net sha>,"params":...} normally, or, while a
+                            gate is open (match.json present), a {"type":"match",match_id,
+                            candidate_sha,opponent,opponent_sha,seed,cand_white,arch,params}
+                            unit handed out round-robin over the whole panel (candidate vs the
+                            last N champions). The arena tolerates duplicates and plays whatever
+                            the fleet didn't. Request body (client identity) accepted and ignored.
+  POST /upload_game      -> multipart/form-data game upload (parts: filename, trainingdata = a
+                            gzipped-JSON `ccz` chunk since Phase C, optional meta). Lands into
+                            buffer/ exactly like POST /game; a byte pipe (never parses the payload).
+  POST /match_result     -> ingest one client-played gate outcome (JSON) into match_results/ for
+                            the arena to tally. Outcomes whose match_id != the open gate's are
+                            acked and dropped (stale).
 
 Run (on the trainer host, same run-dir as train_continuous):
 
@@ -99,9 +91,6 @@ log = logging.getLogger("chessckers_engine.fleet_server")
 # sidecar) by ReplayBuffer.append_game / the worker. worker_id may exceed 3 digits
 # (volunteer bases), so allow 3+. Anchored — rejects any path traversal.
 _NAME_RE = re.compile(r"^\d{3,}_\d{10}\.pkl(\.meta)?$")
-# Gate opponent ids served at /net/opp/<id> — 'best' or an archived champion 'net-<ts>'.
-# Anchored so the id can never escape the match_nets/ dir (no path traversal).
-_OPPID_RE = re.compile(r"^(best|net-\d+)$")
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024  # a single game pkl is tens of KB; 64 MB is paranoia
 CLIENT_ACTIVE_WINDOW = 120  # s — a client last-seen within this counts as "active" in /status
 
@@ -395,38 +384,6 @@ class _Handler(BaseHTTPRequestHandler):
                 "clients": clients,  # {id: {age: s-since-seen, version: git-sha, workers: up/down/off, net: sha}}, active window only
             }).encode()
             self._send(200, body, "application/json")
-        elif self.path == "/next_game":
-            m = _read_match(rd)
-            seeds = (m or {}).get("seeds") or []
-            opps = (m or {}).get("opponents") or ["best"]
-            if not m or not seeds:
-                self._send(200, b'{"mode": "selfplay"}', "application/json")
-                return
-            units = [(o, s, cw) for o in opps for s in seeds for cw in (True, False)]
-            opp, seed, cand_white = units[next(self.server.match_cursor) % len(units)]  # type: ignore[attr-defined]
-            self._send(200, json.dumps({
-                "mode": "match", "match_id": m["match_id"], "opp": opp, "seed": seed,
-                "cand_white": cand_white, "arch": m["arch"], "params": m["params"],
-            }).encode(), "application/json")
-        elif self.path in ("/net/best", "/net/cand"):
-            fname = "best.pt" if self.path.endswith("best") else "cand.pt"
-            try:
-                data = (rd / fname).read_bytes()
-            except OSError:
-                self._send(404, b"no net")
-                return
-            self._send(200, data, "application/octet-stream")
-        elif self.path.startswith("/net/opp/"):
-            oppid = self.path[len("/net/opp/"):]
-            if not _OPPID_RE.match(oppid):
-                self._send(400, b"bad opp")
-                return
-            try:
-                data = (rd / "match_nets" / f"{oppid}.pt").read_bytes()
-            except OSError:
-                self._send(404, b"no net")
-                return
-            self._send(200, data, "application/octet-stream")
         elif self.path.split("?", 1)[0] == "/get_network":
             # lc0-canonical content-addressed fetch: GET /get_network?sha=<sha256>. Serves
             # whichever servable net hashes to <sha> (best/weights/cand/opponents); 404 on miss.
@@ -449,7 +406,7 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/match_result":
             self._match_result()
             return
-        if self.path == "/next_game":      # lc0-canonical job assignment (alongside GET /next_game)
+        if self.path == "/next_game":      # lc0-canonical job assignment (train vs match)
             self._next_game_post()
             return
         if self.path == "/upload_game":    # lc0-canonical multipart upload (alongside POST /game)
@@ -516,13 +473,12 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, b"ok")
 
     def _next_game_post(self) -> None:
-        """lc0-canonical job assignment (POST /next_game). Same selection as the legacy
-        GET /next_game (match.json + round-robin over the gate panel, via the shared
-        match_cursor) but in lc0's vocabulary: {"type":"train"|"match","sha":<net sha>,
-        "params":...}. Nets are identified by sha256 so the client fetches them with
-        GET /get_network?sha=. Any POSTed body (lc0 clients send their identity) is drained
-        and ignored — liveness still rides the X-Client-Id header. GET /next_game is left
-        byte-for-byte intact for fleet_match."""
+        """lc0-canonical job assignment (POST /next_game) — the sole assignment path. Selects
+        from match.json + round-robin over the gate panel (via the shared match_cursor) and
+        replies in lc0's vocabulary: {"type":"train"|"match","sha":<net sha>,"params":...}.
+        Nets are identified by sha256 so the client fetches them with GET /get_network?sha=.
+        Any POSTed body (lc0 clients send their identity) is drained and ignored — liveness
+        still rides the X-Client-Id header."""
         rd = self._run_dir()
         self._read_body()  # drain/ignore posted form fields
         m = _read_match(rd)

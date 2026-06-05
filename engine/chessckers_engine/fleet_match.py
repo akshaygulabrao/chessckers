@@ -1,27 +1,26 @@
-"""Fleet match player — a self-play client contributes keep-best GATE games.
+"""Fleet match player — plays one keep-best GATE game for the client.
 
-When `fleet_arena` opens a gate it publishes a match (candidate vs a panel of the
-last N champions) through the server: `GET /next_game` hands out (opponent, seed,
-side) units, `GET /net/cand` serves the candidate and `GET /net/opp/<id>` serves
-each opponent net, `POST /match_result` collects outcomes tagged with the opponent.
-This module is the client side — pull a unit, play one gate game with the SAME
-search the arena uses (native C++ if built, else Python MCTS), POST the outcome.
-The arena tallies these and plays locally only the units no client supplied, so
-idle boxes share the gating cost instead of the trainer host carrying all of it.
-Serving every champion net (not just best) is what lets the older-champion ladder
-games offload too — lc0 ships both shas to its clients; we ship cand + each champ.
+When `fleet_arena` opens a gate it publishes a panel (the candidate vs the last N
+champions). The server hands each (opponent, seed, side) unit to a self-play box as
+a `match` job over `POST /next_game` (lc0-shaped; nets identified by sha256). The box
+fetches the two nets by content address (`GET /get_network?sha=`), plays the unit with
+the SAME search the arena uses (native C++ if built, else Python MCTS), and POSTs the
+outcome to `/match_result`. The arena tallies these and plays locally only the units no
+client supplied, so idle boxes share the gating cost instead of the trainer host
+carrying all of it.
 
-Heavy (torch + model + the native ext), so `fleet_client` imports this lazily and
-only when a match is actually open; a box without the deps stays self-play-only.
-It reuses the arena's game runner / net loader / pickers verbatim, so a client
-gate game is the same computation as a local one.
+This module is the in-process PLAYER only. `fleet_client` owns all the HTTP (it has the
+interface-bound opener + the heartbeat headers), so it fetches the nets and hands this
+runner the job dict plus the two already-fetched net files; the runner loads them and
+plays — it never talks to the network. It is heavy (torch + model + the native ext), so
+`fleet_client` imports it LAZILY and only when a gate is actually open; a box without the
+deps stays self-play-only. It reuses the arena's game runner / net loader / pickers
+verbatim, so a client gate game is the same computation as a local one.
 """
 from __future__ import annotations
 
 import itertools
-import json
 import logging
-import urllib.request
 from pathlib import Path
 
 from chessckers_engine import fleet_arena as arena
@@ -31,26 +30,15 @@ from chessckers_engine.variant_py import PyVariantClient
 log = logging.getLogger("chessckers_engine.fleet_match")
 
 
-def _get(url: str, timeout: float) -> bytes:
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return r.read()
-
-
-def _post(url: str, data: bytes, timeout: float) -> None:
-    req = urllib.request.Request(url, data=data, method="POST",
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        r.read()
-
-
 class MatchRunner:
-    """Holds the current gate's candidate picker plus a per-opponent picker cache, all
-    rebuilt when the server rotates to a new gate (match_id change). Opponents are fetched
-    lazily as `/next_game` hands them out, so a client only downloads the champions it's
-    actually asked to play. One instance per client process."""
+    """Plays gate games for one client process. Search pickers are cached by net content
+    sha (building a native net is expensive) and dropped when the server rotates to a new
+    gate (match_id change), so at most one gate's panel is ever resident. The client fetches
+    nets content-addressed and passes their file paths to `play`, so this runner is pure
+    compute — no HTTP, no knowledge of the wire. One instance per client process."""
 
-    def __init__(self, run_dir: Path, device: str = "cpu") -> None:
-        self.cache = run_dir / "_match"
+    def __init__(self, cache_dir: Path, device: str = "cpu") -> None:
+        self.cache = Path(cache_dir)
         self.cache.mkdir(parents=True, exist_ok=True)
         self.device = pick_device(device)
         self.client = PyVariantClient()
@@ -59,70 +47,41 @@ class MatchRunner:
         self.arch: dict | None = None
         self.params: dict | None = None
         self.max_plies = 200
-        self.cand_pick = None
-        self.opp_picks: dict = {}           # oppid -> picker (one per opponent we've been handed this gate)
+        self.picks: dict[str, object] = {}  # net sha -> search picker (rebuilt each gate)
 
-    def _picker(self, net, sims, c_puct, dir_alpha, dir_eps):
+    def _picker(self, net):
         if arena.NATIVE_OK:
-            return arena._native_picker(net, sims, c_puct, dir_alpha, dir_eps, self.counter)
-        return arena._model_picker(net, self.client, sims, c_puct, dir_alpha, dir_eps)
+            return arena._native_picker(net, self.params["sims"], self.params["c_puct"],
+                                        self.params["dir_alpha"], self.params["dir_eps"],
+                                        self.counter)
+        return arena._model_picker(net, self.client, self.params["sims"], self.params["c_puct"],
+                                   self.params["dir_alpha"], self.params["dir_eps"])
 
-    def _build_pick(self, url_path: str, fname: str, server: str, timeout: float):
-        """Download one gate net to `fname` and build its search picker (params/arch are
-        the open gate's, set by `_ensure_match`)."""
-        pt = self.cache / fname
-        pt.write_bytes(_get(f"{server}{url_path}", timeout))
-        net = arena._make_net(pt, self.arch, self.cache / (fname[:-3] + ".bin"), self.device)
-        return self._picker(net, self.params["sims"], self.params["c_puct"],
-                            self.params["dir_alpha"], self.params["dir_eps"])
-
-    def _ensure_match(self, server: str, mid: int, arch: dict, params: dict, timeout: float) -> None:
-        """On a new gate (match_id change): reset, download the candidate, drop stale files."""
-        if mid == self.mid:
-            return
-        self.arch = arch
-        self.params = params
-        self.max_plies = int(params["max_plies"])
-        self.cand_pick = None
-        self.opp_picks = {}
-        self.mid = mid
-        for p in self.cache.iterdir():            # prune the previous gate's files
-            if str(mid) not in p.name:
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
-        self.cand_pick = self._build_pick("/net/cand", f"cand-{mid}.pt", server, timeout)
-        log.info("loaded candidate for match %d (backend=%s)", mid,
-                 "native" if arena.NATIVE_OK else "python")
-
-    def _ensure_opp(self, server: str, oppid: str, timeout: float):
-        """Lazily download + build a gate opponent's picker (cached for this gate). Clients
-        only ever held best.pt before; serving every champion net is what lets an
-        older-champion ladder game be offloaded exactly like the vs-best gate."""
-        pick = self.opp_picks.get(oppid)
+    def _pick(self, sha: str, path: Path):
+        """Build (and cache, by content sha) the search picker for one net file. The native
+        net is held in memory after construction, so the picker stays valid even if the
+        backing file is later removed."""
+        pick = self.picks.get(sha)
         if pick is None:
-            pick = self._build_pick(f"/net/opp/{oppid}", f"opp-{self.mid}-{oppid}.pt", server, timeout)
-            self.opp_picks[oppid] = pick
-            log.info("loaded opponent %s for match %d", oppid, self.mid)
+            net = arena._make_net(Path(path), self.arch, self.cache / f"{sha}.bin", self.device)
+            pick = self._picker(net)
+            self.picks[sha] = pick
         return pick
 
-    def step(self, server: str, timeout: float) -> int:
-        """One assignment: GET /next_game; if a match is open, play its (opponent, seed,
-        side) unit and POST the outcome tagged with the opponent. Returns 1 if a gate game
-        was played, 0 for self-play (no match)."""
-        a = json.loads(_get(f"{server}/next_game", timeout))
-        if a.get("mode") != "match":
-            return 0
-        self._ensure_match(server, a["match_id"], a["arch"], a["params"], timeout)
-        oppid = a.get("opp") or "best"
-        opp_pick = self._ensure_opp(server, oppid, timeout)
-        cand_white = bool(a["cand_white"])
-        white_pick, black_pick = ((self.cand_pick, opp_pick) if cand_white
-                                  else (opp_pick, self.cand_pick))
-        outcome = arena._play_from(white_pick, black_pick, self.client, a["seed"], self.max_plies)
-        _post(f"{server}/match_result", json.dumps({
-            "match_id": a["match_id"], "seed": a["seed"], "opp": oppid,
-            "cand_white": cand_white, "outcome": outcome,
-        }).encode(), timeout)
-        return 1
+    def play(self, job: dict, cand_path: Path, opp_path: Path) -> str:
+        """Play one gate unit described by a `POST /next_game` match job, given the two
+        already-fetched (content-addressed) net files. Returns 'white' | 'black' | 'draw'
+        from the winner's perspective. On a new gate (match_id change) the per-net picker
+        cache is dropped first, so only the current gate's nets stay resident."""
+        if job["match_id"] != self.mid:
+            self.mid = job["match_id"]
+            self.picks = {}
+        self.cache.mkdir(parents=True, exist_ok=True)
+        self.arch = job["arch"]
+        self.params = job["params"]
+        self.max_plies = int(job["params"]["max_plies"])
+        cand_pick = self._pick(job["candidate_sha"], cand_path)
+        opp_pick = self._pick(job["opponent_sha"], opp_path)
+        white_pick, black_pick = ((cand_pick, opp_pick) if job["cand_white"]
+                                  else (opp_pick, cand_pick))
+        return arena._play_from(white_pick, black_pick, self.client, job["seed"], self.max_plies)

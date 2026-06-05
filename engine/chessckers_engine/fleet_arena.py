@@ -446,8 +446,8 @@ def main() -> int:
     stop_path = run_dir / "STOP"
     match_path = run_dir / "match.json"           # open-gate manifest the server hands to clients
     results_dir = run_dir / "match_results"       # client gate outcomes (server writes them here)
-    cand_served = run_dir / "cand.pt"             # candidate net the server serves as /net/cand
-    served_dir = run_dir / "match_nets"           # per-opponent gate nets the server serves at /net/opp/<id>
+    cand_served = run_dir / "cand.pt"             # candidate net (server serves it by sha via /get_network)
+    served_dir = run_dir / "match_nets"           # per-opponent gate nets (served by sha via /get_network)
     nets_dir.mkdir(parents=True, exist_ok=True)
     arena_dir.mkdir(parents=True, exist_ok=True)
     if match_path.exists():
