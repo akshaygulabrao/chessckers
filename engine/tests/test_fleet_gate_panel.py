@@ -1,14 +1,15 @@
 """Wire-contract tests for the distributed keep-best gate panel (the two lc0 caveats).
 
-Caveat 2 — the WHOLE opponent panel is fleet-offloadable, not just vs-best:
+Caveat 2 — the WHOLE opponent panel is played by the FLEET (the arena tallies, never plays a
+gate game), not just vs-best:
   - POST /next_game round-robins (opponent x seed x side) over the published panel as lc0
     `match` jobs (the legacy GET /next_game + /net/* serving were retired in Phase D; nets
     are fetched content-addressed via GET /get_network?sha=);
   - POST /match_result persists the opponent tag;
-  - fleet_arena._RemotePool buckets client outcomes by (opp, seed, side) and preserves
-    results for opponents the (sequential) arena hasn't reached yet.
+  - fleet_arena._GateCollector buckets client outcomes by (opp, seed, side) and the arena
+    waits on it until the fleet has played the whole panel — it plays no gate game itself.
 
-These exercise the server + the arena's pool with stdlib HTTP only — no torch, no nets,
+These exercise the server + the arena's collector with stdlib HTTP only — no torch, no nets,
 no self-play — so they're fast and deterministic. The actual game-playing path
 (fleet_match.MatchRunner) reuses the arena's runner and is covered by the engine's MCTS tests.
 """
@@ -126,12 +127,12 @@ def test_match_result_persists_opponent(server):
     assert len(list((rd / "match_results").glob("*.json"))) == 1
 
 
-# --- _RemotePool (the arena side) ----------------------------------------------
+# --- _GateCollector (the arena side) -------------------------------------------
 
-def test_remote_pool_buckets_by_opponent(tmp_path):
-    """The arena plays opponents SEQUENTIALLY while clients supply all of them at once, so
-    a drain triggered while consuming one opponent must not discard another's results."""
-    from chessckers_engine.fleet_arena import _RemotePool
+def test_gate_collector_buckets_by_opponent(tmp_path):
+    """Clients supply every opponent's games CONCURRENTLY, so one drain must bucket results by
+    (opp, seed, side) and never discard an opponent the scoring loop hasn't reached yet."""
+    from chessckers_engine.fleet_arena import _GateCollector
 
     rd = tmp_path / "match_results"
     rd.mkdir()
@@ -146,24 +147,40 @@ def test_remote_pool_buckets_by_opponent(tmp_path):
     write(1, "net-1", "s1", True, "black")   # different opponent, SAME seed+side
     write(2, "best", "s1", True, "draw")
 
-    pool = _RemotePool(rd, mid)
-    v_best, v_old = pool.view("best"), pool.view("net-1")
+    col = _GateCollector(rd, mid)
+    # One drain (via have) buckets all three: best has 2 at (s1,True), net-1 has 1.
+    assert col.have(["best", "net-1"], ["s1"], pairs=2) == 3   # min(2,2) + min(1,2)
 
-    # Consuming 'best' drains the whole dir (capturing net-1's result into the shared buf).
-    got = sorted(filter(None, [v_best.pop("s1", True), v_best.pop("s1", True)]))
-    assert got == ["draw", "white"]
-    assert v_best.pop("s1", True) is None            # best exhausted
-
-    # net-1's result survived the best-triggered drain — that's the shared-pool invariant.
-    assert v_old.pop("s1", True) == "black"
-    assert v_old.pop("s1", True) is None
-    assert pool.popped == 3                           # summed across views
+    best = col.collected_for("best", ["s1"])
+    old = col.collected_for("net-1", ["s1"])
+    assert sorted(best[("s1", True)]) == ["draw", "white"]
+    assert best[("s1", False)] == []                  # untouched side
+    assert old[("s1", True)] == ["black"]             # survived the shared drain
 
 
-def test_remote_pool_unsupplied_unit_returns_none(tmp_path):
-    from chessckers_engine.fleet_arena import _RemotePool
+def test_gate_collector_counts_completion_capped(tmp_path):
+    """have() caps each unit at `pairs` and reaches len(opps)*len(seeds)*2*pairs when complete."""
+    from chessckers_engine.fleet_arena import _GateCollector
+
     rd = tmp_path / "match_results"
     rd.mkdir()
-    pool = _RemotePool(rd, 1)
-    assert pool.view("best").pop("missing", True) is None
-    assert pool.popped == 0
+    mid = 9
+    col = _GateCollector(rd, mid)
+    assert col.have(["best"], ["s1"], pairs=2) == 0   # one opp, one seed, both sides => 4 to complete
+
+    def write(n, cw, outcome):
+        (rd / f"{mid}_{n}.json").write_text(json.dumps({
+            "opp": "best", "seed": "s1", "cand_white": cw, "outcome": outcome, "match_id": mid}))
+
+    write(0, True, "white"); write(1, True, "draw"); write(2, True, "black")  # 3 on White (caps at 2)
+    write(3, False, "white"); write(4, False, "black")                        # 2 on Black
+    assert col.have(["best"], ["s1"], pairs=2) == 4   # min(3,2) + min(2,2) = complete
+
+
+def test_gate_collector_empty_is_zero(tmp_path):
+    from chessckers_engine.fleet_arena import _GateCollector
+    rd = tmp_path / "match_results"
+    rd.mkdir()
+    col = _GateCollector(rd, 1)
+    assert col.have(["best"], ["missing"], pairs=2) == 0
+    assert col.collected_for("best", ["missing"]) == {("missing", True): [], ("missing", False): []}

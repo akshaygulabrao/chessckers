@@ -7,10 +7,14 @@ server versions on `best.pt`, so workers reload once per PROMOTION, not per
 iteration). It also archives every champion by timestamp and logs a per-side
 capacity signal, so we can read empirically when the network stops improving.
 
-Gate games run on the NATIVE C++ search (cpp.run_mcts_native) when the extension
-is present — ~5x faster than the Python MCTS, so a full gate is minutes not tens
-of minutes — falling back to the Python search otherwise. Progress is logged per
-label and per seed so the run is visibly working between gate boundaries.
+The promotion gate is played by the FLEET, lc0-style: the arena opens a gate
+(writes match.json) and the server round-robins the candidate-vs-panel games to
+the self-play clients, which POST each result back; the arena only TALLIES them. The
+trainer/server host never plays a gate game itself (mirrors lc0's server/client
+responsibility split). With no client connected a gate simply never completes —
+intentional; the local box always runs a loopback self-play client. The host's own
+native/Python search is used only for the cheap favored-side labelling pass and the
+on-promotion benches (vs-anchor capacity + the regression ladder).
 
 Imbalance-aware promotion rule
 ------------------------------
@@ -170,55 +174,24 @@ def _score(outcome: str, cand_is_white: bool) -> float:
     return 1.0 if cand_won else 0.0
 
 
-def _obtain(cand_pick, opp_pick, client, seed: str, cand_white: bool, max_plies: int,
-            remote) -> tuple[str, str]:
-    """One gate game's (outcome, source). source is 'client' if a self-play box
-    already played this unit and POSTed it (consumed from `remote`), else 'local'
-    (the arena plays it here). With `remote=None` it's always local — a gate with
-    no clients is identical to the old all-local gate."""
-    if remote is not None:
-        out = remote.pop(seed, cand_white)
-        if out is not None:
-            return out, "client"
-    white_pick, black_pick = (cand_pick, opp_pick) if cand_white else (opp_pick, cand_pick)
-    return _play_from(white_pick, black_pick, client, seed, max_plies), "local"
-
-
-def _gate(cand_pick, opp_pick, client, seeds: list[str], labels: dict[str, str],
-          pairs: int, max_plies: int, tag: str = "gate", remote=None,
-          log_games: bool = False) -> dict:
-    """Color-swapped seed-paired match: candidate vs opponent. Returns per-seed
-    pair-scores plus the imbalance-aware aggregate (balanced over favored-side
-    classes). Logs a line per seed so a long gate is visibly progressing; with
-    `log_games` it also logs each individual game's completion (g/total, outcome,
-    and whether the arena host or a self-play client computed it).
-
-    `remote` (optional): a source of client-played outcomes for this same match.
-    Each unit a client already supplied is consumed instead of played locally, so
-    the trainer host only plays the units the fleet didn't — the scoring math is
-    unchanged (still exactly 2*pairs games/seed)."""
+def _score_opp(collected: dict, seeds: list[str], labels: dict[str, str], pairs: int) -> dict:
+    """Imbalance-aware score of ONE opponent's color-swapped seed-paired games. `collected`
+    maps (seed, cand_white) -> list of outcomes ('white'|'black'|'draw'); the first `pairs`
+    per (seed, side) are scored (exactly 2*pairs games/seed). The single definition of the
+    promotion math, shared by the local benches (_gate) and the fleet-played panel gate."""
     per_seed: dict[str, float] = {}
-    rec = [0, 0, 0]  # candidate's aggregate [W, L, D] vs opponent across all gate games
-    total = len(seeds) * pairs * 2  # games in the whole gate (for the g/total progress)
-    g = 0
-    for si, seed in enumerate(seeds, 1):
+    rec = [0, 0, 0]  # candidate's aggregate [W, L, D] vs opponent across all games
+    for seed in seeds:
         pts = 0.0
         wld = [0, 0, 0]  # this seed's [W, L, D] from the candidate's perspective
-        for _ in range(pairs):
-            for cand_white in (True, False):
-                outcome, gsrc = _obtain(cand_pick, opp_pick, client, seed, cand_white, max_plies, remote)
+        for cand_white in (True, False):
+            for outcome in collected.get((seed, cand_white), [])[:pairs]:
                 s = _score(outcome, cand_white)
-                g += 1
                 pts += s
                 wld[0 if s == 1.0 else 1 if s == 0.0 else 2] += 1
-                if log_games:
-                    log.info("  [%s] game %d/%d %-16s cand=%s -> %-5s [%s]",
-                             tag, g, total, _seed_tag(seed), "W" if cand_white else "B", outcome, gsrc)
         per_seed[seed] = pts / (2 * pairs)
         for i in range(3):
             rec[i] += wld[i]
-        log.info("  [%s] seed %d/%d %-16s -> %.3f  (cand W%d L%d D%d of %d)",
-                 tag, si, len(seeds), _seed_tag(seed), per_seed[seed], wld[0], wld[1], wld[2], 2 * pairs)
 
     # Class scores: a 'balanced' seed counts toward BOTH classes.
     w_scores = [per_seed[s] for s in seeds if labels.get(s) in ("white", "balanced")]
@@ -237,21 +210,43 @@ def _gate(cand_pick, opp_pick, client, seeds: list[str], labels: dict[str, str],
     }
 
 
-class _RemotePool:
-    """Shared buffer of client-played outcomes for the WHOLE opponent panel of the open
-    gate (self-play clients POST each to the server, which writes it as a JSON file under
-    `match_results/`, tagged with its opponent). The arena plays the panel's opponents
-    SEQUENTIALLY, but clients contribute every opponent's games CONCURRENTLY (the server
-    round-robins opponent x seed x side). So a single shared drain keyed by (opp, seed,
-    side) is required: a per-opponent drain would discard results for opponents the arena
-    hasn't reached yet. `view(opp)` hands each opponent's `_gate` a `.pop(seed, cand_white)`
-    over its own slice, so `_gate` is unchanged from the single-opponent days."""
+def _gate(cand_pick, opp_pick, client, seeds: list[str], labels: dict[str, str],
+          pairs: int, max_plies: int, tag: str = "gate") -> dict:
+    """Color-swapped seed-paired match played LOCALLY on this host. Used ONLY for the
+    on-promotion benches (vs-anchor capacity + the regression ladder) — NOT the promotion
+    gate, which the fleet plays and the arena merely tallies (see _GateCollector). Logs a
+    line per seed so a bench is visibly progressing; returns the imbalance-aware score."""
+    collected: dict[tuple[str, bool], list[str]] = {}
+    for si, seed in enumerate(seeds, 1):
+        pts = 0.0
+        wld = [0, 0, 0]  # this seed's [W, L, D] from the candidate's perspective
+        for _ in range(pairs):
+            for cand_white in (True, False):
+                wp, bp = (cand_pick, opp_pick) if cand_white else (opp_pick, cand_pick)
+                outcome = _play_from(wp, bp, client, seed, max_plies)
+                collected.setdefault((seed, cand_white), []).append(outcome)
+                s = _score(outcome, cand_white)
+                pts += s
+                wld[0 if s == 1.0 else 1 if s == 0.0 else 2] += 1
+        log.info("  [%s] seed %d/%d %-16s -> %.3f  (cand W%d L%d D%d of %d)",
+                 tag, si, len(seeds), _seed_tag(seed), pts / (2 * pairs), wld[0], wld[1], wld[2], 2 * pairs)
+    return _score_opp(collected, seeds, labels, pairs)
+
+
+class _GateCollector:
+    """Tally of FLEET-played gate outcomes for the open gate. Self-play clients POST each
+    result to the server, which writes it as match_results/<match_id>_<n>.json tagged with
+    its opponent; this drains those files into an in-memory bucket keyed by (opponent, seed,
+    cand_white). The arena plays NONE of the gate (lc0: the trainer/server host dispatches +
+    tallies; the clients play every game) — it just waits here until every panel unit has
+    --pairs results. One shared bucket is required because clients contribute every opponent's
+    games CONCURRENTLY (the server round-robins opponent x seed x side), so a drain must never
+    discard a result for an opponent the scoring loop hasn't reached yet."""
 
     def __init__(self, results_dir: Path, match_id: int) -> None:
         self._dir = results_dir
         self._mid = match_id
         self._buf: dict[tuple[str, str, bool], list[str]] = {}
-        self.views: dict[str, "_RemoteView"] = {}
 
     def _drain(self) -> None:
         for p in sorted(self._dir.glob(f"{self._mid}_*.json")):
@@ -267,39 +262,19 @@ class _RemotePool:
             except OSError:
                 pass
 
-    def _pop(self, opp: str, seed: str, cand_white: bool):
-        key = (opp, seed, bool(cand_white))
-        if not self._buf.get(key):
-            self._drain()
-        lst = self._buf.get(key)
-        return lst.pop() if lst else None
+    def have(self, opps: list[str], seeds: list[str], pairs: int) -> int:
+        """Drain pending results, then count how many of the panel's units are satisfied
+        (each unit counts up to `pairs`). == len(opps)*len(seeds)*2*pairs once the gate is
+        complete; the gate loop polls this until it reaches that total."""
+        self._drain()
+        return sum(min(len(self._buf.get((o, s, cw), [])), pairs)
+                   for o in opps for s in seeds for cw in (True, False))
 
-    def view(self, opp: str) -> "_RemoteView":
-        v = self.views.get(opp)
-        if v is None:
-            v = _RemoteView(self, opp)
-            self.views[opp] = v
-        return v
-
-    @property
-    def popped(self) -> int:
-        return sum(v.popped for v in self.views.values())
-
-
-class _RemoteView:
-    """One opponent's window onto the shared `_RemotePool`: `_gate` calls `.pop(seed,
-    cand_white)` and reads `.popped` exactly as it did the old per-gate `_RemoteGate`."""
-
-    def __init__(self, pool: _RemotePool, opp: str) -> None:
-        self._pool = pool
-        self._opp = opp
-        self.popped = 0
-
-    def pop(self, seed: str, cand_white: bool):
-        out = self._pool._pop(self._opp, seed, cand_white)
-        if out is not None:
-            self.popped += 1
-        return out
+    def collected_for(self, opp: str, seeds: list[str]) -> dict:
+        """One opponent's outcomes as {(seed, cand_white): [outcomes]} — the shape
+        _score_opp consumes (it scores the first `pairs` per side)."""
+        return {(s, cw): self._buf.get((opp, s, cw), [])
+                for s in seeds for cw in (True, False)}
 
 
 def _elo_delta(score: float, cap: float = 400.0) -> float:
@@ -526,62 +501,74 @@ def main() -> int:
         labels = _label_seeds(_picker(best_net), rand_pick, client, seeds, args.max_plies)
         glyph = {"white": "W", "black": "B", "balanced": "~"}
         # Opponent panel: the last --gate-opponents champions, newest first. panel[0] is the
-        # current best (reuse best_net); the rest are older champions from nets/ (fewer than N
-        # early in a run). Promotion needs the full bar vs the immediate best AND no regression
-        # (>= --no-regress) vs each older champion — the regression ladder folded into the gate,
-        # so strength can't cycle backwards. EVERY opponent's games are fleet-offloadable: we
-        # serve the candidate + each champion net (lc0 ships both shas to its clients), so a
-        # gate against an older champion distributes exactly like the vs-best gate.
+        # current best; the rest are older champions from nets/ (fewer than N early in a run).
+        # Promotion needs the full bar vs the immediate best AND no regression (>= --no-regress)
+        # vs each older champion — the regression ladder folded into the gate, so strength can't
+        # cycle backwards. The arena does NOT play the panel: it serves the candidate + every
+        # champion net (clients fetch both by sha via /get_network) and the FLEET plays every
+        # opponent's games, so the panel is just (id, file) to serve — no net is loaded here.
         champ_paths = list(reversed(sorted(nets_dir.glob("net-*.pt"), key=_net_ts)))  # newest first
-        panel = [("best", best_path, best_net)]
-        for oi, cp in enumerate(champ_paths[1:args.gate_opponents], start=1):
-            panel.append((cp.stem, cp, _make_net(cp, arch, arena_dir / f"opp{oi}.bin", device)))
+        panel = [("best", best_path)] + [(cp.stem, cp) for cp in champ_paths[1:args.gate_opponents]]
+        panel_oppids = [oppid for oppid, _src in panel]
         per_opp = len(seeds) * args.pairs * 2
-        log.info("GATE START %s vs last %d champion(s) | favored: %s | %d x %d games = %d total (clients contribute every opponent's games)",
+        need = len(panel) * per_opp
+        log.info("GATE START %s vs last %d champion(s) | favored: %s | %d x %d games = %d total (the fleet plays them; the arena tallies)",
                  cand_path.name, len(panel),
                  ", ".join(f"{_seed_tag(s)}={glyph[labels[s]]}" for s in seeds),
-                 len(panel), per_opp, len(panel) * per_opp)
+                 len(panel), per_opp, need)
 
-        # Publish ONE gate covering the whole panel: clear stale results, copy the candidate
-        # and every opponent net to the served paths, write the manifest (the opponent ids,
-        # newest first — index 0 is the primary vs-best). The arena plays whatever unit no
-        # client supplied, so with no clients this is identical to a local gate.
+        # Open ONE gate covering the whole panel: clear stale results, serve the candidate and
+        # every opponent net, write the manifest (opponent ids newest-first — index 0 is the
+        # primary vs-best). The server then round-robins (opponent x seed x side) as `match`
+        # jobs to every client; the arena waits below until the fleet has played the whole panel.
         match_id = int(time.time())
         for d in (results_dir, served_dir):
             if d.exists():
                 shutil.rmtree(d, ignore_errors=True)
             d.mkdir(parents=True, exist_ok=True)
         _atomic_copy(cand_path, cand_served)
-        for oppid, src, _net in panel:
+        for oppid, src in panel:
             _atomic_copy(src, served_dir / f"{oppid}.pt")
         _write_json(match_path, {
             "match_id": match_id,
             "seeds": seeds,
             "arch": arch,
-            "opponents": [oppid for oppid, _src, _net in panel],
+            "opponents": panel_oppids,
             "params": {"sims": args.sims, "c_puct": args.c_puct,
                        "dir_alpha": args.dirichlet_alpha, "dir_eps": args.dirichlet_eps,
                        "max_plies": args.max_plies},
         })
-        pool = _RemotePool(results_dir, match_id)
 
-        opp_results = []
-        for oi, (oppid, _src, onet) in enumerate(panel):
-            tag = "gate" if oi == 0 else f"gate-prev{oi}"
-            r = _gate(_picker(cand_net), _picker(onet), client, seeds, labels,
-                      args.pairs, args.max_plies, tag=tag, remote=pool.view(oppid), log_games=True)
-            opp_results.append((oppid, r))
-            log.info("  panel %d/%d vs %-14s -> balanced=%.3f min_class=%.3f (cand W%d-L%d-D%d; %d/%d offloaded)",
-                     oi + 1, len(panel), oppid, r["balanced_score"], r["min_class"],
-                     r["record"]["w"], r["record"]["l"], r["record"]["d"],
-                     pool.view(oppid).popped, per_opp)
-
+        # Wait for the FLEET to play the whole panel — the arena plays NO gate game (lc0: the
+        # server host dispatches + tallies). Drain client results until every (opponent, seed,
+        # side) has --pairs games; STOP abandons the open gate. With no client connected this
+        # never completes (intentional — the local box always runs a loopback self-play client).
+        collector = _GateCollector(results_dir, match_id)
+        last_progress = 0.0
+        while not stop_path.exists():
+            have = collector.have(panel_oppids, seeds, args.pairs)
+            if have >= need:
+                break
+            now = time.time()
+            if now - last_progress >= 30.0:
+                log.info("  GATE %s: %d/%d fleet results in — waiting...", cand_path.name, have, need)
+                last_progress = now
+            time.sleep(min(args.gate_seconds, 5.0))
         try:
             match_path.unlink()                         # close the gate: clients fall back to self-play
         except OSError:
             pass
-        if pool.popped:
-            log.info("  %d/%d panel gate games contributed by clients", pool.popped, len(panel) * per_opp)
+        if stop_path.exists():
+            break                                       # STOP during the gate — abandon this candidate
+
+        opp_results = []
+        for oi, oppid in enumerate(panel_oppids):
+            r = _score_opp(collector.collected_for(oppid, seeds), seeds, labels, args.pairs)
+            opp_results.append((oppid, r))
+            log.info("  panel %d/%d vs %-14s -> balanced=%.3f min_class=%.3f (cand W%d-L%d-D%d of %d)",
+                     oi + 1, len(panel), oppid, r["balanced_score"], r["min_class"],
+                     r["record"]["w"], r["record"]["l"], r["record"]["d"], per_opp)
+        log.info("  gate complete: %d fleet games tallied across %d opponent(s)", need, len(panel))
 
         res = opp_results[0][1]                         # vs immediate best — drives elo + the promote bar
         primary_ok = res["balanced_score"] >= args.threshold and res["min_class"] >= args.side_floor
