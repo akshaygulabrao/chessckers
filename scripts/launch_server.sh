@@ -69,7 +69,7 @@ pids=()
   --run-dir "$RUN" --no-prime \
   --buffer-cap 300000 --min-buffer 2000 --replay-factor 8 --batch-size 256 \
   --per-game-keep "$PER_GAME_KEEP" \
-  --publish-seconds 45 --ckpt-seconds 120 \
+  --publish-seconds 45 --ckpt-seconds 1800 \
   --d-hidden $FLEET_DH --c-filters $FLEET_CF --n-blocks $FLEET_NB --seed 1000 \
   >"$TLOG" 2>&1 &
 pids+=($!); say "trainer  pid $!  -> $TLOG  (per-game-keep=$PER_GAME_KEEP)"
