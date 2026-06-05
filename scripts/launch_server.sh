@@ -43,6 +43,7 @@ if [ -n "${FRESH:-}" ]; then
   rm -rf "$RUN"
 fi
 mkdir -p "$RUN/buffer"
+rm -f "$RUN/STOP" 2>/dev/null || true   # clear a stale STOP (interrupted stop_local.sh), else the arena exits at startup
 
 say "seed mix: $(grep -cvE '^[[:space:]]*(#|$)' "$SEED_MIX") positions from $SEED_MIX"
 
