@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -29,13 +30,6 @@ log = logging.getLogger("chessckers_engine.selfplay_worker_async")
 
 def _stop_requested(stop_path: Path | None) -> bool:
     return stop_path is not None and stop_path.exists()
-
-
-def _pause_requested(pause_path: Path | None) -> bool:
-    """True while a PAUSE sentinel is present. fleet_client touches run_dir/PAUSE
-    while it plays a keep-best gate game on this box, so the workers it owns idle at
-    the next game boundary instead of contending for CPU; cleared when the gate closes."""
-    return pause_path is not None and pause_path.exists()
 
 
 # Self-play knobs that may be live-overridden mid-run via run_dir/selfplay.json
@@ -148,9 +142,6 @@ def play_forever(payload: dict) -> int:
     if "pin_cpu" in payload and payload["pin_cpu"] is not None:
         _pin_to_cpu(int(payload["pin_cpu"]))
     stop_path = Path(payload["stop_path"]) if payload.get("stop_path") else None
-    # PAUSE shares run_dir with STOP (derived, not plumbed through the payload): fleet_client
-    # touches it to idle these workers while it plays a gate game on the same box.
-    pause_path = stop_path.with_name("PAUSE") if stop_path is not None else None
     buffer = ReplayBuffer(payload["buffer_root"])
     max_games = payload.get("max_games")
     max_plies = int(payload.get("max_plies", 400))
@@ -232,13 +223,6 @@ def play_forever(payload: dict) -> int:
     try:
         while not _stop_requested(stop_path):
             if max_games is not None and games_played >= int(max_games):
-                break
-
-            # Gate pause: idle at the game boundary while PAUSE is present (fleet_client is
-            # playing a gate game on this box). STOP still wins, so a paused worker exits cleanly.
-            while _pause_requested(pause_path) and not _stop_requested(stop_path):
-                time.sleep(0.5)
-            if _stop_requested(stop_path):
                 break
 
             # Per-worker mode: refresh local model from weights file when newer.
@@ -324,3 +308,232 @@ def play_forever(payload: dict) -> int:
             except Exception:
                 pass
     return games_played
+
+
+def _claim_job(jobs_dir: Path, worker_id: int) -> tuple | None:
+    """Atomically claim one queued job for this worker (the lc0 client-drives-each-game model).
+
+    fleet_client mints jobs as `<seq>.json` in run_dir/jobs/ (one per POST /next_game). A worker
+    claims one by renaming it to `<seq>.json.c<wid>` — POSIX rename is atomic, so of N workers
+    racing for the same file exactly one wins and the losers fall through to the next candidate.
+    (Claimed files end in `.c<wid>`, not `.json`, so they drop out of the unclaimed glob the
+    client tops up against.) Returns (seq, claimed_path, job_dict), or None when nothing is
+    claimable right now. A malformed file is claimed-then-dropped so it can't wedge the queue."""
+    try:
+        candidates = sorted(jobs_dir.glob("*.json"))
+    except OSError:
+        return None
+    for src in candidates:
+        dst = src.with_name(src.name + f".c{worker_id}")
+        try:
+            os.rename(src, dst)            # atomic; the losing races get FileNotFoundError
+        except OSError:
+            continue                        # another worker took it (or it vanished) — next one
+        try:
+            job = json.loads(dst.read_text())
+        except (OSError, ValueError):
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+            continue
+        return src.stem, dst, job
+    return None
+
+
+def play_jobs_forever(payload: dict) -> int:
+    """Job-driven self-play / gate executor — the lc0 *client-drives-each-game* model.
+
+    Replaces the autonomous `play_forever` loop for FLEET workers: instead of self-playing
+    continuously, the worker claims ONE server-assigned job at a time from run_dir/jobs/
+    (minted by fleet_client via POST /next_game) and plays exactly that —
+      • train -> one self-play game with the job's params, appended to buffer/ (the client
+                 uploads it via /upload_game, exactly as the autonomous path did);
+      • match -> one keep-best gate game between the two nets the client already fetched by
+                 content address (paths carried in the job), the outcome written to
+                 run_dir/match_out/ for the client to POST to /match_result.
+    Per-worker inference only (a job-driven worker holds its own model + optional native search).
+    The net setup + hot-reload below MIRRORS play_forever's per-worker branch — keep the two in
+    sync (the native .bin export is training-critical). Returns the count of self-play games."""
+    import torch as _torch
+
+    from chessckers_engine import heartbeat as _hb
+    from chessckers_engine.checkpoints import load_checkpoint
+    from chessckers_engine.inference_server import InferenceServer as _IS
+    from chessckers_engine.model import ChesskersScorer as _Scorer
+    from chessckers_engine.replay_buffer import ReplayBuffer
+    from chessckers_engine.selfplay_az import az_game_to_examples, play_az_game
+    from chessckers_engine.variant_py import PyVariantClient as _PVC
+
+    worker_id = int(payload["worker_id"])
+    if payload.get("pin_cpu") is not None:
+        _pin_to_cpu(int(payload["pin_cpu"]))
+    stop_path = Path(payload["stop_path"]) if payload.get("stop_path") else None
+    buffer = ReplayBuffer(payload["buffer_root"])
+    run_dir = Path(payload["buffer_root"]).parent
+    jobs_dir = run_dir / "jobs"
+    match_out = run_dir / "match_out"
+    gate_dir = run_dir / "_gate"
+    machine = str(payload.get("machine", "unknown"))
+    max_plies_default = int(payload.get("max_plies", 400))
+    incarnation_id = time.time()
+
+    # ---- per-worker inference net (mirror of play_forever's per-worker branch; keep in sync) ----
+    weights_path = Path(payload["weights_path"])
+    poll_s = float(payload.get("weights_poll_seconds", 2.0))
+    device = _torch.device(payload["device"])
+    model = _Scorer(**payload["model_arch"]).to(device).eval()
+    use_native = bool(payload.get("use_native", False))
+    native_search = None
+    net_box = [None]
+    native_bin = None
+    if use_native:
+        import chessckers_cpp  # noqa: F401 — fail fast if the ext is missing
+        from chessckers_engine.native_search import make_native_search_fn
+        native_bin = run_dir / f"native_{worker_id}.bin"
+        native_search = make_native_search_fn(net_box)
+    use_in_proc_server = int(payload["mcts_batch_size"]) > 1 and not use_native
+    server = _IS(model, max_batch_size=int(payload["mcts_batch_size"])) if use_in_proc_server else None
+    evaluator = server if server is not None else model
+    last_mtime = -1.0
+    loaded = False
+
+    client = _PVC()
+    rng = _torch.Generator().manual_seed(int(payload["seed"]))
+    match_runner = None  # lazily built on the first match job (heavy: torch + the native ext)
+    games_played = 0
+
+    try:
+        _hb.write(run_dir, machine=machine, worker_id=worker_id, role="worker",
+                  games_played=0, incarnation_id=incarnation_id)
+    except OSError as e:
+        log.warning("worker %d initial heartbeat failed: %s", worker_id, e)
+
+    # Never play on a random-init net: wait for the client's first weights.pt.
+    while not weights_path.exists():
+        if _stop_requested(stop_path):
+            return 0
+        time.sleep(poll_s)
+
+    try:
+        while not _stop_requested(stop_path):
+            # Hot-reload the net when the client syncs a fresher weights.pt (mtime poll). Same
+            # native re-export as play_forever; a mid-write reload just skips this tick.
+            try:
+                cur_mtime = weights_path.stat().st_mtime
+            except FileNotFoundError:
+                time.sleep(poll_s)
+                continue
+            if cur_mtime > last_mtime:
+                try:
+                    load_checkpoint(model, weights_path)
+                    model.eval()
+                    if use_native:
+                        import chessckers_cpp
+                        from chessckers_engine.native_net import export_state_dict
+                        _tmp = str(native_bin) + ".tmp"
+                        export_state_dict(model.state_dict(), _tmp)
+                        Path(_tmp).replace(native_bin)
+                        net_box[0] = chessckers_cpp.ChesskersNet(str(native_bin))
+                    last_mtime = cur_mtime
+                    loaded = True
+                except (EOFError, RuntimeError, OSError) as e:
+                    log.debug("worker %d weight reload failed: %s", worker_id, e)
+                    time.sleep(poll_s)
+                    continue
+            if not loaded:
+                time.sleep(poll_s)
+                continue
+
+            claim = _claim_job(jobs_dir, worker_id)
+            if claim is None:
+                time.sleep(0.2)   # queue empty — the client mints more on its poll tick
+                continue
+            seq, claimed_path, job = claim
+            jtype = job.get("type", "train")
+            try:
+                if jtype == "match":
+                    if match_runner is None:
+                        from chessckers_engine.fleet_match import MatchRunner
+                        match_runner = MatchRunner(gate_dir, device=payload["device"])
+                    outcome = match_runner.play(job, Path(job["cand_path"]), Path(job["opp_path"]))
+                    match_out.mkdir(parents=True, exist_ok=True)
+                    _tmp = match_out / f"{seq}.json.tmp"
+                    _tmp.write_text(json.dumps({
+                        "match_id": job["match_id"], "seed": job["seed"],
+                        "opp": job["opponent"], "cand_white": job["cand_white"],
+                        "outcome": outcome,
+                    }))
+                    _tmp.replace(match_out / f"{seq}.json")  # atomic: the client never reads a half-file
+                    log.info("worker %d gate game: match %s opp=%s cand_white=%s -> %s",
+                             worker_id, job["match_id"], job["opponent"], job["cand_white"], outcome)
+                else:  # train (default)
+                    ov = job.get("params") or {}
+                    games_played += 1
+                    game = play_az_game(
+                        evaluator, client,
+                        n_sims=int(ov.get("sims", payload["n_sims"])),
+                        c_puct=float(ov.get("c_puct", payload["c_puct"])),
+                        temperature=float(ov.get("temperature", payload["temperature"])),
+                        max_plies=int(ov.get("max_plies", max_plies_default)),
+                        rng=rng,
+                        dirichlet_alpha=ov.get("dirichlet_alpha", payload.get("dirichlet_alpha")),
+                        dirichlet_eps=float(ov.get("dirichlet_eps", payload.get("dirichlet_eps", 0.25))),
+                        vloss_batch=int(payload.get("vloss_batch", 1)),
+                        search_fn=native_search,
+                        resign_threshold=float(payload.get("resign_threshold", 0.0)),
+                        resign_no_resign_frac=float(payload.get("resign_no_resign_frac", 0.1)),
+                        resign_consecutive=int(payload.get("resign_consecutive", 2)),
+                        resign_min_ply=int(payload.get("resign_min_ply", 8)),
+                    )
+                    examples = az_game_to_examples(game)
+                    _game_path = buffer.append_game(
+                        worker_id=worker_id, game_id=games_played, examples=examples)
+                    try:
+                        Path(str(_game_path) + ".meta").write_text(json.dumps({
+                            "worker_id": worker_id, "machine": machine,
+                            "outcome": game.outcome, "plies": len(game.records),
+                            "seed_fen": game.records[0].fen if game.records else None,
+                        }))
+                    except (OSError, AttributeError, TypeError):
+                        pass
+            except Exception as e:  # noqa: BLE001 — one bad job must never kill the worker
+                log.warning("worker %d job %s (%s) failed: %r", worker_id, seq, jtype, e)
+            finally:
+                try:
+                    claimed_path.unlink()  # release the slot so the client mints the next job
+                except OSError:
+                    pass
+            try:
+                _hb.write(run_dir, machine=machine, worker_id=worker_id, role="worker",
+                          games_played=games_played, incarnation_id=incarnation_id)
+            except OSError as e:
+                log.debug("worker %d heartbeat write failed: %s", worker_id, e)
+    finally:
+        client.close()
+        if server is not None:
+            server.shutdown()
+    return games_played
+
+
+def play_jobs_forever_subprocess(payload: dict) -> None:
+    """Subprocess entry point for the job-driven executor — same os._exit hard-exit rationale as
+    play_forever_subprocess (skip interpreter shutdown so a lingering thread can't wedge join)."""
+    import os as _os
+    import sys as _sys
+    rc = 0
+    try:
+        play_jobs_forever(payload)
+    except SystemExit as e:
+        rc = int(e.code or 0)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        rc = 1
+    finally:
+        try:
+            _sys.stdout.flush()
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        _os._exit(rc)

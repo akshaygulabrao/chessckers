@@ -15,11 +15,12 @@ Phase C (gzipped-chunk records + client upload migration):
   - fleet_client._build_multipart  ↔ fleet_server._parse_multipart  agree on the wire
   - fleet_client._upload_games     posts each game to /upload_game (multipart), not /game
 
-Phase D (gate assignment folded into the client; the legacy GET /next_game + /net/* serving
-were RETIRED — POST /next_game is now the sole assignment path):
-  - fleet_client._play_gate_job    plays one `match` job: fetch cand+opp nets by sha
-    (/get_network), play (lazy MatchRunner — stubbed here), POST /match_result
-  - run-dir/PAUSE                  sentinel the client touches so its owned workers idle mid-gate
+Phase E (client-drives-each-game: the client mints jobs, the workers claim + play — there is
+no autonomous self-play and no in-client gate play / PAUSE; both were RETIRED):
+  - fleet_client._mint_jobs            tops up run-dir/jobs/ via POST /next_game — a train job
+    verbatim; a match job with the two nets pre-fetched by sha (/get_network) + their paths added
+  - fleet_client._ship_match_results   POSTs each worker-written gate outcome to /match_result
+  - selfplay_worker_async._claim_job   the worker's atomic (rename) claim of one queued job
 
 and assert the LEGACY self-play endpoints (POST /game, GET /version) still work — the lc0 mirror
 must not break the existing fleet_client self-play path. Stdlib HTTP only: fast, no torch/nets.
@@ -29,11 +30,11 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
-import sys
 import threading
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -317,87 +318,101 @@ def test_client_uploads_via_multipart_endpoint(server, tmp_path):
     assert not (buf / (name + ".meta")).exists()
 
 
-# --- Phase D: client plays gate jobs over POST /next_game ----------------------
+# --- Phase E: client mints jobs + ships gate results; the worker claims --------
 
-def test_client_plays_gate_job_over_post(server, tmp_path, monkeypatch):
-    """fleet_client._play_gate_job: given an open gate's `match` job, the client fetches the
-    candidate + opponent nets by content address (/get_network?sha=) and POSTs /match_result.
-    The heavy player is stubbed so the wire test stays torch-free; we assert it received the
-    right nets (content-addressed, cached on disk) and that the outcome landed for the arena."""
-    import types
+def test_client_mints_train_jobs(server, tmp_path):
+    """With no gate open, _mint_jobs tops up run-dir/jobs/ to --queue-depth with `train` jobs,
+    each carrying the server's self-play params (the lc0 next_game loop, train side)."""
+    base, rd = server
+    (rd / "weights.pt").write_bytes(b"W")
+    (rd / "selfplay.json").write_text(json.dumps({"sims": 7, "c_puct": 1.5}))
+    jobs = tmp_path / "jobs"
 
+    nxt = fleet_client._mint_jobs(base, jobs, tmp_path / "_gate", 3, 0, True, 5, {})
+    files = sorted(jobs.glob("*.json"))
+    assert len(files) == 3 and nxt == 3            # filled exactly to depth, seq advanced
+    job = json.loads(files[0].read_text())
+    assert job["type"] == "train" and job["params"]["sims"] == 7
+
+    # already at depth -> a second call is a no-op (no extra files, seq unchanged)
+    assert fleet_client._mint_jobs(base, jobs, tmp_path / "_gate", 3, nxt, True, 5, {}) == nxt
+    assert len(list(jobs.glob("*.json"))) == 3
+
+
+def test_client_mints_match_jobs_with_fetched_nets(server, tmp_path):
+    """With a gate open, _mint_jobs fetches the candidate + opponent nets by content address
+    and queues a `match` job with their LOCAL paths added, so the worker plays it offline."""
     base, rd = server
     (rd / "cand.pt").write_bytes(b"CANDNET")
     (rd / "best.pt").write_bytes(b"BESTNET")
     (rd / "match.json").write_text(json.dumps({
         "match_id": 11, "seeds": ["fenX"], "opponents": ["best"],
-        "arch": {"d_hidden": 8}, "params": {"sims": 1, "c_puct": 1.5,
-                                            "dir_alpha": 0.5, "dir_eps": 0.15, "max_plies": 10},
+        "arch": {"d_hidden": 8}, "params": {"sims": 1, "max_plies": 10},
     }))
+    jobs = tmp_path / "jobs"
+    gate = tmp_path / "_gate"
 
-    # the match job the client would receive from POST /next_game (nets identified by sha)
-    _, body = _post(f"{base}/next_game", b"")
-    job = json.loads(body)
-    assert job["type"] == "match" and job["candidate_sha"] and job["opponent_sha"]
-
-    # stub the heavy player (no torch); capture the nets it's handed
-    seen = {}
-
-    class _FakeRunner:
-        def __init__(self, cache_dir, device="cpu"):
-            seen["device"] = device
-
-        def play(self, j, cand_path, opp_path):
-            seen["job_mid"] = j["match_id"]
-            seen["cand"] = cand_path.read_bytes()
-            seen["opp"] = opp_path.read_bytes()
-            return "white"
-
-    fake = types.ModuleType("chessckers_engine.fleet_match")
-    fake.MatchRunner = _FakeRunner
-    monkeypatch.setitem(sys.modules, "chessckers_engine.fleet_match", fake)
-
-    gate_dir = tmp_path / "_gate"
-    runner, disabled = fleet_client._play_gate_job(base, job, gate_dir, None, "cpu", 5)
-    assert disabled is False and runner is not None
-
-    # fetched the right nets by content address, and cached them sha-named on disk
-    assert seen["cand"] == b"CANDNET" and seen["opp"] == b"BESTNET" and seen["job_mid"] == 11
-    assert (gate_dir / f"{job['candidate_sha']}.pt").read_bytes() == b"CANDNET"
-    # the outcome landed (tagged with the opponent) for the arena to tally
-    files = list((rd / "match_results").glob("11_*.json"))
-    assert len(files) == 1
-    rec = json.loads(files[0].read_text())
-    assert rec["outcome"] == "white" and rec["match_id"] == 11 and rec["opp"] == job["opponent"]
+    fleet_client._mint_jobs(base, jobs, gate, 2, 0, True, 5, {})
+    job = json.loads(sorted(jobs.glob("*.json"))[0].read_text())
+    assert job["type"] == "match" and job["match_id"] == 11
+    # nets fetched content-addressed into the gate cache; the worker reads them from these paths
+    assert Path(job["cand_path"]).read_bytes() == b"CANDNET"
+    assert Path(job["opp_path"]).read_bytes() == b"BESTNET"
+    assert Path(job["cand_path"]).parent == gate
 
 
-def test_play_gate_job_disables_when_engine_missing(server, tmp_path, monkeypatch):
-    """A box without torch/the native ext disables gating (returns disabled=True) instead of
-    crashing, so a bare volunteer stays self-play-only — the lazy-import guard."""
+def test_client_declines_match_when_cannot_play(server, tmp_path):
+    """A self-play-only box (can_match False) leaves an open gate to the arena / per-worker
+    boxes: it queues NO match jobs and advances no sequence."""
     base, rd = server
     (rd / "cand.pt").write_bytes(b"C")
     (rd / "best.pt").write_bytes(b"B")
     (rd / "match.json").write_text(json.dumps({
-        "match_id": 1, "seeds": ["s"], "opponents": ["best"], "arch": {},
-        "params": {"sims": 1, "c_puct": 1.5, "dir_alpha": 0.5, "dir_eps": 0.15, "max_plies": 5},
+        "match_id": 1, "seeds": ["s"], "opponents": ["best"], "arch": {}, "params": {"sims": 1},
     }))
-    _, body = _post(f"{base}/next_game", b"")
-    job = json.loads(body)
-
-    # a None entry in sys.modules makes `from ... import MatchRunner` raise ImportError
-    monkeypatch.setitem(sys.modules, "chessckers_engine.fleet_match", None)
-    runner, disabled = fleet_client._play_gate_job(base, job, tmp_path / "_gate", None, "cpu", 5)
-    assert runner is None and disabled is True
+    jobs = tmp_path / "jobs"
+    nxt = fleet_client._mint_jobs(base, jobs, tmp_path / "_gate", 4, 0, False, 5, {})
+    assert nxt == 0 and not list(jobs.glob("*.json"))
 
 
-def test_worker_pause_sentinel_semantics(tmp_path):
-    """The self-play worker idles while run-dir/PAUSE exists (the client's gate-pause). PAUSE is
-    derived from the STOP path the worker already receives, so it sits in the same run-dir."""
-    from chessckers_engine.selfplay_worker_async import _pause_requested
-    pause = tmp_path / "PAUSE"
-    assert _pause_requested(None) is False
-    assert _pause_requested(pause) is False
-    pause.touch()
-    assert _pause_requested(pause) is True
-    # contract: the client touches run-dir/PAUSE; the worker derives it as stop_path.with_name("PAUSE")
-    assert (tmp_path / "STOP").with_name("PAUSE") == pause
+def test_client_ships_match_results(server, tmp_path):
+    """_ship_match_results POSTs each worker-written gate outcome to /match_result and drops it
+    locally; the result lands in the arena's match_results/ for tallying."""
+    base, rd = server
+    (rd / "match.json").write_text(json.dumps({
+        "match_id": 7, "seeds": ["s"], "opponents": ["best", "net-1"],
+        "arch": {}, "params": {"sims": 1},
+    }))
+    mo = tmp_path / "match_out"
+    mo.mkdir()
+    (mo / "0.json").write_text(json.dumps({
+        "match_id": 7, "seed": "s", "opp": "net-1", "cand_white": True, "outcome": "white"}))
+
+    n = fleet_client._ship_match_results(base, mo, 5)
+    assert n == 1 and not list(mo.glob("*.json"))          # shipped + consumed locally
+    files = list((rd / "match_results").glob("7_*.json"))
+    assert len(files) == 1
+    rec = json.loads(files[0].read_text())
+    assert rec["outcome"] == "white" and rec["opp"] == "net-1" and rec["match_id"] == 7
+
+
+# --- the worker's atomic job claim (no torch) ----------------------------------
+
+def test_worker_claim_job_atomic(tmp_path):
+    """selfplay_worker_async._claim_job claims one queued job by atomic rename (so N racing
+    workers can't double-claim), parses it, and drops a malformed file instead of wedging."""
+    from chessckers_engine.selfplay_worker_async import _claim_job
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    (jobs / "0.json").write_text(json.dumps({"type": "train", "params": {"sims": 3}}))
+
+    seq, claimed, job = _claim_job(jobs, 5)
+    assert seq == "0" and job["type"] == "train" and job["params"]["sims"] == 3
+    assert claimed.name == "0.json.c5"                     # renamed out of the unclaimed glob
+    assert not list(jobs.glob("*.json"))
+    # a second worker finds nothing claimable (the file is already taken)
+    assert _claim_job(jobs, 6) is None
+    # a malformed job is claimed-then-dropped, never returned, never wedging the queue
+    (jobs / "1.json").write_text("{not valid json")
+    assert _claim_job(jobs, 7) is None
+    assert not list(jobs.glob("*.json"))

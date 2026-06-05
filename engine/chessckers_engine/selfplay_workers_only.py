@@ -49,7 +49,10 @@ import torch
 import torch.multiprocessing as mp
 
 from chessckers_engine.runtime import setup_logging
-from chessckers_engine.selfplay_worker_async import play_forever_subprocess
+from chessckers_engine.selfplay_worker_async import (
+    play_forever_subprocess,
+    play_jobs_forever_subprocess,
+)
 
 log = logging.getLogger("chessckers_engine.selfplay_workers_only")
 
@@ -207,6 +210,13 @@ def main() -> int:
                    help="Per-worker mode: run the native C++ PUCT search "
                         "(cpp.run_mcts_native) — ~4.8x faster than the Python MCTS. "
                         "weights.pt is exported to a flat .bin and hot-reloaded.")
+    p.add_argument("--job-driven", action="store_true",
+                   help="Fleet mode (lc0 client-drives-each-game): instead of self-playing "
+                        "autonomously, each worker claims one server-assigned job at a time from "
+                        "run-dir/jobs/ (minted by fleet_client via POST /next_game) and plays it "
+                        "— a train job -> one self-play game appended to buffer/, a match job -> "
+                        "one keep-best gate game written to match_out/. Per-worker inference only "
+                        "(forces off --shared-inference). fleet_client injects this flag.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--pin-cpu", action="store_true",
                    help="Pin each worker to a CPU core (Linux only).")
@@ -219,6 +229,11 @@ def main() -> int:
     p.add_argument("--shared-timeout-ms", type=float, default=5.0,
                    help="Max wait (ms) for additional requests to coalesce into a batch.")
     args = p.parse_args()
+    if args.job_driven and args.shared_inference:
+        # The job-driven executor holds its own per-worker model (it must load arbitrary gate
+        # nets for match jobs); shared inference has no standalone model to do that with.
+        log.warning("--job-driven forces per-worker inference; ignoring --shared-inference")
+        args.shared_inference = False
 
     run_dir: Path = args.run_dir.resolve()
     buffer_root = run_dir / "buffer"
@@ -305,11 +320,13 @@ def main() -> int:
                 wid=wid, buffer_root=buffer_root, stop_path=stop_path, args=args,
                 model_arch=model_arch, weights_path=weights_path,
             )
-        proc = ctx.Process(target=play_forever_subprocess, args=(payload,),
-                           name=f"worker-{wid}")
+        proc = ctx.Process(
+            target=play_jobs_forever_subprocess if args.job_driven else play_forever_subprocess,
+            args=(payload,), name=f"worker-{wid}")
         proc.start()
         workers.append(proc)
-    mode = "shared-inference" if args.shared_inference else "per-worker"
+    mode = ("job-driven" if args.job_driven
+            else "shared-inference" if args.shared_inference else "per-worker")
     log.info("spawned %d workers (%s mode); weights=%s buffer=%s",
              len(workers), mode, weights_path, buffer_root)
 

@@ -57,7 +57,7 @@ fi
 CLIENT_ARGS=(
   -m chessckers_engine.fleet_client
   --server "$SERVER" --run-dir "$RUN" --client-id local --poll-seconds "$FLEET_POLL_S"
-  --spawn-workers --
+  --queue-depth "$WORKERS" --spawn-workers --
   --workers "$WORKERS" --worker-id-base 0 --seed 1000
   --device "$FLEET_DEVICE" --d-hidden "$FLEET_DH" --c-filters "$FLEET_CF" --n-blocks "$FLEET_NB"
   --max-plies "$FLEET_MAX_PLIES" --sims "$FLEET_SIMS_FALLBACK" --weights-poll-seconds "$FLEET_WEIGHTS_POLL_S"

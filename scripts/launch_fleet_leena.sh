@@ -142,7 +142,7 @@ CLIENT_ARGS=(
   --server "$SERVER" --run-dir "$RUN" --client-id leena --poll-seconds "$FLEET_POLL_S"
   --bind-interface en0
   --update-cmd "$UPDATE_CMD"
-  --spawn-workers --
+  --queue-depth "$FLEET_WORKERS" --spawn-workers --
   --workers "$FLEET_WORKERS" --worker-id-base 300 --seed 4000
   --device "$FLEET_DEVICE" --d-hidden "$FLEET_DH" --c-filters "$FLEET_CF" --n-blocks "$FLEET_NB"
   --max-plies "$FLEET_MAX_PLIES" --sims "$FLEET_SIMS_FALLBACK" --weights-poll-seconds "$FLEET_WEIGHTS_POLL_S"
