@@ -51,6 +51,33 @@ import torch
 POS_C = 15
 MOVE_D = 240
 
+# --- V2 (square-grounded / gather head) shapes ------------------------------
+# V2 keeps the board feature map SPATIAL on a 10x10 grid (the 8x8 board + the
+# 1-square rim) so per-move logits can gather trunk features at the squares a
+# move touches (Leela's source x target dot-product head, generalized to
+# variable-length capture chains via path-pooling over the rim-aware waypoints).
+# See ChesskersScorerV2 + the `project-policy-head-redesign` memory.
+#   Position: the 15 V1 channels (written into the 10x10 interior) + 1 on-board
+#   mask plane (1 on the 8x8 interior, 0 on the rim) so a pure conv stack can
+#   tell an empty interior square from a rim square. 16 channels, 10x10.
+POS_C_V2 = 16
+CH_V2_ONBOARD = 15  # the new on-board mask plane (indices 0..14 = the V1 channels)
+# Move: from_idx, to_idx (10x10 flat indices, gathered against the spatial
+# trunk), a 100-wide waypoint path mask (rim-aware, endpoints excluded), and
+# MV2_K type scalars. NO from/to one-hots (the gather indexes by construction)
+# and NO 100-bit waypoint one-hot fed to an MLP — the mask here drives a
+# mean-pool over the spatial features, not a learned lookup.
+MV2_FROM = 0
+MV2_TO = 1
+MV2_PATH_BASE = 2          # 100 waypoint-mask cells over the 10x10 grid
+MV2_SCALAR_BASE = 102      # MV2_K type scalars
+MV2_K = 12
+MOVE_D_V2 = MV2_SCALAR_BASE + MV2_K  # 114
+# Type-scalar layout (offsets from MV2_SCALAR_BASE):
+#   0 is_capture  1 is_chain  2 is_deploy  3 is_ortho
+#   4 chain_len/8  5 deploy_count/24  6 demotions/8
+#   7..11 promotion one-hot (none, q, r, b, n)
+
 # Position channel indices
 CH_W_PAWN, CH_W_KNIGHT, CH_W_BISHOP, CH_W_ROOK, CH_W_QUEEN, CH_W_KING = range(6)
 CH_STONE_TOP, CH_KING_TOP = 6, 7
@@ -317,4 +344,176 @@ def _encode_move_py(move: dict[str, Any]) -> torch.Tensor:
         if f10 is None or r10 is None:
             continue
         out[MV_WAYPOINT_BASE + r10 * 10 + f10] = 1.0
+    return out
+
+
+# ===========================================================================
+# V2 encoders: 10x10 spatial position + gather-indexed moves (pure Python; a
+# Rust fast path is a deliberate follow-on, mirroring the V1 _rs accel). The
+# (rank10, file10) convention is shared with the V1 waypoint mask, so a board
+# square 'e4' and a rim coord 'z3' map through the SAME _FILE10/_RANK10 tables
+# to the SAME 10x10 flat index the position tensor uses — the gather and the
+# board fill are coordinate-aligned by construction.
+# ===========================================================================
+
+
+def _sq10(s: str) -> int | None:
+    """10x10 flat index (rank10*10 + file10) for a square/coord string, or None
+    if either char is off the known grid. Works for board squares ('a1'..'h8')
+    and rim waypoint coords ('z0'..'i9') alike."""
+    if len(s) != 2:
+        return None
+    f10 = _FILE10.get(s[0])
+    r10 = _RANK10.get(s[1])
+    if f10 is None or r10 is None:
+        return None
+    return r10 * 10 + f10
+
+
+def _board_cell(x: int, y: int) -> tuple[int, int]:
+    """(file 0..7, rank 0..7) -> (rank10, file10) interior cell of the 10x10."""
+    return y + 1, x + 1
+
+
+def encode_position_v2(fen: str) -> torch.Tensor:
+    """Encode a Chessckers FEN as a (16, 10, 10) float32 tensor for V2: the 15
+    V1 channels written into the 8x8 interior of a 10x10 grid + an on-board
+    mask plane (1 interior, 0 rim)."""
+    m = _FEN_HEAD.match(fen)
+    if not m:
+        raise ValueError(f"unrecognized Chessckers FEN: {fen!r}")
+    board, overlay, turn = m.group(1), m.group(2), m.group(3)
+
+    out = torch.zeros((POS_C_V2, 10, 10), dtype=torch.float32)
+    out[CH_V2_ONBOARD, 1:9, 1:9] = 1.0
+
+    ranks = board.split("/")
+    if len(ranks) != 8:
+        raise ValueError(f"FEN board must have 8 ranks: {board!r}")
+    for fen_rank_idx, rank_str in enumerate(ranks):
+        y = 7 - fen_rank_idx
+        x = 0
+        for ch in rank_str:
+            if ch.isdigit():
+                x += int(ch)
+                continue
+            r10, f10 = _board_cell(x, y)
+            if ch in _WHITE_PIECE_CH:
+                out[_WHITE_PIECE_CH[ch], r10, f10] = 1.0
+            elif ch in _BLACK_BITBOARD_CH:
+                out[_BLACK_BITBOARD_CH[ch], r10, f10] = 1.0
+            x += 1
+
+    if overlay:
+        for entry in overlay.split(","):
+            if ":" not in entry:
+                continue
+            sq, pieces = entry.split(":", 1)
+            x, y = square_xy(sq)
+            r10, f10 = _board_cell(x, y)
+            height = len(pieces)
+            if height == 0:
+                continue
+            stones = sum(1 for p in pieces if p in "sS")
+            kings = sum(1 for p in pieces if p == "k")
+            out[CH_TOWER_HEIGHT, r10, f10] = height / 24.0
+            out[CH_STONE_COUNT, r10, f10] = stones / 24.0
+            out[CH_KING_COUNT, r10, f10] = kings / 24.0
+            if pieces[-1] == "s":
+                out[CH_TOP_IS_UNMOVED_STONE, r10, f10] = 1.0
+            if height >= 2 and pieces[-2] == "k":
+                out[CH_SECOND_IS_KING, r10, f10] = 1.0
+
+    if turn == "b":
+        out[CH_SIDE_TO_MOVE, 1:9, 1:9] = 1.0
+
+    m_r8 = _FEN_R8.search(fen)
+    if m_r8:
+        out[CH_RANK8, 1:9, 1:9] = int(m_r8.group(1)) / 3.0
+
+    return out
+
+
+def encode_position_state_v2(state: Any) -> torch.Tensor:
+    """V2 per-leaf encoder from a `variant_py.State` (mirrors encode_position_v2
+    but reads python-chess bitboards + the stacks overlay directly)."""
+    import chess
+
+    out = torch.zeros((POS_C_V2, 10, 10), dtype=torch.float32)
+    out[CH_V2_ONBOARD, 1:9, 1:9] = 1.0
+    bb_to_ch = _bb_to_ch_table()
+    board = state.board
+
+    for sq, piece in board.piece_map().items():
+        ch = bb_to_ch.get((piece.color, piece.piece_type))
+        if ch is None:
+            continue
+        r10, f10 = (sq >> 3) + 1, (sq & 7) + 1
+        out[ch, r10, f10] = 1.0
+
+    for sq, pieces in state.stacks.items():
+        height = len(pieces)
+        if height == 0:
+            continue
+        r10, f10 = (sq >> 3) + 1, (sq & 7) + 1
+        stones = kings = 0
+        for p in pieces:
+            if p == "k":
+                kings += 1
+            else:
+                stones += 1
+        out[CH_TOWER_HEIGHT, r10, f10] = height / 24.0
+        out[CH_STONE_COUNT, r10, f10] = stones / 24.0
+        out[CH_KING_COUNT, r10, f10] = kings / 24.0
+        if pieces[-1] == "s":
+            out[CH_TOP_IS_UNMOVED_STONE, r10, f10] = 1.0
+        if height >= 2 and pieces[-2] == "k":
+            out[CH_SECOND_IS_KING, r10, f10] = 1.0
+
+    if board.turn == chess.BLACK:
+        out[CH_SIDE_TO_MOVE, 1:9, 1:9] = 1.0
+    if state.rank8_count:
+        out[CH_RANK8, 1:9, 1:9] = state.rank8_count / 3.0
+
+    return out
+
+
+def encode_move_v2(move: dict[str, Any]) -> torch.Tensor:
+    """Encode a LegalMove as a (114,) V2 vector: [from_idx, to_idx, path_mask(100),
+    type_scalars(12)]. from/to are 10x10 flat indices the model GATHERS against
+    the spatial trunk (not learned one-hots); the path mask drives a mean-pool
+    over the intermediate waypoint squares (endpoints excluded)."""
+    out = torch.zeros(MOVE_D_V2, dtype=torch.float32)
+    fi = _sq10(move["from"])
+    ti = _sq10(move["to"])
+    # from/to are always real board squares; fall back to interior origin if a
+    # malformed dict slips through rather than crashing the encoder.
+    out[MV2_FROM] = float(fi if fi is not None else 11)
+    out[MV2_TO] = float(ti if ti is not None else 11)
+
+    waypoints = move.get("waypoints") or []
+    for w in waypoints:
+        wi = _sq10(w)
+        if wi is not None:
+            out[MV2_PATH_BASE + wi] = 1.0
+    # Endpoints are gathered separately as source/target — never count them as
+    # intermediate path cells (the final waypoint == `to`).
+    if fi is not None:
+        out[MV2_PATH_BASE + fi] = 0.0
+    if ti is not None:
+        out[MV2_PATH_BASE + ti] = 0.0
+
+    s = MV2_SCALAR_BASE
+    if move.get("capture") is not None:
+        out[s + 0] = 1.0
+    if waypoints:
+        out[s + 1] = 1.0
+    if move.get("deployCount") is not None:
+        out[s + 2] = 1.0
+    if move.get("demotionsRequired") is not None:
+        out[s + 3] = 1.0
+    out[s + 4] = len(waypoints) / 8.0
+    out[s + 5] = (move.get("deployCount") or 0) / 24.0
+    out[s + 6] = (move.get("demotionsRequired") or 0) / 8.0
+    out[s + 7 + _PROMO_INDEX.get(move.get("promotion"), 0)] = 1.0
     return out
