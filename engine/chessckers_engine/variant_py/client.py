@@ -64,12 +64,15 @@ def _detect_status(state: State) -> tuple[str | None, str | None]:
 
     Detection paths handled here (cheap, no move-gen):
     - Black eliminated → variantEnd / winner=white.
+    - White king has held rank 8 for 3 turns (rank8_count >= 3) → variantEnd / white.
     - White's king captured during a Black chain → variantEnd / winner=black.
     White checkmate/stalemate and Black stalemate need the full legal-move
     list, so they're detected in _state_to_dict after move generation. (Mate
     uses the Chessckers check predicate, NOT python-chess's FIDE is_checkmate,
     which wrongly treats an adjacent Black King as giving check.)"""
     if not state.stacks:
+        return ("variantEnd", "white")
+    if state.rank8_count >= 3:
         return ("variantEnd", "white")
     if state.board.king(chess.WHITE) is None:
         return ("variantEnd", "black")
@@ -224,6 +227,8 @@ class PyVariantClient:
         and branching factor, so a per-call cache costs more in key-building
         than it saves.)"""
         if not state.stacks:
+            return ("variantEnd", "white", None)
+        if state.rank8_count >= 3:
             return ("variantEnd", "white", None)
         if state.board.king(chess.WHITE) is None:
             return ("variantEnd", "black", None)

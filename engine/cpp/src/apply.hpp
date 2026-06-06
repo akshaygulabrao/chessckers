@@ -188,6 +188,13 @@ inline void apply_black_move(Board& b, const BlackMove& mv) {
     else if (mv.has_capture) apply_diagonal_capture(b, mv);
     else apply_quiet_or_sprint(b, mv);
     b.turn_white = true;
+    // Rank-8 counter (#3): a check from Black at any point resets it to 0.
+    if (b.rank8_count != 0) {
+        const uint64_t wk_bb = b.kings & b.occupied_white;
+        if (wk_bb != 0 &&
+            white_in_chessckers_check(b.occupied(), b.occupied_white, __builtin_ctzll(wk_bb), b.stacks))
+            b.rank8_count = 0;
+    }
 }
 
 // -------- White move apply (python-chess board.push port) --------
@@ -259,7 +266,19 @@ inline void apply_white_move(Board& b, const WhiteMove& mv) {
     b.castling_rights = cr;
     b.ep_square = new_ep;
     b.halfmove = (mv.capture_sq >= 0 || mv.piece == WPiece::Pawn) ? 0 : b.halfmove + 1;
-    b.turn_white = false;
+    // Opening double-move (#2): the first of White's two sub-moves keeps the turn
+    // White; otherwise the turn passes to Black and the rank-8 counter (#3) is
+    // updated — tick if the king ended on rank 8 (it can't be in check after a
+    // legal White move), else reset.
+    if (b.white_moves_left >= 2) {
+        b.white_moves_left -= 1;
+    } else {
+        b.white_moves_left = 1;
+        b.turn_white = false;
+        const uint64_t wk_bb = b.kings & b.occupied_white;
+        if (wk_bb != 0 && (__builtin_ctzll(wk_bb) >> 3) == 7) b.rank8_count += 1;
+        else b.rank8_count = 0;
+    }
 }
 
 // -------- Status detection --------
@@ -271,6 +290,7 @@ struct Status {
 
 inline Status detect_status(const Board& b) {
     if (b.stacks.empty()) return {"variantEnd", "white"};  // Black eliminated
+    if (b.rank8_count >= 3) return {"variantEnd", "white"};  // rank-8 hold (#3)
     const uint64_t wk_bb = b.kings & b.occupied_white;
     if (wk_bb == 0) return {"variantEnd", "black"};  // White king captured
     const int wk_sq = __builtin_ctzll(wk_bb);

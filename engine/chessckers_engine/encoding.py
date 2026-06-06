@@ -1,6 +1,6 @@
 """FEN and LegalMove tensor encodings for the Chessckers neural-net player.
 
-Position tensor: shape (14, 8, 8), dtype float32. Channels:
+Position tensor: shape (15, 8, 8), dtype float32. Channels:
    0  White Pawn          (one-hot per square from board bitboard)
    1  White Knight
    2  White Bishop
@@ -15,6 +15,7 @@ Position tensor: shape (14, 8, 8), dtype float32. Channels:
   11  top_is_unmoved_stone (1 iff stack top is unmoved Stone 's')
   12  second_is_king      (1 iff stack[-2] is a King)
   13  side_to_move        (all-1 if Black to move, else all-0)
+  14  rank8_progress      (rank8_count / 3, constant plane — White's rank-8 win counter)
 
 Squares use (file, rank) → tensor index (rank, file). Internal y axis runs
 0 (rank 1) to 7 (rank 8); FEN ranks are read top-to-bottom, so FEN's first
@@ -47,7 +48,7 @@ from typing import Any
 
 import torch
 
-POS_C = 14
+POS_C = 15
 MOVE_D = 240
 
 # Position channel indices
@@ -56,6 +57,7 @@ CH_STONE_TOP, CH_KING_TOP = 6, 7
 CH_TOWER_HEIGHT, CH_STONE_COUNT, CH_KING_COUNT = 8, 9, 10
 CH_TOP_IS_UNMOVED_STONE, CH_SECOND_IS_KING = 11, 12
 CH_SIDE_TO_MOVE = 13
+CH_RANK8 = 14
 
 _WHITE_PIECE_CH = {
     "P": CH_W_PAWN,
@@ -86,6 +88,10 @@ _FILE10 = {"z": 0, "a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7, "h": 
 _RANK10 = {str(i): i for i in range(10)}
 
 _FEN_HEAD = re.compile(r"^([^\s\[]+)(?:\[([^\]]*)\])?\s+([wb])\b")
+# White's rank-8 win counter, read from the FEN's trailing {..,r8:N} block.
+# "r8:" occurs only in that block (no board square is named r8), so a plain
+# search is unambiguous.
+_FEN_R8 = re.compile(r"\br8:(\d+)")
 
 # Optional Rust acceleration for the per-leaf encodings — byte-for-byte
 # equivalent to the Python below (see rust/chessckers_movegen). Bypassed by
@@ -120,7 +126,7 @@ def square_index(square: str) -> int:
 
 
 def encode_position(fen: str) -> torch.Tensor:
-    """Encode a Chessckers FEN as a (14, 8, 8) float32 tensor (Rust fast path
+    """Encode a Chessckers FEN as a (15, 8, 8) float32 tensor (Rust fast path
     when available; identical result either way)."""
     if _rs is not None:
         return _buf(_rs.encode_position(fen)).view(POS_C, 8, 8)
@@ -174,6 +180,10 @@ def _encode_position_py(fen: str) -> torch.Tensor:
     if turn == "b":
         out[CH_SIDE_TO_MOVE].fill_(1.0)
 
+    m_r8 = _FEN_R8.search(fen)
+    if m_r8:
+        out[CH_RANK8].fill_(int(m_r8.group(1)) / 3.0)
+
     return out
 
 
@@ -200,7 +210,7 @@ def _bb_to_ch_table() -> dict[tuple[bool, int], int]:
 
 
 def encode_position_state(state: Any) -> torch.Tensor:
-    """Encode a `variant_py.State` directly to the (14, 8, 8) tensor — the
+    """Encode a `variant_py.State` directly to the (15, 8, 8) tensor — the
     per-leaf hot-path encoder (Rust fast path from piece bitboards when
     available; identical result either way)."""
     if _rs is not None:
@@ -213,7 +223,7 @@ def encode_position_state(state: Any) -> torch.Tensor:
         bp = int(b.pieces(chess.PAWN, chess.BLACK))   # Stone-top
         bk = int(b.pieces(chess.KING, chess.BLACK))   # King-top
         return _buf(
-            _rs.encode_position_bb(wp, wn, wb, wr, wq, wk, bp, bk, state.stacks, b.turn == chess.BLACK)
+            _rs.encode_position_bb(wp, wn, wb, wr, wq, wk, bp, bk, state.stacks, b.turn == chess.BLACK, state.rank8_count)
         ).view(POS_C, 8, 8)
     return _encode_position_state_py(state)
 
@@ -259,6 +269,8 @@ def _encode_position_state_py(state: Any) -> torch.Tensor:
 
     if board.turn == chess.BLACK:
         out[CH_SIDE_TO_MOVE].fill_(1.0)
+    if state.rank8_count:
+        out[CH_RANK8].fill_(state.rank8_count / 3.0)
 
     return out
 

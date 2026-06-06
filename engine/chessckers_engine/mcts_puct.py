@@ -88,6 +88,25 @@ def _node_fen(node: PuctNode, client: Any) -> str:
     return node.fen
 
 
+def _node_mover(node: PuctNode) -> bool:
+    """True iff White is to move at `node`. Used to decide whether an edge flips
+    the search perspective: with strict alternation every edge flips, but the
+    opening double-move (#2) has one White→White edge that must NOT flip."""
+    st = node.state
+    if st is not None:
+        return bool(st.board.turn)  # chess.WHITE == True
+    # dict-API fallback: the turn is the first standalone 'w'/'b' token after the
+    # board/overlay.
+    fen = node.fen
+    cut = fen.find("]")
+    for tok in (fen[cut + 1:] if cut != -1 else fen).split():
+        if tok == "w":
+            return True
+        if tok == "b":
+            return False
+    return True
+
+
 # Lc0-style PUCT refinements:
 # - cpuct GROWS with parent visits: cpuct = c_puct + CPUCT_FACTOR*log((N+base)/base).
 #   With base=19652 this is negligible at our sim counts (~+0.04 at N=400) — it
@@ -101,9 +120,15 @@ CPUCT_BASE = 19652.0
 FPU_REDUCTION = 0.25
 
 
-def _puct_score(child: PuctNode, parent_visits: int, cpuct: float, fpu_value: float) -> float:
-    # Q from the parent's perspective: explored child -> -child.q; unexplored -> FPU.
-    q_from_parent = (-child.q) if child.visits > 0 else fpu_value
+def _puct_score(child: PuctNode, parent_visits: int, cpuct: float, fpu_value: float,
+                same_mover: bool = False) -> float:
+    # Q from the parent's perspective. Normally the child is the opponent, so
+    # -child.q; across a same-mover edge (the opening double-move's White→White
+    # step) the child shares the parent's perspective, so +child.q.
+    if child.visits > 0:
+        q_from_parent = child.q if same_mover else -child.q
+    else:
+        q_from_parent = fpu_value
     u = cpuct * child.prior * math.sqrt(max(parent_visits, 1)) / (1 + child.visits)
     return q_from_parent + u
 
@@ -115,7 +140,11 @@ def _select_child(parent: PuctNode, c_puct: float) -> PuctNode:
     # already explored among its children.
     visited_prior = sum(c.prior for c in parent.children.values() if c.visits > 0)
     fpu_value = parent.q - FPU_REDUCTION * math.sqrt(max(visited_prior, 0.0))
-    return max(parent.children.values(), key=lambda c: _puct_score(c, pv, cpuct, fpu_value))
+    parent_mover = _node_mover(parent)
+    return max(
+        parent.children.values(),
+        key=lambda c: _puct_score(c, pv, cpuct, fpu_value, _node_mover(c) == parent_mover),
+    )
 
 
 def _terminal_value(node: PuctNode) -> float:
@@ -231,14 +260,16 @@ def _backup(path: list[PuctNode], leaf_value: float) -> None:
     # the same γ used for the training value target). The leaf keeps its full
     # value; each step up toward the root multiplies by γ, so a win reached in
     # fewer plies backs up a larger value at the root and the search prefers
-    # faster mates. `sign` flips per ply for the side-to-move perspective.
+    # faster mates. The sign is per-MOVER (not blindly per-ply): a node sharing
+    # the leaf's side-to-move keeps the value's sign, an opposing node negates —
+    # so the opening double-move's one White→White edge doesn't wrongly invert.
     gamma = float(os.environ.get("CHESSCKERS_VALUE_DISCOUNT", "1.0"))
-    sign = 1.0
+    leaf_mover = _node_mover(path[-1])
     discount = 1.0
     for node in reversed(path):
         node.visits += 1
+        sign = 1.0 if _node_mover(node) == leaf_mover else -1.0
         node.total_value += sign * discount * leaf_value
-        sign = -sign
         discount *= gamma
 
 

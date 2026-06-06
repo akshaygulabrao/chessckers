@@ -46,6 +46,13 @@ struct Board {
     bool turn_white = true;        // true == 'w'
     int halfmove = 0;
     int fullmove = 1;
+    // Chessckers turn/win state (the FEN's trailing {wm,r8} block). Mirrors
+    // variant_py.state.State: white_moves_left = White sub-moves left this turn
+    // (2 only at the opening double-move, 1 normally); rank8_count = consecutive
+    // completed White turns with the king on rank 8 (3 => White wins; a check
+    // resets to 0).
+    int white_moves_left = 1;
+    int rank8_count = 0;
     // ordered ascending by square -> matches sorted(stacks.items()) on serialize.
     std::map<uint8_t, std::string> stacks;
 
@@ -229,6 +236,28 @@ inline Board parse_fen(const std::string& fen_in) {
     std::string rest = (i < fen.size()) ? strip(fen.substr(i)) : "";
     if (rest.empty()) rest = "w - - 0 1";  // parse_fen default when rest absent
 
+    // Pull off the optional trailing {wm,r8} block before tokenizing the six
+    // standard fields (mirrors state.py _FEN_CKSTATE_RE).
+    int ck_wm = 1, ck_r8 = 0;
+    {
+        const size_t lb = rest.rfind('{');
+        if (lb != std::string::npos) {
+            const size_t rb = rest.find('}', lb);
+            const std::string inside =
+                rest.substr(lb + 1, (rb == std::string::npos ? rest.size() : rb) - lb - 1);
+            rest = strip(rest.substr(0, lb));
+            for (const std::string& kv : split(inside, ',')) {
+                const std::string e = strip(kv);
+                const size_t c = e.find(':');
+                if (e.empty() || c == std::string::npos) continue;
+                const std::string key = strip(e.substr(0, c));
+                const int val = std::stoi(strip(e.substr(c + 1)));
+                if (key == "wm") ck_wm = val;
+                else if (key == "r8") ck_r8 = val;
+            }
+        }
+    }
+
     const std::vector<std::string> t = split_ws(rest);
     const std::string turn = t.size() > 0 ? t[0] : "w";
     const std::string cast = t.size() > 1 ? t[1] : "-";
@@ -253,6 +282,8 @@ inline Board parse_fen(const std::string& fen_in) {
             b.stacks[(uint8_t)parse_square(sqn)] = pieces;
         }
     }
+    b.white_moves_left = ck_wm;
+    b.rank8_count = ck_r8;
     return b;
 }
 
@@ -267,7 +298,17 @@ inline std::string serialize_fen(const Board& b) {
     const std::string rest = std::string(b.turn_white ? "w" : "b") + " " +
                              castling_field(b.castling_rights) + " " + ep + " " +
                              std::to_string(b.halfmove) + " " + std::to_string(b.fullmove);
-    if (b.stacks.empty()) return board_part + " " + rest;
+    // Optional trailing {wm,r8} block — emitted only when non-default, so
+    // ordinary positions and every pre-existing FEN serialize unchanged.
+    std::string ck;
+    if (b.white_moves_left != 1) ck += "wm:" + std::to_string(b.white_moves_left);
+    if (b.rank8_count != 0) {
+        if (!ck.empty()) ck += ',';
+        ck += "r8:" + std::to_string(b.rank8_count);
+    }
+    const std::string suffix = ck.empty() ? "" : (" {" + ck + "}");
+
+    if (b.stacks.empty()) return board_part + " " + rest + suffix;
 
     std::string overlay;
     bool first = true;
@@ -276,7 +317,7 @@ inline std::string serialize_fen(const Board& b) {
         first = false;
         overlay += square_name(sq) + ":" + pieces;
     }
-    return board_part + "[" + overlay + "] " + rest;
+    return board_part + "[" + overlay + "] " + rest + suffix;
 }
 
 }  // namespace cc

@@ -14,7 +14,7 @@
 
 **White.** Standard FIDE setup on ranks 1 and 2.
 
-**Black.** Single-piece towers on every square of ranks 6–8: Stones on ranks 6 and 8, Kings on rank 7 (24 towers total).
+**Black.** Single-piece towers on every square of ranks 6–8: Stones on ranks 6 and 8, plus the rank-7 corner files a7 and h7; Kings on b7–g7. 24 towers total.
 
 ---
 
@@ -35,6 +35,7 @@
 ## 2. White: The Chess Legion
 
 *   **Movement and capture.** Standard FIDE chess.
+*   **Opening double-move.** On White's **first turn of the game**, White makes **two** moves in succession — each an ordinary legal move, either of which may capture, and the two may use the same piece. Black does not move between them. This applies only to the opening; every later White turn is a single move.
 *   **Scope.** White stays on the board and never enters or interacts with the rim.
 *   **Capture effect.** When a White piece captures a Black tower, the **entire tower** is removed regardless of its height.
 
@@ -164,7 +165,10 @@ A King-top tower may move along a rank or file in a single straight line. Path W
 
 **Promotion.** Whenever the path traced by any Black move other than a charge (quiet diagonal, deploy, sprint, capture hop, or capture chain) touches rank 1 — either by landing there or by stepping through it on the way to a rim square — every Stone in the tower is promoted to a King. The promotion takes effect immediately, so any later hops in the same chain use the now-promoted (King-top) tower for direction and capability. Charges never promote.
 
-**White wins** if Black has no pieces left on the board, or if Black has no legal moves on their turn. (Black being unable to move is **not** a draw — Black being stuck loses the game.)
+**White wins** by any of:
+*   Black has no pieces left on the board;
+*   Black has no legal moves on their turn (Black being unable to move is **not** a draw — Black being stuck loses the game); or
+*   the **White king holds rank 8** — the far rank (Black's back rank) — for **three of White's turns** without being in check. The counter increments at the end of each White turn the king finishes anywhere on rank 8, and resets to zero whenever the king leaves rank 8 or is in Chessckers-check at any point (a check from Black wipes the progress). Reaching three wins immediately.
 
 **Black wins** by checkmating the White king, where *check* is meant in the **Chessckers** sense, not FIDE. White is in check when some Black move would capture the king **in transit** — a diagonal capture-hop, or a capturing charge whose path crosses the king's square. A Black King merely standing adjacent to the White king gives **no** check: Black threatens only along the diagonals and files it actually captures along, and (per §3B) a Ram that *lands* on the king does not capture it. It is **checkmate** — and Black wins — when White is in check and has no legal move that escapes it. Black also wins if the king is captured outright during a Black chain.
 

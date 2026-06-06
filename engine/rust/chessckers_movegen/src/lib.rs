@@ -2307,7 +2307,7 @@ fn white_legal_moves<'py>(
 // with per-element assignment; these build a flat Vec<f32> the caller wraps
 // with torch.tensor(...).view(...). See encoding.py for the channel/dim spec.
 
-const ENC_POS_C: usize = 14;
+const ENC_POS_C: usize = 15;
 const ENC_MOVE_D: usize = 240;
 
 #[inline(always)]
@@ -2408,6 +2408,19 @@ fn set_bits_channel(out: &mut [f32], mut bb: u64, ch: usize) {
     }
 }
 
+// White's rank-8 win counter from the FEN's trailing {..,r8:N} block. "r8:"
+// occurs only there (no board square is named r8), so a plain search is
+// unambiguous — mirrors the Python `_FEN_R8` regex.
+fn parse_r8(fen: &str) -> Option<u32> {
+    let idx = fen.find("r8:")?;
+    fen[idx + 3..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
 fn encode_position_native(fen: &str) -> Result<Vec<f32>, String> {
     let bytes = fen.as_bytes();
     let mut i = 0;
@@ -2495,6 +2508,13 @@ fn encode_position_native(fen: &str) -> Result<Vec<f32>, String> {
     if turn == b'b' {
         for v in out[13 * 64..14 * 64].iter_mut() {
             *v = 1.0;
+        }
+    }
+    // Rank-8 win counter (#3): channel 14 = r8 / 3, constant-filled.
+    if let Some(r8) = parse_r8(fen) {
+        let v = r8 as f32 / 3.0;
+        for x in out[14 * 64..15 * 64].iter_mut() {
+            *x = v;
         }
     }
     Ok(out)
@@ -2598,6 +2618,7 @@ fn encode_position_bb<'py>(
     bk: u64,
     stacks: &Bound<'_, PyDict>,
     turn_is_black: bool,
+    rank8_count: u32,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let mut out = vec![0.0f32; ENC_POS_C * 64];
     for (bb, ch) in [(wp, 0), (wn, 1), (wb, 2), (wr, 3), (wq, 4), (wk, 5), (bp, 6), (bk, 7)] {
@@ -2610,6 +2631,12 @@ fn encode_position_bb<'py>(
     if turn_is_black {
         for v in out[13 * 64..14 * 64].iter_mut() {
             *v = 1.0;
+        }
+    }
+    if rank8_count > 0 {
+        let v = rank8_count as f32 / 3.0;
+        for x in out[14 * 64..15 * 64].iter_mut() {
+            *x = v;
         }
     }
     Ok(f32_to_pybytes(py, &out))

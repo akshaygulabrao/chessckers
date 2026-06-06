@@ -24,7 +24,7 @@ def test_starting_position_renders_exactly():
         "   z  a  b  c  d  e  f  g  h  i ",
         " 9 ·  ·  ·  ·  ·  ·  ·  ·  ·  · ",
         " 8 ·  s  s  s  s  s  s  s  s  · ",
-        " 7 ·  k  k  k  k  k  k  k  k  · ",
+        " 7 ·  s  k  k  k  k  k  k  s  · ",
         " 6 ·  s  s  s  s  s  s  s  s  · ",
         " 5 ·  .  .  .  .  .  .  .  .  · ",
         " 4 ·  .  .  .  .  .  .  .  .  · ",

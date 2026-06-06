@@ -17,7 +17,7 @@
 
 namespace cc {
 
-constexpr int ENC_POS_C = 14;
+constexpr int ENC_POS_C = 15;
 constexpr int ENC_MOVE_D = 240;
 
 // channels 8-12 for one tower at (x,y) from its pieces (bottom-to-top {s,S,k}).
@@ -58,6 +58,11 @@ inline std::vector<float> encode_position(const Board& b) {
     for (const auto& [sq, pieces] : b.stacks) apply_tower_channels(out, sq & 7, sq >> 3, pieces);
     if (!b.turn_white)
         for (int i = 13 * 64; i < 14 * 64; ++i) out[i] = 1.0f;
+    // Rank-8 win counter (#3): channel 14 = r8 / 3 (f64 divide -> narrow, matching
+    // the Python reference), constant-filled.
+    if (b.rank8_count != 0)
+        for (int i = 14 * 64; i < 15 * 64; ++i)
+            out[i] = static_cast<float>(static_cast<double>(b.rank8_count) / 3.0);
     return out;
 }
 

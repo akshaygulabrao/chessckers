@@ -32,24 +32,39 @@ import chess
 # game start (after any move both engines strip `kq` since Chessckers Black
 # has no chess king to castle).
 STARTING_FEN = (
-    "pppppppp/kkkkkkkk/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR"
+    "pppppppp/pkkkkkkp/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR"
     "[a6:s,b6:s,c6:s,d6:s,e6:s,f6:s,g6:s,h6:s,"
-    "a7:k,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:k,"
-    "a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQkq - 0 1"
+    "a7:s,b7:k,c7:k,d7:k,e7:k,f7:k,g7:k,h7:s,"
+    "a8:s,b8:s,c8:s,d8:s,e8:s,f8:s,g8:s,h8:s] w KQkq - 0 1 {wm:2}"
 )
 
 
 # Captures: <board>[<overlay>] <rest>  |  <board> <rest>  |  <board>[<overlay>]  |  <board>
 _FEN_HEAD_RE = re.compile(r"^([^\s\[]+)(?:\[([^\]]*)\])?(\s.*)?$")
 
+# Optional trailing Chessckers turn/win state, e.g. ` {wm:2,r8:1}`, sitting after
+# the 6 standard FEN fields. Stripped from `rest` before chess.Board sees it.
+_FEN_CKSTATE_RE = re.compile(r"\s*\{([^}]*)\}\s*$")
+
 
 @dataclass(slots=True)
 class State:
     board: chess.Board
     stacks: dict[chess.Square, str] = field(default_factory=dict)
+    # Chessckers turn/win state, carried in the FEN's optional trailing {wm,r8}
+    # block. white_moves_left = White sub-moves remaining this turn (2 only at the
+    # opening double-move, 1 normally). rank8_count = consecutive completed White
+    # turns with the king on rank 8 (3 => White wins; any check resets it to 0).
+    white_moves_left: int = 1
+    rank8_count: int = 0
 
     def copy(self) -> "State":
-        return State(board=self.board.copy(stack=False), stacks=dict(self.stacks))
+        return State(
+            board=self.board.copy(stack=False),
+            stacks=dict(self.stacks),
+            white_moves_left=self.white_moves_left,
+            rank8_count=self.rank8_count,
+        )
 
 
 def parse_fen(fen: str) -> State:
@@ -61,6 +76,26 @@ def parse_fen(fen: str) -> State:
         raise ValueError(f"unparseable Chessckers FEN: {fen!r}")
     board_str, overlay_str, rest_str = head_match.groups()
     rest_str = (rest_str or " w - - 0 1").strip()
+
+    # Pull off the optional trailing {wm,r8} block before handing the standard
+    # 6-field FEN to chess.Board (which would choke on a 7th token).
+    white_moves_left, rank8_count = 1, 0
+    ck_match = _FEN_CKSTATE_RE.search(rest_str)
+    if ck_match:
+        rest_str = rest_str[: ck_match.start()].strip()
+        for kv in ck_match.group(1).split(","):
+            kv = kv.strip()
+            if not kv:
+                continue
+            key, _, val = kv.partition(":")
+            key = key.strip()
+            if key == "wm":
+                white_moves_left = int(val)
+            elif key == "r8":
+                rank8_count = int(val)
+            else:
+                raise ValueError(f"unknown Chessckers state key {key!r} in FEN: {fen!r}")
+
     standard_fen = f"{board_str} {rest_str}"
     try:
         board = chess.Board(standard_fen)
@@ -80,7 +115,12 @@ def parse_fen(fen: str) -> State:
                 raise ValueError(f"invalid square in overlay: {entry!r}") from e
             stacks[sq] = pieces
 
-    return State(board=board, stacks=stacks)
+    return State(
+        board=board,
+        stacks=stacks,
+        white_moves_left=white_moves_left,
+        rank8_count=rank8_count,
+    )
 
 
 def _castling_field(rights: int) -> str:
@@ -102,6 +142,18 @@ def _castling_field(rights: int) -> str:
     return s or "-"
 
 
+def _serialize_ckstate(state: State) -> str:
+    """The optional trailing `{wm:..,r8:..}` block. Emitted only when a field is
+    non-default (white_moves_left != 1 or rank8_count != 0), so ordinary
+    positions — and every pre-existing FEN — serialize byte-for-byte unchanged."""
+    parts = []
+    if state.white_moves_left != 1:
+        parts.append(f"wm:{state.white_moves_left}")
+    if state.rank8_count != 0:
+        parts.append(f"r8:{state.rank8_count}")
+    return " {" + ",".join(parts) + "}" if parts else ""
+
+
 def serialize_fen(state: State) -> str:
     """Inverse of parse_fen. Stacks are emitted in ascending square index
     order to match scalachess's canonical form."""
@@ -119,5 +171,7 @@ def serialize_fen(state: State) -> str:
             f"{chess.square_name(sq)}:{pieces}"
             for sq, pieces in sorted(state.stacks.items())
         )
-        return f"{board_part}[{overlay}] {rest}"
-    return f"{board_part} {rest}"
+        base = f"{board_part}[{overlay}] {rest}"
+    else:
+        base = f"{board_part} {rest}"
+    return base + _serialize_ckstate(state)

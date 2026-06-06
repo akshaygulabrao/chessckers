@@ -354,6 +354,23 @@ def apply_white_move(state: State, uci: str) -> State:
         new_state.stacks.pop(captured_sq, None)
 
     new_state.board.push(move)
+    # Opening double-move (#2): when White has two sub-moves this turn, the first
+    # does NOT pass the turn — White moves again. board.push() already flipped the
+    # turn to Black, so flip it back and spend one of the two moves. Otherwise the
+    # turn passes to Black as normal.
+    if new_state.white_moves_left >= 2:
+        new_state.white_moves_left -= 1
+        new_state.board.turn = chess.WHITE
+    else:
+        new_state.white_moves_left = 1
+        # Rank-8 win counter (#3): on completing a White turn, tick if the king
+        # ended on rank 8 (it can't be in check — White's move is check-filtered),
+        # else reset. Reaching 3 is the rank-8 win, detected in the status layer.
+        wk = new_state.board.king(chess.WHITE)
+        if wk is not None and chess.square_rank(wk) == 7:
+            new_state.rank8_count += 1
+        else:
+            new_state.rank8_count = 0
     return new_state
 
 

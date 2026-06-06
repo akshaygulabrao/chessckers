@@ -43,8 +43,9 @@ def test_new_game_default_returns_starting_position():
     assert state["status"] is None
     assert state["winner"] is None
     assert "RNBQKBNR" in state["fen"]
-    # 24 stacks in the overlay, each "square:pieces" -> 24 colons.
-    assert state["fen"].count(":") == 24
+    # 24 stacks in the overlay, each "square:pieces" -> 24 colons (count the
+    # overlay only; the trailing {wm:2} opening-state block also has a colon).
+    assert state["fen"].split("]")[0].count(":") == 24
 
 
 def test_new_game_with_fen_echoes_input():

@@ -160,7 +160,7 @@ inline void relu_(std::vector<float>& x) {
 
 struct ChesskersNet {
     WeightStore w;
-    int c_in = 14, c_filters = 96, d_hidden = 256, d_move = 240;
+    int c_in = 15, c_filters = 96, d_hidden = 256, d_move = 240;
 
     explicit ChesskersNet(const std::string& path) : w(load_weights(path)) {}
 

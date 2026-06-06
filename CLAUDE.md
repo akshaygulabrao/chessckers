@@ -90,16 +90,18 @@ Key invariant: for every Black square, `stacks[sq]`'s top piece matches the bitb
 
 Chessckers FEN appends a bracketed stack overlay after the standard board field: `[a6:s,a7:k,a8:Sks,...]`. Each entry is `square:pieces` where pieces are bottom-to-top: `s`=Stone(unmoved), `S`=Stone(moved), `k`=King.
 
+An optional trailing `{wm:N,r8:N}` block after the six standard fields carries Chessckers turn/win state: `wm` = White sub-moves left this turn (2 only at the opening double-move; default 1) and `r8` = the rank-8 win counter (0–2; default 0). It is omitted when both are at their defaults (so ordinary FENs are unchanged); `STARTING_FEN` carries `{wm:2}`. Parsed/serialized in `variant_py/state.py`, the Rust `parse_r8`, and the C++ `parse_fen`; encoded as position-tensor channel 14 (`r8/3`).
+
 ## Game Rules Reference
 
 The formal spec is in `chessckers.md` (monorepo root). Key points (v3 terms):
-- White plays standard FIDE chess (ranks 1-2).
-- Black has 24 checker pieces (Stones + Kings) on ranks 6-8, organized as **Towers** (stacks).
+- White plays standard FIDE chess (ranks 1-2). **Opening double-move:** on White's first turn of the game, White plays two moves in succession (carried as FEN `{wm:2}`).
+- Black has 24 checker pieces (Stones + Kings) on ranks 6-8, organized as **Towers** (stacks). Initial setup: Stones on ranks 6 and 8 plus a7 & h7; Kings on b7-g7.
 - Black moves: diagonal movement (range = stack height), deploys (stacking/unstacking), back-rank sprint, diagonal **capture hops/chains**, and orthogonal **Charges** (King-top towers).
 - §3B capture rules: a hop walks one diagonal and captures Whites in transit; a chain is several hops sharing a **cadence** (the first hop's length). Paths **never bounce off the rim** — a hop whose cadence landing overshoots the 10×10 grid settles on the last on-board square and ends the turn (legal only if it captured ≥1 White). Intermediate chain stops are optional. Notation: `c<N>:<from>~<hops>-><rest>` (cadence leading; `<rest>` always on-board).
 - **Mandate** (mandatory capture): if any Black tower has a normal-landing capture available, Black must capture this turn.
 - **Ram** (suicide capture): landing on an enemy destroys the tower but captures all enemies on the path; never mandatory; does not capture the landing piece (so a ram onto the King does NOT capture it — only path-captures do).
-- Win: White wins by eliminating all Black towers; Black wins by checkmating (capturing) White's king.
+- Win: White wins by eliminating all Black towers **or by holding its king on rank 8 for three of White's turns without being in check** (FEN `r8` counter; any check resets it); Black wins by checkmating (capturing) White's king.
 
 ## Code Style
 

@@ -1,6 +1,6 @@
 import torch
 
-from chessckers_engine.encoding import MOVE_D
+from chessckers_engine.encoding import MOVE_D, POS_C
 from chessckers_engine.model import ChesskersScorer
 from chessckers_engine.train import save_checkpoint, train
 
@@ -51,7 +51,7 @@ def test_checkpoint_save_and_load_roundtrip(tmp_path):
     fresh = ChesskersScorer()
     fresh.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     # Same forward pass output before and after roundtrip.
-    pos = torch.zeros(1, 14, 8, 8)
+    pos = torch.zeros(1, POS_C, 8, 8)
     mv = torch.zeros(1, MOVE_D)
     with torch.no_grad():
         a = model(pos, mv)
