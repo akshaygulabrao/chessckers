@@ -15,6 +15,11 @@ PY="$ENG/.venv/bin/python"
 RUN="$ENG/weights/run-gcp"            # this box's own client run-dir (mirrors local/leena)
 SEED_MIX="$REPO_ROOT/scripts/seed_mix.txt"
 WORKERS="${WORKERS:-$(nproc)}"        # one self-play worker per vCPU
+# Distinct worker-id-base PER NODE: each worker's RNG is seeded (--seed + worker-id-base + i), so
+# two boxes sharing a base self-play byte-identical games (same net + same RNG stream) and the
+# second box's data is pure duplicate. Hash the hostname into a wide band clear of local(0)/
+# leena(300) so every node — including identical MIG instances — gets its own game stream.
+WORKER_ID_BASE="${WORKER_ID_BASE:-$(( 100000 + $(hostname | cksum | cut -d' ' -f1) % 900000 ))}"
 cd "$ENG" || exit 1
 
 fleet_export_env
@@ -37,6 +42,6 @@ exec "$PY" -m chessckers_engine.fleet_client \
   --server "$SERVER" --run-dir "$RUN" --client-id "gcp-$(hostname)" --poll-seconds "$FLEET_POLL_S" \
   --update-cmd "$UPDATE_CMD" \
   --queue-depth "$WORKERS" --spawn-workers -- \
-  --workers "$WORKERS" --worker-id-base 400 --seed 4000 \
+  --workers "$WORKERS" --worker-id-base "$WORKER_ID_BASE" --seed 4000 \
   --device "$FLEET_DEVICE" --d-hidden "$FLEET_DH" --c-filters "$FLEET_CF" --n-blocks "$FLEET_NB" \
   --max-plies "$FLEET_MAX_PLIES" --sims "$FLEET_SIMS_FALLBACK" --weights-poll-seconds "$FLEET_WEIGHTS_POLL_S"

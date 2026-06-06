@@ -10,7 +10,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
 ZONE="${ZONE:-us-central1-a}"
 NAME="${NAME:-chessckers-sp-1}"
-MACHINE="${MACHINE:-e2-medium}"        # 2 vCPU / 4GB — torch-CPU self-play floor without OOM
+MACHINE="${MACHINE:-e2-standard-8}"        # 8 vCPU / 32GB — 8 self-play workers (one per vCPU)
 TRAINER_IP="${TRAINER_IP:-$(tailscale ip -4 2>/dev/null | head -1)}"
 [ -n "$TRAINER_IP" ] || { echo "no Tailscale IP on this Mac — run 'tailscale up' first"; exit 1; }
 
