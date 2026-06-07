@@ -121,7 +121,7 @@ if [ -x cpp/build.sh ]; then
   else echo "leena: native build FAILED (see run-local/cpp_build.log)"; fi
 fi
 if [ "$BUILD_OK" = 1 ] && "$PY" -c "import chessckers_cpp" 2>/dev/null; then
-  NATIVE="--native"; echo "leena: native C++ engine -> --native"
+  NATIVE="--native"; echo "leena: native C++ engine (v1+v2) -> --native"
 else
   echo "leena: Python engine (no --native) — build failed or ext unavailable"
 fi
@@ -144,6 +144,7 @@ CLIENT_ARGS=(
   --queue-depth "$FLEET_WORKERS" --spawn-workers --
   --workers "$FLEET_WORKERS" --worker-id-base 300 --seed 4000
   --device "$FLEET_DEVICE" --d-hidden "$FLEET_DH" --c-filters "$FLEET_CF" --n-blocks "$FLEET_NB"
+  --arch-version "$FLEET_ARCH_VERSION" --tf-blocks "$FLEET_TF_BLOCKS" --tf-heads "$FLEET_TF_HEADS" --tf-ff-mult "$FLEET_TF_FF"
   --max-plies "$FLEET_MAX_PLIES" --sims "$FLEET_SIMS_FALLBACK" --weights-poll-seconds "$FLEET_WEIGHTS_POLL_S"
 )
 [ -n "$NATIVE" ] && CLIENT_ARGS+=("$NATIVE")

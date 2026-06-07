@@ -31,7 +31,7 @@ from chessckers_engine.device import pick_device
 from chessckers_engine.evaluate import evaluate as run_eval
 from chessckers_engine.inference_server import InferenceServer
 from chessckers_engine.mcts_puct import pick_puct
-from chessckers_engine.model import ChesskersScorer
+from chessckers_engine.model import ChesskersScorer, build_model
 from chessckers_engine.random_player import pick_random
 from chessckers_engine.selfplay_az import JsonlWatchSink, az_game_to_examples, play_az_game
 from chessckers_engine.train_az import save_checkpoint, train_az
@@ -169,7 +169,7 @@ def _eval_game_subprocess(payload: dict) -> str:
     from chessckers_engine.checkpoints import load_checkpoint
     from chessckers_engine.evaluate import play_game as _play_game
     from chessckers_engine.mcts_puct import pick_puct
-    from chessckers_engine.model import ChesskersScorer as _Scorer
+    from chessckers_engine.model import build_model as _build_model
     from chessckers_engine.random_player import pick_random
     from chessckers_engine.variant_py import PyVariantClient as _PVC
 
@@ -181,7 +181,7 @@ def _eval_game_subprocess(payload: dict) -> str:
     def _build_picker(model_path: str | None):
         if model_path is None:
             return lambda state: pick_random(state.get("legalMoves") or [])
-        m = _Scorer(**arch).to(device)
+        m = _build_model(**arch).to(device)
         load_checkpoint(m, model_path)
         m.eval()
         return lambda state: pick_puct(state, client, m, n_sims=n_sims)
@@ -218,12 +218,12 @@ def _play_game_subprocess(payload: dict):
 
     from chessckers_engine.checkpoints import load_checkpoint
     from chessckers_engine.inference_server import InferenceServer as _IS
-    from chessckers_engine.model import ChesskersScorer as _Scorer
+    from chessckers_engine.model import build_model as _build_model
     from chessckers_engine.selfplay_az import play_az_game as _play
     from chessckers_engine.variant_py import PyVariantClient as _PVC
 
     device = _torch.device(payload["device"])
-    model = _Scorer(**payload["model_arch"]).to(device)
+    model = _build_model(**payload["model_arch"]).to(device)
     load_checkpoint(model, payload["state_path"])
     model.eval()
 
@@ -932,6 +932,17 @@ def main() -> int:
     # Model sizing — defaults match the original ~2.4M-param laptop config.
     # AZ-chess scale would be roughly --model-blocks 20 --model-filters 256
     # (~25M params); AZ-go scale ~--model-blocks 40 --model-filters 256.
+    p.add_argument("--arch-version", choices=["v1", "v2"], default="v1",
+                   help="Net architecture: v1 (pooled scorer) or v2 "
+                        "(square-grounded gather head, 10x10 encoding).")
+    p.add_argument("--tf-blocks", type=int, default=0,
+                   help="V2 only: Transformer blocks interleaved into the trunk "
+                        "(residual-first ResTNet RRT; 0 = pure ResNet). The 2.5M-param "
+                        "config matched to V1 is --model-blocks 9 --tf-blocks 7.")
+    p.add_argument("--tf-heads", type=int, default=4,
+                   help="V2 transformer attention heads (must divide --model-filters).")
+    p.add_argument("--tf-ff-mult", type=int, default=4,
+                   help="V2 transformer feed-forward expansion multiplier.")
     p.add_argument("--model-blocks", type=int, default=4,
                    help="Residual blocks in the position trunk. Default 4 (~2.4M params). "
                         "AZ-chess used 20.")
@@ -982,15 +993,28 @@ def main() -> int:
     client = PyVariantClient()
 
     torch.manual_seed(args.seed)
-    model = ChesskersScorer(
-        d_hidden=args.model_hidden,
-        c_filters=args.model_filters,
-        n_blocks=args.model_blocks,
-    ).to(train_device)
+    # One arch dict drives BOTH the in-process build and the worker `model_arch`
+    # (and thus the `.arch.json` sidecar), so they can never drift. Transformer
+    # knobs are V2-only — V1's constructor would reject them.
+    arch_kwargs = {
+        "d_hidden": args.model_hidden,
+        "c_filters": args.model_filters,
+        "n_blocks": args.model_blocks,
+    }
+    if args.arch_version == "v2":
+        arch_kwargs.update(
+            n_tf_blocks=args.tf_blocks,
+            n_heads=args.tf_heads,
+            tf_ff_mult=args.tf_ff_mult,
+        )
+    model = build_model(version=args.arch_version, **arch_kwargs).to(train_device)
     n_params = sum(p.numel() for p in model.parameters())
     log.info(
-        "model: %d blocks × %d filters, hidden=%d → %d params (%.2fM)",
-        args.model_blocks, args.model_filters, args.model_hidden,
+        "model: %s, %d res-blocks%s × %d filters, hidden=%d → %d params (%.2fM)",
+        args.arch_version, args.model_blocks,
+        (f" + {args.tf_blocks} transformer-blocks"
+         if args.arch_version == "v2" and args.tf_blocks else ""),
+        args.model_filters, args.model_hidden,
         n_params, n_params / 1e6,
     )
     if args.base:
@@ -1032,11 +1056,7 @@ def main() -> int:
         worker_mode=args.worker_mode,
         worker_device=device,
         ingest_dir=Path(args.ingest_dir) if args.ingest_dir else None,
-        model_arch={
-            "d_hidden": args.model_hidden,
-            "c_filters": args.model_filters,
-            "n_blocks": args.model_blocks,
-        },
+        model_arch={"version": args.arch_version, **arch_kwargs},
     )
 
     print("\n  iter | τ     | ply̅  | policy | value  | self-play W/B/D | vs.rand W:W/L/D | vs.rand B:W/L/D")

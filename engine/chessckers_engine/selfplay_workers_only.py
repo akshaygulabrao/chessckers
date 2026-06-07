@@ -205,6 +205,13 @@ def main() -> int:
     p.add_argument("--d-hidden", type=int, default=128)
     p.add_argument("--c-filters", type=int, default=64)
     p.add_argument("--n-blocks", type=int, default=4)
+    p.add_argument("--arch-version", choices=["v1", "v2"], default="v1",
+                   help="Net arch: v1 (pooled) or v2 (square-grounded gather head + optional transformer). "
+                        "MUST match the trainer that produced weights.pt.")
+    p.add_argument("--tf-blocks", type=int, default=0,
+                   help="V2 only: Transformer blocks interleaved into the trunk (0 = pure ResNet).")
+    p.add_argument("--tf-heads", type=int, default=4, help="V2 transformer attention heads.")
+    p.add_argument("--tf-ff-mult", type=int, default=4, help="V2 transformer feed-forward expansion.")
     p.add_argument("--weights-poll-seconds", type=float, default=5.0)
     p.add_argument("--native", action="store_true",
                    help="Per-worker mode: run the native C++ PUCT search "
@@ -247,11 +254,20 @@ def main() -> int:
     if not weights_path.exists():
         log.warning("weights file does not exist yet at %s — workers will wait", weights_path)
 
+    # Carry the arch version (+ V2 transformer knobs) so build_model picks the right
+    # class HERE (shared inference) AND in each per-worker subprocess (model_arch rides
+    # in the payload -> selfplay_worker_async build_model). MCTS encoders then dispatch
+    # on model.VERSION automatically.
     model_arch = {
+        "version": args.arch_version,
         "d_hidden": args.d_hidden,
         "c_filters": args.c_filters,
         "n_blocks": args.n_blocks,
     }
+    if args.arch_version == "v2":
+        model_arch.update(
+            n_tf_blocks=args.tf_blocks, n_heads=args.tf_heads, tf_ff_mult=args.tf_ff_mult,
+        )
 
     # SIGTERM → touch stop file, let workers exit cleanly.
     def _on_sigterm(_signum, _frame):
@@ -273,10 +289,10 @@ def main() -> int:
     response_qs: list = []
     if args.shared_inference:
         from chessckers_engine.cross_inference import CrossInferenceServer
-        from chessckers_engine.model import ChesskersScorer
+        from chessckers_engine.model import build_model
 
         device = torch.device(args.device)
-        model = ChesskersScorer(**model_arch).to(device).eval()
+        model = build_model(**model_arch).to(device).eval()
         # Seed model from disk if available; otherwise the watcher will pick
         # it up the first time it appears.
         if weights_path.exists():

@@ -253,6 +253,21 @@ static std::vector<float> encode_move_dict(const py::dict& mv) {
                            has_dem ? mv["demotionsRequired"].cast<int>() : 0, promo);
 }
 
+// Native V2 move-feature encode (114-dim gather features) — mirrors
+// encoding.encode_move_v2 reading the same dict keys.
+static std::vector<float> encode_move_v2_dict(const py::dict& mv) {
+    const int from_sq = cc::parse_square(mv["from"].cast<std::string>());
+    const int to_sq = cc::parse_square(mv["to"].cast<std::string>());
+    std::vector<std::string> wps;
+    if (!mv["waypoints"].is_none()) wps = mv["waypoints"].cast<std::vector<std::string>>();
+    const bool has_deploy = !mv["deployCount"].is_none();
+    const bool has_dem = !mv["demotionsRequired"].is_none();
+    const std::string promo = mv["promotion"].is_none() ? "" : mv["promotion"].cast<std::string>();
+    return cc::encode_move_v2(from_sq, to_sq, wps, !mv["capture"].is_none(), has_deploy,
+                              has_deploy ? mv["deployCount"].cast<int>() : 0, has_dem,
+                              has_dem ? mv["demotionsRequired"].cast<int>() : 0, promo);
+}
+
 // Expand a leaf: native legal-move gen -> Python eval(fen, dicts) -> (value,
 // priors) -> create a child per move via native apply + native status. Returns
 // the leaf's value.
@@ -295,6 +310,15 @@ static void mcts_simulate(cc::PuctNode* root, const py::function& eval_fn, doubl
     cc::backup(path, value, gamma);
 }
 
+// Pick the version-correct encoders for a net: V1 (15ch 8x8 / 240-dim) vs V2
+// (16ch 10x10 / 114-dim gather features). net.is_v2 is set at load from the keys.
+static std::vector<float> encode_pos_for(const cc::ChesskersNet& net, const cc::Board& b) {
+    return net.is_v2 ? cc::encode_position_v2(b) : cc::encode_position(b);
+}
+static std::vector<float> encode_move_for(const cc::ChesskersNet& net, const py::dict& mv) {
+    return net.is_v2 ? encode_move_v2_dict(mv) : encode_move_dict(mv);
+}
+
 // Fully-native expansion: native legal-move gen + native encode + native forward
 // (cc::ChesskersNet) — NOTHING crosses into Python. This is the eval that makes
 // the search fast (the per-leaf Python round-trip was the ~1x bottleneck).
@@ -313,10 +337,11 @@ static double mcts_expand_native(cc::PuctNode* node, const cc::ChesskersNet& net
         node->terminal_status = st.status;
         return cc::terminal_value(*node);
     }
-    const auto pos_enc = cc::encode_position(node->board);
+    const auto pos_enc = encode_pos_for(net, node->board);
     std::vector<std::vector<float>> move_encs;
     move_encs.reserve(n);
-    for (size_t i = 0; i < n; ++i) move_encs.push_back(encode_move_dict(legal[i].cast<py::dict>()));
+    for (size_t i = 0; i < n; ++i)
+        move_encs.push_back(encode_move_for(net, legal[i].cast<py::dict>()));
     const auto r = net.eval(pos_enc, move_encs);
     for (size_t i = 0; i < n; ++i) {
         const py::dict mv = legal[i].cast<py::dict>();
@@ -349,7 +374,7 @@ static void mcts_simulate_native(cc::PuctNode* root, const cc::ChesskersNet& net
     double value;
     if (leaf->is_terminal) value = cc::terminal_value(*leaf);
     else if (!leaf->expanded) value = mcts_expand_native(leaf, net);
-    else value = net.eval(cc::encode_position(leaf->board), {}).first;
+    else value = net.eval(encode_pos_for(net, leaf->board), {}).first;
     cc::backup(path, value, gamma);
 }
 
@@ -579,6 +604,17 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         "encode_move", [](const py::dict& mv) { return encode_move_dict(mv); }, py::arg("move"),
         "Slice 6c: encode a move dict to the flat 240-dim NN move features. Mirrors "
         "encoding.encode_move / Rust encode_move.");
+
+    m.def(
+        "encode_position_v2", [](const cc::Board& b) { return cc::encode_position_v2(b); },
+        py::arg("board"),
+        "V2: encode a Board to the flat 16*10*10 gather-head planes. Mirrors "
+        "encoding.encode_position_v2 / encode_position_state_v2.");
+
+    m.def(
+        "encode_move_v2", [](const py::dict& mv) { return encode_move_v2_dict(mv); }, py::arg("move"),
+        "V2: encode a move dict to the flat 114-dim gather move features "
+        "([from_idx, to_idx, path_mask(100), scalars(12)]). Mirrors encoding.encode_move_v2.");
 
     py::class_<cc::ChesskersNet>(m, "ChesskersNet")
         .def(py::init<const std::string&>(), py::arg("weights_path"),

@@ -113,4 +113,97 @@ inline std::vector<float> encode_move(int from_sq, int to_sq, bool has_capture,
     return out;
 }
 
+// ===== V2 encoders (ChesskersScorerV2: 16ch 10x10 position + 114-d gather move) =====
+// Byte-for-byte port of encoding.encode_position_v2 / encode_move_v2: the 15 V1
+// channels written into the 8x8 interior of a 10x10 grid + an on-board mask plane
+// (ch 15); moves carry 10x10 from/to indices (gathered against the spatial trunk),
+// a rim-aware path mask (endpoints excluded), and 12 type scalars. f64-divide-then
+// -narrow preserved so the planes match PyTorch bit-for-bit.
+
+constexpr int ENC_POS_C_V2 = 16;
+constexpr int ENC_MOVE_D_V2 = 114;
+
+// 10x10 flat index (rank10*10 + file10) of an 8x8 board square — the interior cell,
+// matching encoding._sq10 / _board_cell (the rim offsets the inner board by 1).
+inline int sq10_of(int sq) { return ((sq >> 3) + 1) * 10 + ((sq & 7) + 1); }
+
+inline std::vector<float> encode_position_v2(const Board& b) {
+    std::vector<float> out(ENC_POS_C_V2 * 100, 0.0f);
+    for (int r = 1; r <= 8; ++r)                                  // on-board mask (ch 15)
+        for (int f = 1; f <= 8; ++f) out[15 * 100 + r * 10 + f] = 1.0f;
+    auto set_bits = [&](uint64_t bb, int ch) {
+        while (bb) {
+            const int sq = __builtin_ctzll(bb);
+            bb &= bb - 1;
+            out[ch * 100 + sq10_of(sq)] = 1.0f;
+        }
+    };
+    const uint64_t ow = b.occupied_white, ob = b.occupied_black;
+    set_bits(b.pawns & ow, 0);
+    set_bits(b.knights & ow, 1);
+    set_bits(b.bishops & ow, 2);
+    set_bits(b.rooks & ow, 3);
+    set_bits(b.queens & ow, 4);
+    set_bits(b.kings & ow, 5);
+    set_bits(b.pawns & ob, 6);   // Black Stone-top
+    set_bits(b.kings & ob, 7);   // Black King-top
+    for (const auto& [sq, pieces] : b.stacks) {
+        const int height = (int)pieces.size();
+        if (height == 0) continue;
+        int kings = 0, stones = 0;
+        for (char c : pieces) { if (c == 'k') ++kings; else ++stones; }
+        const int base = sq10_of(sq);
+        out[8 * 100 + base] = static_cast<float>(static_cast<double>(height) / 24.0);
+        out[9 * 100 + base] = static_cast<float>(static_cast<double>(stones) / 24.0);
+        out[10 * 100 + base] = static_cast<float>(static_cast<double>(kings) / 24.0);
+        if (pieces[height - 1] == 's') out[11 * 100 + base] = 1.0f;
+        if (height >= 2 && pieces[height - 2] == 'k') out[12 * 100 + base] = 1.0f;
+    }
+    if (!b.turn_white)
+        for (int r = 1; r <= 8; ++r)
+            for (int f = 1; f <= 8; ++f) out[13 * 100 + r * 10 + f] = 1.0f;
+    if (b.rank8_count != 0) {
+        const float v = static_cast<float>(static_cast<double>(b.rank8_count) / 3.0);
+        for (int r = 1; r <= 8; ++r)
+            for (int f = 1; f <= 8; ++f) out[14 * 100 + r * 10 + f] = v;
+    }
+    return out;
+}
+
+inline int promo_index_v2(const std::string& p) {
+    if (p == "q") return 1;
+    if (p == "r") return 2;
+    if (p == "b") return 3;
+    if (p == "n") return 4;
+    return 0;
+}
+
+inline std::vector<float> encode_move_v2(int from_sq, int to_sq,
+                                         const std::vector<std::string>& waypoints, bool has_capture,
+                                         bool has_deploy, int deploy_count, bool has_demotions,
+                                         int demotions_required, const std::string& promotion) {
+    std::vector<float> out(ENC_MOVE_D_V2, 0.0f);
+    const bool from_ok = from_sq >= 0 && from_sq < 64, to_ok = to_sq >= 0 && to_sq < 64;
+    const int fi = from_ok ? sq10_of(from_sq) : 11;
+    const int ti = to_ok ? sq10_of(to_sq) : 11;
+    out[0] = static_cast<float>(fi);
+    out[1] = static_cast<float>(ti);
+    for (const auto& w : waypoints) {
+        const auto fr = file_rank10(w);
+        if (fr) out[2 + fr->second * 10 + fr->first] = 1.0f;
+    }
+    if (from_ok) out[2 + fi] = 0.0f;   // endpoints gathered separately, never path cells
+    if (to_ok) out[2 + ti] = 0.0f;
+    const int s = 102;
+    if (has_capture) out[s + 0] = 1.0f;
+    if (!waypoints.empty()) out[s + 1] = 1.0f;
+    if (has_deploy) out[s + 2] = 1.0f;
+    if (has_demotions) out[s + 3] = 1.0f;
+    out[s + 4] = static_cast<float>(static_cast<double>(waypoints.size()) / 8.0);
+    out[s + 5] = static_cast<float>(static_cast<double>(has_deploy ? deploy_count : 0) / 24.0);
+    out[s + 6] = static_cast<float>(static_cast<double>(has_demotions ? demotions_required : 0) / 8.0);
+    out[s + 7 + promo_index_v2(promotion)] = 1.0f;
+    return out;
+}
+
 }  // namespace cc

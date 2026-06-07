@@ -46,7 +46,7 @@ sleep 1
 # to the slower-but-correct Python engine rather than running a stale ext).
 NATIVE=""
 if "$PY" -c "import chessckers_cpp" 2>/dev/null; then
-  NATIVE="--native"; say "native C++ engine -> --native"
+  NATIVE="--native"; say "native C++ engine (v1+v2) -> --native"
 else
   say "Python engine (no --native) — ext not importable (build: cd engine && cpp/build.sh)"
 fi
@@ -60,6 +60,7 @@ CLIENT_ARGS=(
   --queue-depth "$WORKERS" --spawn-workers --
   --workers "$WORKERS" --worker-id-base 0 --seed 1000
   --device "$FLEET_DEVICE" --d-hidden "$FLEET_DH" --c-filters "$FLEET_CF" --n-blocks "$FLEET_NB"
+  --arch-version "$FLEET_ARCH_VERSION" --tf-blocks "$FLEET_TF_BLOCKS" --tf-heads "$FLEET_TF_HEADS" --tf-ff-mult "$FLEET_TF_FF"
   --max-plies "$FLEET_MAX_PLIES" --sims "$FLEET_SIMS_FALLBACK" --weights-poll-seconds "$FLEET_WEIGHTS_POLL_S"
 )
 [ -n "$NATIVE" ] && CLIENT_ARGS+=("$NATIVE")

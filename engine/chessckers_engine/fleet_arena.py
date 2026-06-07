@@ -62,7 +62,7 @@ from pathlib import Path
 from chessckers_engine.checkpoints import load_checkpoint
 from chessckers_engine.evaluate import _state_to_outcome
 from chessckers_engine.mcts_puct import run_mcts
-from chessckers_engine.model import ChesskersScorer
+from chessckers_engine.model import ChesskersScorer, build_model
 from chessckers_engine.runtime import setup_logging
 
 log = logging.getLogger("chessckers_engine.fleet_arena")
@@ -235,8 +235,8 @@ def _clock(t: float) -> str:
 
 # --- net loading ---------------------------------------------------------------
 
-def _load_model(path: Path, arch: dict, device) -> ChesskersScorer:
-    m = ChesskersScorer(**arch).to(device)
+def _load_model(path: Path, arch: dict, device):
+    m = build_model(**arch).to(device)
     load_checkpoint(m, str(path))
     m.eval()
     return m
@@ -244,11 +244,12 @@ def _load_model(path: Path, arch: dict, device) -> ChesskersScorer:
 
 def _make_net(path: Path, arch: dict, bin_path: Path, device):
     """Load a checkpoint into a gate-playable net. Native: export the state_dict
-    to a flat .bin and return a cc::ChesskersNet (CPU C++ search). Fallback: the
-    torch model for the Python search."""
+    to a flat .bin and return a cc::ChesskersNet (CPU C++ search; supports both V1
+    and the V2 transformer/gather net). Fallback: the torch model for the Python
+    search when the native extension isn't built."""
     if not NATIVE_OK:
         return _load_model(path, arch, device)
-    m = ChesskersScorer(**arch)
+    m = build_model(**arch)
     load_checkpoint(m, str(path))
     m.eval()
     tmp = str(bin_path) + ".tmp"
@@ -261,6 +262,15 @@ def _atomic_copy(src: Path, dst: Path) -> None:
     tmp = dst.with_suffix(dst.suffix + ".tmp")
     shutil.copy2(src, tmp)
     os.replace(tmp, dst)
+    # Carry the arch sidecar (build_model recipe) so every copied checkpoint —
+    # best.pt and the archived nets/ champions — stays self-describing for offline
+    # loaders (checkpoints.load_scorer / the eval gauntlet). No-op if src has none.
+    src_arch = Path(str(src) + ".arch.json")
+    if src_arch.exists():
+        dst_arch = Path(str(dst) + ".arch.json")
+        atmp = Path(str(dst_arch) + ".tmp")
+        shutil.copy2(src_arch, atmp)
+        os.replace(atmp, dst_arch)
 
 
 def _write_json(path: Path, obj: dict) -> None:
@@ -318,6 +328,13 @@ def main() -> int:
     p.add_argument("--d-hidden", type=int, default=256)
     p.add_argument("--c-filters", type=int, default=96)
     p.add_argument("--n-blocks", type=int, default=4)
+    p.add_argument("--arch-version", choices=["v1", "v2"], default="v1",
+                   help="Net arch the gate nets use: v1 (pooled) or v2 (gather head + optional transformer). "
+                        "MUST match the trainer; rides into match.json so gate clients rebuild the exact net.")
+    p.add_argument("--tf-blocks", type=int, default=0,
+                   help="V2 only: Transformer blocks interleaved into the trunk (0 = pure ResNet).")
+    p.add_argument("--tf-heads", type=int, default=4, help="V2 transformer attention heads.")
+    p.add_argument("--tf-ff-mult", type=int, default=4, help="V2 transformer feed-forward expansion.")
     p.add_argument("--sims", type=int, default=160, help="MCTS sims per move the fleet uses for gate games")
     p.add_argument("--pairs", type=int, default=4, help="color-swapped pairs per seed per opponent (2x games/seed)")
     p.add_argument("--threshold", type=float, default=0.55, help="win-rate vs current best to promote (lc0 gate)")
@@ -353,7 +370,10 @@ def main() -> int:
     if match_path.exists():
         match_path.unlink()                       # no gate open at startup; drop any stale manifest
 
-    arch = {"d_hidden": args.d_hidden, "c_filters": args.c_filters, "n_blocks": args.n_blocks}
+    arch = {"version": args.arch_version, "d_hidden": args.d_hidden,
+            "c_filters": args.c_filters, "n_blocks": args.n_blocks}
+    if args.arch_version == "v2":
+        arch.update(n_tf_blocks=args.tf_blocks, n_heads=args.tf_heads, tf_ff_mult=args.tf_ff_mult)
     ladder_all = args.ladder_rungs.strip().lower() == "all"
     ladder_offsets = [] if ladder_all else [int(x) for x in args.ladder_rungs.split(",") if x.strip()]
     # Keep enough champions that every ladder rung still exists after GC. Under `all` the

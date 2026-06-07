@@ -65,7 +65,85 @@ class ResidualBlock(nn.Module):
         return torch.relu(out + x)
 
 
+class TransformerBlock2d(nn.Module):
+    """Pre-norm Transformer encoder block over a (B, C, H, W) feature map: the
+    H×W grid is read as a sequence of H·W tokens (each a C-dim square embedding)
+    so global self-attention lets every square attend to every other — the
+    long-range board reasoning a fixed 3×3 conv can't do in one layer. Width is
+    held at C (= c_filters) so these blocks compose freely with ResidualBlocks in
+    a single trunk (ResTNet-style interleave, IJCAI'25); the output reshapes back
+    to (B, C, H, W), shape unchanged, so the gather policy head is oblivious to
+    whether the trunk is pure-conv or conv+attention.
+
+    Pre-norm (LN before attn/FFN, residual add after) is the stable-training
+    Transformer variant; GELU FFN with `ff_mult`× expansion. Attention runs over
+    ONE position's tokens at a time (batch dim independent), so a batched forward
+    equals B per-position forwards — the contamination-free property the gather
+    head relies on survives the attention trunk.
+    """
+
+    def __init__(self, c: int, n_heads: int = 4, ff_mult: int = 4):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(c)
+        self.attn = nn.MultiheadAttention(c, n_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(c)
+        self.ff = nn.Sequential(
+            nn.Linear(c, ff_mult * c),
+            nn.GELU(),
+            nn.Linear(ff_mult * c, c),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        t = x.flatten(2).transpose(1, 2)              # (B, H*W, C) tokens
+        n = self.norm1(t)
+        a, _ = self.attn(n, n, n, need_weights=False)
+        t = t + a
+        t = t + self.ff(self.norm2(t))
+        return t.transpose(1, 2).reshape(b, c, h, w)
+
+
+class _AddSpatialPosEmb(nn.Module):
+    """Add a learned per-square positional embedding (1, C, H, W) to the feature
+    map. Self-attention is permutation-invariant over tokens, so the trunk needs
+    an explicit position signal before its first Transformer block (the conv stem
+    supplies some, this makes it first-class). Zero-init = identity at start, so
+    inserting it doesn't perturb the conv features until training learns it."""
+
+    def __init__(self, c: int, h: int = 10, w: int = 10):
+        super().__init__()
+        self.pos = nn.Parameter(torch.zeros(1, c, h, w))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pos
+
+
+def _residual_first_trunk(
+    c_filters: int, n_res: int, n_tf: int, n_heads: int, ff_mult: int
+) -> list[nn.Module]:
+    """Interleave `n_res` ResidualBlocks with `n_tf` TransformerBlock2ds,
+    residual-FIRST and evenly spread. ResTNet (IJCAI'25) found a conv block
+    before each transformer (RRT-style) beats transformer-first (the worst
+    ordering); this emits a ResidualBlock every step and drops in transformers so
+    their running count tracks the fraction of conv blocks placed so far — so the
+    body always opens with a conv and never stacks a transformer before one."""
+    blocks: list[nn.Module] = []
+    placed = 0
+    for i in range(n_res):
+        blocks.append(ResidualBlock(c_filters))
+        due = round(n_tf * (i + 1) / n_res)
+        while placed < due:
+            blocks.append(TransformerBlock2d(c_filters, n_heads, ff_mult))
+            placed += 1
+    while placed < n_tf:                              # safety; due hits n_tf at i=n_res-1
+        blocks.append(TransformerBlock2d(c_filters, n_heads, ff_mult))
+        placed += 1
+    return blocks
+
+
 class ChesskersScorer(nn.Module):
+    VERSION = "v1"
+
     def __init__(
         self,
         c_in: int = POS_C,
@@ -75,6 +153,13 @@ class ChesskersScorer(nn.Module):
         n_blocks: int = 4,
     ):
         super().__init__()
+        # Full reconstruction recipe, stamped so save_checkpoint can drop an
+        # `.arch.json` sidecar and checkpoints.load_scorer can rebuild this exact
+        # model from a bare `.pt` (build_model(**arch)).
+        self.arch = {
+            "version": "v1", "d_hidden": d_hidden,
+            "c_filters": c_filters, "n_blocks": n_blocks,
+        }
         # Position trunk: initial conv + residual tower + bottleneck dense.
         # Kept as a single Sequential so existing tests that walk the trunk
         # looking for Conv2d modules still find the input conv at index 0.
@@ -253,6 +338,19 @@ class ChesskersScorer(nn.Module):
         logits = self.head(combined).squeeze(-1)            # (N,)
         return logits, v
 
+    def training_forward(
+        self, positions: torch.Tensor, padded_moves: torch.Tensor, move_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One trunk pass → (policy_logits (B,n_max), wdl_logits (B,3),
+        ml_pred (B,)) for a padded training batch. The version-uniform surface
+        train_az drives, so the loss is identical across arch versions; for V1
+        this is exactly the old inlined _batch_loss body (bit-identical)."""
+        pos_emb = self.position_trunk(positions)                  # (B, d_hidden)
+        wdl_logits = self.value_head(pos_emb)                     # (B, 3)
+        ml_pred = self.moves_left_head(pos_emb).squeeze(-1)       # (B,)
+        policy_logits = self._batched_move_logits(pos_emb, padded_moves, move_mask)
+        return policy_logits, wdl_logits, ml_pred
+
 
 class ChesskersScorerV2(nn.Module):
     """Square-grounded successor to ChesskersScorer (research-backed; see the
@@ -282,6 +380,8 @@ class ChesskersScorerV2(nn.Module):
     training loss can't diverge (the property V1 advertised for _batched_move_logits).
     """
 
+    VERSION = "v2"
+
     def __init__(
         self,
         c_in: int = POS_C_V2,
@@ -289,19 +389,46 @@ class ChesskersScorerV2(nn.Module):
         d_hidden: int = 256,
         c_filters: int = 96,
         n_blocks: int = 4,
+        n_tf_blocks: int = 0,
+        n_heads: int = 4,
+        tf_ff_mult: int = 4,
     ):
         super().__init__()
         if d_move != MOVE_D_V2:
             raise ValueError(f"ChesskersScorerV2 expects d_move={MOVE_D_V2}; got {d_move}")
+        if n_tf_blocks > 0 and c_filters % n_heads != 0:
+            raise ValueError(
+                f"n_heads ({n_heads}) must divide c_filters ({c_filters}) for the "
+                "transformer trunk"
+            )
         self.c_filters = c_filters
-        # Spatial trunk: initial conv + residual tower, NO flatten/pool. Output
-        # stays (B, c_filters, 10, 10) so the policy head can gather per-square.
-        self.position_trunk = nn.Sequential(
+        # Full reconstruction recipe (see ChesskersScorer.arch). n_tf_blocks=0 →
+        # pure ResNet trunk; >0 interleaves Transformer blocks (residual-first).
+        self.arch = {
+            "version": "v2", "d_hidden": d_hidden, "c_filters": c_filters,
+            "n_blocks": n_blocks, "n_tf_blocks": n_tf_blocks,
+            "n_heads": n_heads, "tf_ff_mult": tf_ff_mult,
+        }
+        # Spatial trunk: initial conv + (residual tower, optionally interleaved
+        # with Transformer blocks), NO flatten/pool. Output stays
+        # (B, c_filters, 10, 10) so the policy head can gather per-square. With
+        # n_tf_blocks=0 the body is exactly the original residual tower (so the
+        # state_dict is byte-identical to the pre-transformer V2); with >0 a
+        # learned positional embedding precedes a residual-first RRT interleave
+        # (the ResTNet strength swing — see `project-policy-head-redesign`).
+        stem = [
             nn.Conv2d(c_in, c_filters, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(num_groups=8, num_channels=c_filters),
             nn.ReLU(inplace=True),
-            *[ResidualBlock(c_filters) for _ in range(n_blocks)],
-        )
+        ]
+        if n_tf_blocks > 0:
+            body: list[nn.Module] = [
+                _AddSpatialPosEmb(c_filters),
+                *_residual_first_trunk(c_filters, n_blocks, n_tf_blocks, n_heads, tf_ff_mult),
+            ]
+        else:
+            body = [ResidualBlock(c_filters) for _ in range(n_blocks)]
+        self.position_trunk = nn.Sequential(*stem, *body)
         # Value/moves-left path: global-pool the spatial map, then a bottleneck.
         self.value_trunk = nn.Sequential(
             nn.Linear(c_filters, d_hidden),
@@ -447,3 +574,27 @@ class ChesskersScorerV2(nn.Module):
             priors[i, : lengths[i]] if lengths[i] else torch.empty(0, device=device)
             for i in range(B)
         ]
+
+    def training_forward(
+        self, positions: torch.Tensor, padded_moves: torch.Tensor, move_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Version-uniform training surface (see ChesskersScorer.training_forward):
+        one spatial trunk pass → pooled value/moves-left heads + the gathered
+        policy logits."""
+        spatial = self._spatial(positions)                   # (B, Cf, 10, 10)
+        pooled = self._pooled(spatial)                       # (B, d_hidden)
+        wdl_logits = self.value_head(pooled)                 # (B, 3)
+        ml_pred = self.moves_left_head(pooled).squeeze(-1)   # (B,)
+        f_flat = spatial.reshape(spatial.shape[0], self.c_filters, 100)
+        policy_logits = self._gather_logits(f_flat, padded_moves, move_mask)
+        return policy_logits, wdl_logits, ml_pred
+
+
+def build_model(version: str = "v1", **arch):
+    """Construct the arch-versioned scorer from a model_arch dict. `arch` carries
+    d_hidden/c_filters/n_blocks (and optionally c_in/d_move); a `version` key is
+    consumed HERE so the same dict can be splatted at every construction site
+    (build_model(**model_arch)). Default 'v1' keeps every existing caller — the
+    whole fleet — byte-identical until a run opts into 'v2'."""
+    cls = ChesskersScorerV2 if version == "v2" else ChesskersScorer
+    return cls(**arch)

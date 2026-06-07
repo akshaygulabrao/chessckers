@@ -23,7 +23,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from chessckers_engine.encoding import encode_move, encode_position
+from chessckers_engine.encoding import encode_move, encode_position, encoders_for
 from chessckers_engine.model import ChesskersScorer
 from chessckers_engine.selfplay_az import AZExample
 
@@ -81,33 +81,18 @@ def _batch_loss(
     (policy_loss, value_loss, mlh_loss), each a mean over the batch.
     `value_loss_fn` is accepted for backward-compat but unused (WDL uses CE)."""
     device = next(model.parameters()).device
+    # Encoders follow the model's arch VERSION (V1 8×8 / 240-d moves, V2 10×10 /
+    # 114-d gather-indexed moves); everything else is version-uniform via
+    # training_forward, so this loss is bit-identical to the old V1 inline body.
+    enc_pos, _, enc_move = encoders_for(getattr(model, "VERSION", "v1"))
     positions = torch.stack(
-        [encode_position(ex.fen) for ex in batch]
-    ).to(device)                                                # (B, C, 8, 8)
+        [enc_pos(ex.fen) for ex in batch]
+    ).to(device)                                                # (B, C, H, W)
 
-    # Trunk once, then the two scalar-ish heads batched.
-    pos_emb = model.position_trunk(positions)                    # (B, d_hidden)
-    # WDL value: cross-entropy against the one-hot Win/Draw/Loss outcome.
-    wdl_logits = model.value_head(pos_emb)                       # (B, 3)
-    wdl_targets = torch.tensor(
-        [ex.wdl_target for ex in batch], dtype=torch.float32, device=device,
-    )                                                            # (B, 3)
-    value_loss = -(wdl_targets * torch.log_softmax(wdl_logits, dim=1)).sum(dim=1).mean()
-    # Moves-left: MSE on scaled plies-to-end.
-    ml_pred = model.moves_left_head(pos_emb).squeeze(-1)         # (B,)
-    ml_target = torch.tensor(
-        [ex.moves_left_target for ex in batch], dtype=torch.float32, device=device,
-    )                                                            # (B,)
-    mlh_loss = nn.functional.mse_loss(ml_pred / MLH_TARGET_SCALE, ml_target / MLH_TARGET_SCALE)
-
-    # Policy head, BATCHED via the model's shared padded-policy forward — the
-    # SAME one MCTS uses in batch_eval, so training loss and inference priors
-    # can't drift apart. (The old code ran B tiny sequential forwards, one per
-    # example, which was kernel-launch-bound on MPS.) Build the padded moves +
-    # mask + visit-distribution target on CPU, then ONE host->device transfer
-    # each (mirrors how `positions`/`wdl_targets` are built above).
+    # Build the padded moves + mask + visit-distribution target on CPU, then ONE
+    # host->device transfer each (mirrors how `positions` is built above).
     move_lists = [
-        torch.stack([encode_move(m) for m in ex.legal_moves]) for ex in batch
+        torch.stack([enc_move(m) for m in ex.legal_moves]) for ex in batch
     ]                                                            # B × (N_i, D) on CPU
     counts = [mv.shape[0] for mv in move_lists]
     B, n_max, d_move = len(batch), max(counts), move_lists[0].shape[1]
@@ -119,10 +104,25 @@ def _batch_loss(
         mask[i, : counts[i]] = True
         target[i, : counts[i]] = torch.tensor(ex.visit_distribution, dtype=torch.float32)
     padded, mask, target = padded.to(device), mask.to(device), target.to(device)
-    logits = model._batched_move_logits(pos_emb, padded, mask)   # (B, n_max); padded -> -inf
+
+    # One trunk pass → policy logits + WDL value logits + moves-left preds. The
+    # policy head is the SAME padded forward MCTS uses, so training loss and
+    # inference priors can't drift apart.
+    logits, wdl_logits, ml_pred = model.training_forward(positions, padded, mask)
+
+    # WDL value: cross-entropy against the one-hot Win/Draw/Loss outcome.
+    wdl_targets = torch.tensor(
+        [ex.wdl_target for ex in batch], dtype=torch.float32, device=device,
+    )                                                            # (B, 3)
+    value_loss = -(wdl_targets * torch.log_softmax(wdl_logits, dim=1)).sum(dim=1).mean()
+    # Moves-left: MSE on scaled plies-to-end.
+    ml_target = torch.tensor(
+        [ex.moves_left_target for ex in batch], dtype=torch.float32, device=device,
+    )                                                            # (B,)
+    mlh_loss = nn.functional.mse_loss(ml_pred / MLH_TARGET_SCALE, ml_target / MLH_TARGET_SCALE)
+    # Policy CE per example = -Σ target·log_probs over valid moves; padded slots
+    # have target=0 and log_probs=-inf (0·-inf=NaN), so zero them before summing.
     log_probs = torch.log_softmax(logits, dim=1)
-    # CE per example = -Σ target·log_probs over valid moves; padded slots have
-    # target=0 and log_probs=-inf (0·-inf=NaN), so zero them before summing.
     policy_loss = (-(target * log_probs)).masked_fill(~mask, 0.0).sum(dim=1).mean()
 
     return policy_loss, value_loss, mlh_loss
@@ -196,3 +196,13 @@ def train_az(
 def save_checkpoint(model: ChesskersScorer, path: str | Path) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), path)
+    # Self-describing sidecar: the bare `.pt` stays a plain state_dict (every
+    # existing load_checkpoint reader is untouched), but an `<path>.arch.json`
+    # records the trunk recipe so checkpoints.load_scorer can rebuild the exact
+    # architecture — essential once the trunk is non-default (e.g. the V2
+    # transformer). Written only for build_model-constructed models (which carry
+    # `.arch`); models built directly get no sidecar and load as before.
+    arch = getattr(model, "arch", None)
+    if arch is not None:
+        import json
+        Path(str(path) + ".arch.json").write_text(json.dumps(arch))

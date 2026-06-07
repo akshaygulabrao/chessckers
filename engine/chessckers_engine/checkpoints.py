@@ -55,3 +55,27 @@ def load_checkpoint(model: nn.Module, path: str | Path) -> tuple[list[str], list
     if unexpected:
         log.warning("checkpoint %s has unexpected keys (ignored): %s", path, unexpected)
     return missing, unexpected
+
+
+def load_scorer(path: str | Path, fallback_version: str = "v1"):
+    """Build the right model for a checkpoint, then load it. Reads the
+    `<path>.arch.json` sidecar written by train_az.save_checkpoint to reconstruct
+    the EXACT architecture (trunk depth, transformer blocks, …) via build_model;
+    without a sidecar (old/bare checkpoints) it falls back to a default-arch
+    model of `fallback_version`. This is what lets a tool point at a `.pt` and
+    get a correctly-shaped model without knowing its arch out-of-band — closing
+    the strict=False footgun where a transformer net silently loads into a
+    plain-ResNet shell (most weights dropped, no error). Returns the model on CPU
+    (caller moves/`.eval()`s as needed)."""
+    import json
+
+    from chessckers_engine.model import build_model
+
+    p = Path(path)
+    arch_path = Path(str(p) + ".arch.json")
+    if arch_path.exists():
+        model = build_model(**json.loads(arch_path.read_text()))
+    else:
+        model = build_model(version=fallback_version)
+    load_checkpoint(model, p)
+    return model

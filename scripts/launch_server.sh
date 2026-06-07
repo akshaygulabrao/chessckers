@@ -70,7 +70,9 @@ pids=()
   --buffer-cap 300000 --min-buffer 2000 --replay-factor 8 --batch-size 256 \
   --per-game-keep "$PER_GAME_KEEP" \
   --publish-seconds 45 --ckpt-seconds 1800 \
-  --d-hidden $FLEET_DH --c-filters $FLEET_CF --n-blocks $FLEET_NB --seed 1000 \
+  --d-hidden $FLEET_DH --c-filters $FLEET_CF --n-blocks $FLEET_NB \
+  --arch-version $FLEET_ARCH_VERSION --tf-blocks $FLEET_TF_BLOCKS --tf-heads $FLEET_TF_HEADS --tf-ff-mult $FLEET_TF_FF \
+  --seed 1000 \
   >"$TLOG" 2>&1 &
 pids+=($!); say "trainer  pid $!  -> $TLOG  (per-game-keep=$PER_GAME_KEEP)"
 
@@ -78,6 +80,7 @@ pids+=($!); say "trainer  pid $!  -> $TLOG  (per-game-keep=$PER_GAME_KEEP)"
 "$PY" -m chessckers_engine.fleet_arena \
   --run-dir "$RUN" --seed-mix-file "$SEED_MIX" \
   --d-hidden $FLEET_DH --c-filters $FLEET_CF --n-blocks $FLEET_NB \
+  --arch-version $FLEET_ARCH_VERSION --tf-blocks $FLEET_TF_BLOCKS --tf-heads $FLEET_TF_HEADS --tf-ff-mult $FLEET_TF_FF \
   --sims 160 --pairs 4 --threshold 0.55 \
   --ladder-rungs all --no-regress 0.50 \
   --max-plies $FLEET_MAX_PLIES --gate-seconds 60 \

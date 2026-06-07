@@ -32,7 +32,7 @@ from typing import Any, Protocol
 
 import torch
 
-from chessckers_engine.encoding import encode_move, encode_position, encode_position_state
+from chessckers_engine.encoding import encoders_for
 from chessckers_engine.model import ChesskersScorer
 
 log = logging.getLogger("chessckers_engine.mcts_puct")
@@ -172,17 +172,19 @@ def _eval_and_priors(
         # concurrent worker threads. The submit API is FEN-keyed, so we
         # still pass the FEN here; cross-process IPC needs a string anyway.
         return evaluator.submit(fen, legal_moves).result()
-    # Direct model path — one trunk pass, both heads.
+    # Direct model path — one trunk pass, both heads. Encoders are chosen by the
+    # model's arch VERSION so a V2 net gets the 10×10 / gather-indexed encoding.
     model = evaluator
+    enc_pos, enc_pos_state, enc_move = encoders_for(getattr(model, "VERSION", "v1"))
     device = next(model.parameters()).device
     pos = (
-        encode_position_state(state) if state is not None else encode_position(fen)
+        enc_pos_state(state) if state is not None else enc_pos(fen)
     ).unsqueeze(0).to(device)
     if not legal_moves:
         with torch.no_grad():
             value = model.value(pos)
         return float(value.item()), []
-    moves = torch.stack([encode_move(m) for m in legal_moves]).to(device)
+    moves = torch.stack([enc_move(m) for m in legal_moves]).to(device)
     with torch.no_grad():
         logits, value = model.policy_and_value(pos, moves)
         probs = torch.softmax(logits, dim=0)
@@ -561,9 +563,26 @@ def pick_puct(
     n_sims: int = 100,
     c_puct: float = 1.5,
     vloss_batch: int = 1,
+    temperature: float = 0.0,
 ) -> LegalMove | None:
-    """Picker-shaped wrapper: returns just the chosen move."""
-    return run_mcts(
+    """Picker-shaped wrapper: returns just the chosen move.
+
+    temperature=0.0 (default) returns the argmax-visits move — deterministic, so
+    every existing caller (self-play gating, eval-vs-random) is unchanged. When
+    >0, sample the move from the visit-count distribution sharpened by
+    temperature (the same `visits^(1/T)` rule self-play uses in
+    selfplay_az.play_az_game) — used by the gauntlet to diversify otherwise
+    identical games."""
+    result = run_mcts(
         state, client, model,
         n_sims=n_sims, c_puct=c_puct, vloss_batch=vloss_batch,
-    ).chosen
+    )
+    if temperature and temperature > 0.0 and result.root.children:
+        children = result.root.children
+        ucis = list(children.keys())
+        visits = torch.tensor([children[u].visits for u in ucis], dtype=torch.float32)
+        if float(visits.sum()) > 0.0:
+            probs = visits.pow(1.0 / temperature)
+            idx = int(torch.multinomial(probs / probs.sum(), 1).item())
+            return children[ucis[idx]].move_to_here
+    return result.chosen

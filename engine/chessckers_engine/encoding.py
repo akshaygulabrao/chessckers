@@ -517,3 +517,12 @@ def encode_move_v2(move: dict[str, Any]) -> torch.Tensor:
     out[s + 6] = (move.get("demotionsRequired") or 0) / 8.0
     out[s + 7 + _PROMO_INDEX.get(move.get("promotion"), 0)] = 1.0
     return out
+
+
+def encoders_for(version: str = "v1"):
+    """Return the (position-from-FEN, position-from-State, move) encoder trio for
+    an arch version, so the play/train hot paths can pick the right encoding from
+    a model's VERSION tag. Default 'v1' is the existing encoding."""
+    if version == "v2":
+        return encode_position_v2, encode_position_state_v2, encode_move_v2
+    return encode_position, encode_position_state, encode_move

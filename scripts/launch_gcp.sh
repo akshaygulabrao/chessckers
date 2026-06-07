@@ -44,4 +44,5 @@ exec "$PY" -m chessckers_engine.fleet_client \
   --queue-depth "$WORKERS" --spawn-workers -- \
   --workers "$WORKERS" --worker-id-base "$WORKER_ID_BASE" --seed 4000 \
   --device "$FLEET_DEVICE" --d-hidden "$FLEET_DH" --c-filters "$FLEET_CF" --n-blocks "$FLEET_NB" \
+  --arch-version "$FLEET_ARCH_VERSION" --tf-blocks "$FLEET_TF_BLOCKS" --tf-heads "$FLEET_TF_HEADS" --tf-ff-mult "$FLEET_TF_FF" \
   --max-plies "$FLEET_MAX_PLIES" --sims "$FLEET_SIMS_FALLBACK" --weights-poll-seconds "$FLEET_WEIGHTS_POLL_S"

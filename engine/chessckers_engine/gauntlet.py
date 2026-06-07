@@ -21,7 +21,7 @@ from typing import Callable
 
 import torch
 
-from chessckers_engine.checkpoints import load_checkpoint
+from chessckers_engine.checkpoints import load_scorer
 from chessckers_engine.evaluate import play_game
 from chessckers_engine.mcts_puct import pick_puct
 from chessckers_engine.model import ChesskersScorer
@@ -32,17 +32,20 @@ log = logging.getLogger("chessckers_engine.gauntlet")
 Picker = Callable[[dict], dict | None]
 
 
-def _load_model(path: Path) -> ChesskersScorer:
-    model = ChesskersScorer()
-    load_checkpoint(model, path)
+def _load_model(path: Path, version: str = "v1") -> ChesskersScorer:
+    # Sidecar-aware: a `<path>.arch.json` (written at train time) reconstructs the
+    # exact trunk — so a 2.5M transformer V2 and a default-arch V1 reload side by
+    # side in one gauntlet. `version` is only the fallback for sidecar-less nets.
+    model = load_scorer(path, fallback_version=version)
     model.eval()
     return model
 
 
 def _make_puct_picker(model: ChesskersScorer, client: PyVariantClient,
-                      n_sims: int, c_puct: float) -> Picker:
+                      n_sims: int, c_puct: float, temperature: float = 0.0) -> Picker:
     def picker(state: dict) -> dict | None:
-        return pick_puct(state, client, model, n_sims=n_sims, c_puct=c_puct)
+        return pick_puct(state, client, model, n_sims=n_sims, c_puct=c_puct,
+                         temperature=temperature)
     return picker
 
 
@@ -58,12 +61,14 @@ def gauntlet_match(
     n_sims: int,
     c_puct: float,
     max_plies: int = 400,
+    temperature: float = 0.0,
 ) -> dict:
     """Play `n_games` between challenger and champion. Half games the
     challenger plays White, half plays Black. Returns counts from the
-    challenger's perspective with per-color breakdown."""
-    challenger_pick = _make_puct_picker(challenger, client, n_sims, c_puct)
-    champion_pick = _make_puct_picker(champion, client, n_sims, c_puct)
+    challenger's perspective with per-color breakdown. `temperature`>0 samples
+    moves (diversifies otherwise-identical deterministic games)."""
+    challenger_pick = _make_puct_picker(challenger, client, n_sims, c_puct, temperature)
+    champion_pick = _make_puct_picker(champion, client, n_sims, c_puct, temperature)
 
     overall = _empty_record()
     by_color = {"as_white": _empty_record(), "as_black": _empty_record()}
@@ -110,6 +115,7 @@ def run_ladder(
     n_sims: int,
     c_puct: float,
     max_plies: int = 400,
+    version: str = "v1",
 ) -> list[dict]:
     """For each consecutive iter-az-N vs iter-az-{N-1} pair in `ladder_dir`,
     run a gauntlet_match and collect per-pair scores. Returns a list of dicts
@@ -124,8 +130,8 @@ def run_ladder(
         champ_path, chal_path = ckpts[i - 1], ckpts[i]
         log.info("ladder rung %d/%d: %s vs %s",
                  i, len(ckpts) - 1, chal_path.name, champ_path.name)
-        champ = _load_model(champ_path)
-        chal = _load_model(chal_path)
+        champ = _load_model(champ_path, version)
+        chal = _load_model(chal_path, version)
         result = gauntlet_match(chal, champ, client,
                                 n_games=games_per_match, n_sims=n_sims,
                                 c_puct=c_puct, max_plies=max_plies)
@@ -178,7 +184,17 @@ def main() -> int:
     p.add_argument("--max-plies", type=int, default=400)
     p.add_argument("--use-server", action="store_true",
                    help="Deprecated no-op: PyVariant is always used (scalachess server removed).")
+    p.add_argument("--arch-version", choices=["v1", "v2"], default="v1",
+                   help="Net arch (v1 pooled / v2 gather head). Ladder default + "
+                        "fallback for both pairwise models.")
+    p.add_argument("--challenger-version", choices=["v1", "v2"], default=None,
+                   help="Override arch for the challenger (head-to-head cross-version).")
+    p.add_argument("--champion-version", choices=["v1", "v2"], default=None,
+                   help="Override arch for the champion (head-to-head cross-version).")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="Sample moves at this temperature instead of argmax "
+                        "(>0 diversifies the otherwise-deterministic games). 0 = argmax.")
     args = p.parse_args()
 
     if not (args.ladder_dir or (args.challenger and args.champion)):
@@ -191,14 +207,16 @@ def main() -> int:
     if args.ladder_dir:
         rows = run_ladder(Path(args.ladder_dir), client,
                           games_per_match=args.games, n_sims=args.sims,
-                          c_puct=args.c_puct, max_plies=args.max_plies)
+                          c_puct=args.c_puct, max_plies=args.max_plies,
+                          version=args.arch_version)
         print(format_ladder(rows))
     else:
-        chal = _load_model(Path(args.challenger))
-        champ = _load_model(Path(args.champion))
+        chal = _load_model(Path(args.challenger), args.challenger_version or args.arch_version)
+        champ = _load_model(Path(args.champion), args.champion_version or args.arch_version)
         result = gauntlet_match(chal, champ, client,
                                 n_games=args.games, n_sims=args.sims,
-                                c_puct=args.c_puct, max_plies=args.max_plies)
+                                c_puct=args.c_puct, max_plies=args.max_plies,
+                                temperature=args.temperature)
         print(format_match(args.challenger, args.champion, result))
 
     client.close()

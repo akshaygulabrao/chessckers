@@ -85,22 +85,24 @@ inline std::vector<float> linear_batch(const std::vector<float>& X, int N,
     return Y;
 }
 
-// conv k3p1 bias=false via im2col + GEMM. in: [Cin,8,8], w: [Cout,Cin*9] -> [Cout,8,8].
+// conv k3p1 bias=false via im2col + GEMM. in: [Cin,H,W], w: [Cout,Cin*9] -> [Cout,H,W].
+// H,W default to 8 (V1's 8x8 board); V2's spatial trunk passes 10,10. With H=W=8 the
+// body is bit-identical to the original (the loop bounds become runtime, the math doesn't).
 inline std::vector<float> conv3x3(const std::vector<float>& in, int Cin,
-                                  const std::vector<float>& w, int Cout) {
-    constexpr int HW = 64;
+                                  const std::vector<float>& w, int Cout, int H = 8, int W = 8) {
+    const int HW = H * W;
     std::vector<float> col((size_t)Cin * 9 * HW, 0.0f);
     for (int ci = 0; ci < Cin; ++ci)
         for (int ky = 0; ky < 3; ++ky)
             for (int kx = 0; kx < 3; ++kx) {
                 float* cp = &col[(size_t)(ci * 9 + ky * 3 + kx) * HW];
                 const float* ip = &in[(size_t)ci * HW];
-                for (int y = 0; y < 8; ++y) {
+                for (int y = 0; y < H; ++y) {
                     const int iy = y + ky - 1;
-                    for (int x = 0; x < 8; ++x) {
+                    for (int x = 0; x < W; ++x) {
                         const int ix = x + kx - 1;
-                        cp[y * 8 + x] =
-                            (iy >= 0 && iy < 8 && ix >= 0 && ix < 8) ? ip[iy * 8 + ix] : 0.0f;
+                        cp[y * W + x] =
+                            (iy >= 0 && iy < H && ix >= 0 && ix < W) ? ip[iy * W + ix] : 0.0f;
                     }
                 }
             }
@@ -111,8 +113,7 @@ inline std::vector<float> conv3x3(const std::vector<float>& in, int Cin,
 }
 
 inline void groupnorm_(std::vector<float>& x, int C, int G, const std::vector<float>& w,
-                       const std::vector<float>& b, float eps = 1e-5f) {
-    constexpr int HW = 64;
+                       const std::vector<float>& b, float eps = 1e-5f, int HW = 64) {
     const int cg = C / G;
     for (int g = 0; g < G; ++g) {
         const int c0 = g * cg, c1 = (g + 1) * cg, cnt = cg * HW;
@@ -158,11 +159,34 @@ inline void relu_(std::vector<float>& x) {
         if (v < 0) v = 0;
 }
 
+// Exact GELU (erf form) — matches PyTorch nn.GELU() default (approximate='none').
+inline void gelu_(std::vector<float>& x) {
+    for (float& v : x) {
+        const double z = v;
+        v = static_cast<float>(0.5 * z * (1.0 + std::erf(z * 0.70710678118654752440)));
+    }
+}
+
 struct ChesskersNet {
     WeightStore w;
     int c_in = 15, c_filters = 96, d_hidden = 256, d_move = 240;
+    bool is_v2 = false;   // ChesskersScorerV2: square-grounded gather head + (optional) transformer trunk
+    int n_heads = 4;
 
-    explicit ChesskersNet(const std::string& path) : w(load_weights(path)) {}
+    explicit ChesskersNet(const std::string& path) : w(load_weights(path)) {
+        // V2 is detected by the gather head's source projection. It uses a 16-channel
+        // 10x10 encoding + 114-dim move features (vs V1's 15ch / 8x8 / 240). d_hidden and
+        // c_filters are read off src_proj.weight [d_hidden, c_filters] so the same loader
+        // serves any width.
+        const auto sp = w.tensors.find("src_proj.weight");
+        if (sp != w.tensors.end()) {
+            is_v2 = true;
+            c_in = 16;
+            d_move = 114;
+            d_hidden = sp->second.shape[0];
+            c_filters = sp->second.shape[1];
+        }
+    }
 
     std::vector<float> trunk(const std::vector<float>& pos) const {
         auto x = conv3x3(pos, c_in, w.at("position_trunk.0.weight"), c_filters);
@@ -218,8 +242,194 @@ struct ChesskersNet {
         return linear_batch(h, N, w.at("head.3.weight"), w.at("head.3.bias"), 1, d_hidden);  // [N]
     }
 
+    // ===== V2 (ChesskersScorerV2): square-grounded gather head + transformer trunk =====
+
+    // One pre-norm Transformer encoder block over the 100 square-tokens of the
+    // (c_filters,10,10) map, in place on the channel-major buffer x[c_filters*100].
+    // attn(LN(t)) residual, then ff(LN(t)) residual — mirrors model.TransformerBlock2d.
+    void transformer_block_(std::vector<float>& x, const std::string& p) const {
+        const int T = 100, C = c_filters, Hn = n_heads, hd = C / Hn;
+        std::vector<float> t((size_t)T * C);                    // channel-major [C,T] -> token-major [T,C]
+        for (int c = 0; c < C; ++c)
+            for (int s = 0; s < T; ++s) t[(size_t)s * C + c] = x[(size_t)c * T + s];
+
+        // ---- self-attention (pre-norm) ----
+        std::vector<float> n = t;
+        layernorm_(n, T, C, w.at(p + "norm1.weight"), w.at(p + "norm1.bias"));
+        // PyTorch MultiheadAttention packs Q,K,V into in_proj_weight [3C,C] / in_proj_bias [3C].
+        const auto qkv = linear_batch(n, T, w.at(p + "attn.in_proj_weight"),
+                                      w.at(p + "attn.in_proj_bias"), 3 * C, C);
+        const float scale = 1.0f / std::sqrt((float)hd);
+        std::vector<float> attn_out((size_t)T * C);
+        std::vector<float> Qh((size_t)T * hd), Kh((size_t)T * hd), Vh((size_t)T * hd),
+            scores((size_t)T * T), Oh((size_t)T * hd);
+        for (int h = 0; h < Hn; ++h) {
+            const int off = h * hd;
+            for (int s = 0; s < T; ++s) {
+                const float* row = &qkv[(size_t)s * 3 * C];
+                for (int d = 0; d < hd; ++d) {
+                    Qh[(size_t)s * hd + d] = row[off + d];
+                    Kh[(size_t)s * hd + d] = row[C + off + d];
+                    Vh[(size_t)s * hd + d] = row[2 * C + off + d];
+                }
+            }
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, T, hd, scale, Qh.data(), hd,
+                        Kh.data(), hd, 0.0f, scores.data(), T);            // Qh @ Kh^T / sqrt(hd)
+            for (int i = 0; i < T; ++i) {                                  // row softmax (double)
+                float* sr = &scores[(size_t)i * T];
+                float mx = sr[0];
+                for (int j = 1; j < T; ++j) mx = std::max(mx, sr[j]);
+                double sum = 0.0;
+                for (int j = 0; j < T; ++j) { sr[j] = (float)std::exp((double)sr[j] - mx); sum += sr[j]; }
+                const float inv = (float)(1.0 / sum);
+                for (int j = 0; j < T; ++j) sr[j] *= inv;
+            }
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, T, hd, T, 1.0f, scores.data(), T,
+                        Vh.data(), hd, 0.0f, Oh.data(), hd);               // scores @ Vh
+            for (int s = 0; s < T; ++s)
+                for (int d = 0; d < hd; ++d) attn_out[(size_t)s * C + off + d] = Oh[(size_t)s * hd + d];
+        }
+        const auto proj = linear_batch(attn_out, T, w.at(p + "attn.out_proj.weight"),
+                                       w.at(p + "attn.out_proj.bias"), C, C);
+        for (size_t i = 0; i < t.size(); ++i) t[i] += proj[i];            // residual
+
+        // ---- feed-forward (pre-norm): Linear -> GELU -> Linear ----
+        std::vector<float> n2 = t;
+        layernorm_(n2, T, C, w.at(p + "norm2.weight"), w.at(p + "norm2.bias"));
+        const int ff_dim = (int)w.at(p + "ff.0.bias").size();             // ff_mult * C
+        auto h1 = linear_batch(n2, T, w.at(p + "ff.0.weight"), w.at(p + "ff.0.bias"), ff_dim, C);
+        gelu_(h1);
+        const auto h2 = linear_batch(h1, T, w.at(p + "ff.2.weight"), w.at(p + "ff.2.bias"), C, ff_dim);
+        for (size_t i = 0; i < t.size(); ++i) t[i] += h2[i];              // residual
+
+        for (int c = 0; c < C; ++c)                                       // token-major -> channel-major
+            for (int s = 0; s < T; ++s) x[(size_t)c * T + s] = t[(size_t)s * C + c];
+    }
+
+    // Spatial trunk: stem conv + (pos-emb, residual/transformer blocks). Returns the
+    // (c_filters,10,10) feature map flat [c_filters*100] — NO pool/flatten (the gather
+    // head needs it spatial). Blocks are walked by index and dispatched on which keys
+    // exist, so any residual-first interleave (or pure ResNet) works without hardcoding.
+    std::vector<float> trunk_v2(const std::vector<float>& pos) const {
+        const int HW = 100;
+        auto x = conv3x3(pos, c_in, w.at("position_trunk.0.weight"), c_filters, 10, 10);
+        groupnorm_(x, c_filters, 8, w.at("position_trunk.1.weight"), w.at("position_trunk.1.bias"),
+                   1e-5f, HW);
+        relu_(x);
+        for (int k = 3;; ++k) {
+            const std::string p = "position_trunk." + std::to_string(k) + ".";
+            if (w.tensors.count(p + "pos")) {                             // _AddSpatialPosEmb
+                const auto& pe = w.at(p + "pos");                         // [1,c_filters,10,10]
+                for (size_t i = 0; i < x.size(); ++i) x[i] += pe[i];
+            } else if (w.tensors.count(p + "conv1.weight")) {             // ResidualBlock
+                auto c1 = conv3x3(x, c_filters, w.at(p + "conv1.weight"), c_filters, 10, 10);
+                groupnorm_(c1, c_filters, 8, w.at(p + "bn1.weight"), w.at(p + "bn1.bias"), 1e-5f, HW);
+                relu_(c1);
+                auto c2 = conv3x3(c1, c_filters, w.at(p + "conv2.weight"), c_filters, 10, 10);
+                groupnorm_(c2, c_filters, 8, w.at(p + "bn2.weight"), w.at(p + "bn2.bias"), 1e-5f, HW);
+                for (size_t i = 0; i < x.size(); ++i) c2[i] += x[i];
+                relu_(c2);
+                x = std::move(c2);
+            } else if (w.tensors.count(p + "attn.in_proj_weight")) {      // TransformerBlock2d
+                transformer_block_(x, p);
+            } else {
+                break;                                                    // end of trunk
+            }
+        }
+        return x;
+    }
+
+    // WDL value off the spatial map: global-mean-pool -> value_trunk -> value_head.
+    float value_v2(const std::vector<float>& F) const {
+        std::vector<float> pooled(c_filters);
+        for (int c = 0; c < c_filters; ++c) {
+            double s = 0.0;
+            for (int i = 0; i < 100; ++i) s += F[(size_t)c * 100 + i];
+            pooled[c] = (float)(s / 100.0);
+        }
+        auto vt = linear_batch(pooled, 1, w.at("value_trunk.0.weight"), w.at("value_trunk.0.bias"),
+                               d_hidden, c_filters);
+        layernorm_(vt, 1, d_hidden, w.at("value_trunk.1.weight"), w.at("value_trunk.1.bias"));
+        relu_(vt);
+        auto v = linear_batch(vt, 1, w.at("value_head.0.weight"), w.at("value_head.0.bias"),
+                              d_hidden / 2, d_hidden);
+        layernorm_(v, 1, d_hidden / 2, w.at("value_head.1.weight"), w.at("value_head.1.bias"));
+        relu_(v);
+        const auto wdl = linear_batch(v, 1, w.at("value_head.3.weight"), w.at("value_head.3.bias"),
+                                      3, d_hidden / 2);
+        const float mx = std::max({wdl[0], wdl[1], wdl[2]});
+        const double e0 = std::exp(wdl[0] - mx), e1 = std::exp(wdl[1] - mx), e2 = std::exp(wdl[2] - mx);
+        return (float)((e0 - e2) / (e0 + e1 + e2));
+    }
+
+    // Gather policy head: per move, gather F at from/to/path squares, then
+    //   logit = (src_proj(F[from]) . tgt_proj(F[to])) / sqrt(d_hidden)
+    //         + ctx_mlp([F[from], F[to], pathmean(F), type_scalars]).
+    // Move features: [0]=from_idx, [1]=to_idx, [2:102]=path mask (100), [102:]=K scalars.
+    std::vector<float> policy_logits_v2(const std::vector<float>& F,
+                                        const std::vector<std::vector<float>>& moves) const {
+        const int N = (int)moves.size(), C = c_filters;
+        std::vector<float> FF((size_t)N * C), TF((size_t)N * C), PF((size_t)N * C);
+        for (int i = 0; i < N; ++i) {
+            const auto& m = moves[i];
+            const int fi = (int)std::lround(m[0]), ti = (int)std::lround(m[1]);
+            for (int c = 0; c < C; ++c) {
+                FF[(size_t)i * C + c] = F[(size_t)c * 100 + fi];
+                TF[(size_t)i * C + c] = F[(size_t)c * 100 + ti];
+            }
+            double denom = 0.0;
+            for (int j = 0; j < 100; ++j) denom += m[2 + j];
+            if (denom < 1.0) denom = 1.0;
+            for (int c = 0; c < C; ++c) {
+                double s = 0.0;
+                for (int j = 0; j < 100; ++j) {
+                    const float pj = m[2 + j];
+                    if (pj != 0.0f) s += (double)pj * F[(size_t)c * 100 + j];
+                }
+                PF[(size_t)i * C + c] = (float)(s / denom);
+            }
+        }
+        const auto src = linear_batch(FF, N, w.at("src_proj.weight"), w.at("src_proj.bias"), d_hidden, C);
+        const auto tgt = linear_batch(TF, N, w.at("tgt_proj.weight"), w.at("tgt_proj.bias"), d_hidden, C);
+        const float scale = std::sqrt((float)d_hidden);
+        const int K = d_move - 102, ctx_in = 3 * C + K;                   // K type scalars (=12)
+        std::vector<float> ci((size_t)N * ctx_in);
+        for (int i = 0; i < N; ++i) {
+            float* r = &ci[(size_t)i * ctx_in];
+            for (int c = 0; c < C; ++c) r[c] = FF[(size_t)i * C + c];
+            for (int c = 0; c < C; ++c) r[C + c] = TF[(size_t)i * C + c];
+            for (int c = 0; c < C; ++c) r[2 * C + c] = PF[(size_t)i * C + c];
+            for (int k = 0; k < K; ++k) r[3 * C + k] = moves[i][102 + k];
+        }
+        auto hh = linear_batch(ci, N, w.at("ctx_mlp.0.weight"), w.at("ctx_mlp.0.bias"), d_hidden, ctx_in);
+        layernorm_(hh, N, d_hidden, w.at("ctx_mlp.1.weight"), w.at("ctx_mlp.1.bias"));
+        relu_(hh);
+        const auto ctx = linear_batch(hh, N, w.at("ctx_mlp.3.weight"), w.at("ctx_mlp.3.bias"), 1, d_hidden);
+        std::vector<float> logits(N);
+        for (int i = 0; i < N; ++i) {
+            double d = 0.0;
+            for (int j = 0; j < d_hidden; ++j)
+                d += (double)src[(size_t)i * d_hidden + j] * tgt[(size_t)i * d_hidden + j];
+            logits[i] = (float)(d / scale) + ctx[i];
+        }
+        return logits;
+    }
+
     std::pair<float, std::vector<float>> eval(const std::vector<float>& pos,
                                               const std::vector<std::vector<float>>& moves) const {
+        if (is_v2) {
+            const auto F = trunk_v2(pos);
+            const float v = value_v2(F);
+            const int N = (int)moves.size();
+            std::vector<float> priors(N);
+            if (N == 0) return {v, priors};
+            const auto logits = policy_logits_v2(F, moves);
+            const float mx = *std::max_element(logits.begin(), logits.end());
+            double s = 0.0;
+            for (float l : logits) s += std::exp(l - mx);
+            for (int i = 0; i < N; ++i) priors[i] = (float)(std::exp(logits[i] - mx) / s);
+            return {v, priors};
+        }
         const auto pe = trunk(pos);
         const float v = value(pe);
         const int N = (int)moves.size();

@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from chessckers_engine.model import ChesskersScorer
+from chessckers_engine.model import ChesskersScorer, ChesskersScorerV2
 from chessckers_engine.native_net import export_state_dict
 
 cpp = pytest.importorskip("chessckers_cpp")
@@ -42,6 +42,31 @@ def test_native_search_matches_eval_callback(net, seed: str, n_sims: int):
         return net.eval(cpp.encode_position(b), [cpp.encode_move(mv) for mv in moves])
 
     _, vd_native, *_ = cpp.run_mcts_native(cpp.parse_fen(seed), net, n_sims, 1.5)
+    _, vd_callback = cpp.run_mcts(cpp.parse_fen(seed), evf, n_sims, 1.5)
+    assert dict(vd_native) == dict(vd_callback), f"seed={seed} n_sims={n_sims}"
+
+
+@pytest.fixture(scope="module")
+def net_v2(tmp_path_factory):
+    torch.manual_seed(0)
+    m = ChesskersScorerV2(n_blocks=9, n_tf_blocks=7, n_heads=4, tf_ff_mult=4)
+    m.eval()
+    wpath = str(tmp_path_factory.mktemp("net_v2") / "net.bin")
+    export_state_dict(m.state_dict(), wpath)
+    return cpp.ChesskersNet(wpath)
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("n_sims", [16, 48])
+def test_native_v2_search_matches_eval_callback(net_v2, seed: str, n_sims: int):
+    """The fully-native V2 search (run_mcts_native -> encode_pos/move_for -> V2
+    encoders + gather-head eval) must equal the eval-callback search that encodes
+    V2 explicitly — confirming run_mcts_native dispatches to the V2 encoders."""
+    def evf(fen, moves):
+        b = cpp.parse_fen(fen)
+        return net_v2.eval(cpp.encode_position_v2(b), [cpp.encode_move_v2(mv) for mv in moves])
+
+    _, vd_native, *_ = cpp.run_mcts_native(cpp.parse_fen(seed), net_v2, n_sims, 1.5)
     _, vd_callback = cpp.run_mcts(cpp.parse_fen(seed), evf, n_sims, 1.5)
     assert dict(vd_native) == dict(vd_callback), f"seed={seed} n_sims={n_sims}"
 

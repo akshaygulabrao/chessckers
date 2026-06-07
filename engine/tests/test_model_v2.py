@@ -21,7 +21,13 @@ from chessckers_engine.encoding import (
     encode_position_state_v2,
     encode_position_v2,
 )
-from chessckers_engine.model import ChesskersScorerV2
+from chessckers_engine.model import (
+    ChesskersScorer,
+    ChesskersScorerV2,
+    ResidualBlock,
+    TransformerBlock2d,
+    _AddSpatialPosEmb,
+)
 from chessckers_engine.variant_py.client import PyVariantClient
 
 # Black king-top tower on d4; White pawns on c3/e3 → a real diagonal capture
@@ -158,3 +164,91 @@ def test_gather_is_coordinate_aligned_with_spatial_map():
     idx = _sq10("d4")
     r10, f10 = divmod(idx, 10)
     assert torch.equal(flat[0, :, idx], spatial[0, :, r10, f10])
+
+
+# --------------------------------------------------------------------------- #
+# Transformer trunk (ResTNet residual-first interleave; gather head unchanged)
+# --------------------------------------------------------------------------- #
+def test_zero_transformer_blocks_is_byte_identical_resnet():
+    # n_tf_blocks=0 (the default) must keep the trunk a pure ResNet: no
+    # positional-embedding or attention params, so pre-transformer V2 checkpoints
+    # and the committed module stay loadable byte-for-byte.
+    keys = set(ChesskersScorerV2(d_hidden=64, c_filters=32, n_blocks=2).state_dict())
+    assert not any(k.endswith(".pos") or "attn" in k or ".ff." in k for k in keys)
+
+
+def test_transformer_trunk_adds_attention_and_is_residual_first():
+    model = ChesskersScorerV2(d_hidden=64, c_filters=32, n_blocks=2,
+                              n_tf_blocks=2, n_heads=4)
+    keys = list(model.state_dict())
+    assert any(k.endswith(".pos") for k in keys)      # learned positional embedding
+    assert any("attn" in k for k in keys)             # multi-head attention params
+    # Trunk body (after the 3-module conv stem) must OPEN with the positional
+    # embedding then a residual block — never a transformer first (ResTNet: the
+    # transformer-first ordering was the worst).
+    body = list(model.position_trunk.children())[3:]
+    assert isinstance(body[0], _AddSpatialPosEmb)
+    first_res = next(i for i, m in enumerate(body) if isinstance(m, ResidualBlock))
+    first_tf = next(i for i, m in enumerate(body) if isinstance(m, TransformerBlock2d))
+    assert first_res < first_tf
+
+
+def test_transformer_config_is_param_matched_to_v1():
+    # The headline scale-up: 9 residual + 7 transformer @ default 96 filters lands
+    # at ~2.52M params — matched to V1's ~2.51M (the delta is the 9.6K pos-emb), so
+    # the A/B is a fair "same budget, better architecture" comparison.
+    v2t = ChesskersScorerV2(n_blocks=9, n_tf_blocks=7, n_heads=4, tf_ff_mult=4)
+    n = sum(p.numel() for p in v2t.parameters())
+    assert n == 2_522_597, n
+    n_v1 = sum(p.numel() for p in ChesskersScorer().parameters())
+    assert abs(n - n_v1) < 25_000  # within ~1% of V1 — param-matched
+
+
+def test_transformer_invalid_heads_rejected():
+    import pytest
+    with pytest.raises(ValueError):
+        ChesskersScorerV2(c_filters=32, n_tf_blocks=1, n_heads=5)  # 5 ∤ 32
+
+
+def test_transformer_batch_eval_has_no_cross_position_contamination():
+    # Attention runs over ONE position's 100 tokens; batching two positions must
+    # not leak features between them, so batched priors == per-position softmax.
+    torch.manual_seed(0)
+    model = ChesskersScorerV2(d_hidden=64, c_filters=32, n_blocks=2,
+                              n_tf_blocks=2, n_heads=4).eval()
+    fen_a, moves_a = _client_moves()
+    fen_b, moves_b = _client_moves(CHAIN_FEN)
+    pos_a = encode_position_v2(fen_a).unsqueeze(0)
+    pos_b = encode_position_v2(fen_b).unsqueeze(0)
+    mv_a = torch.stack([encode_move_v2(m) for m in moves_a])
+    mv_b = torch.stack([encode_move_v2(m) for m in moves_b])
+    with torch.no_grad():
+        log_a = model(pos_a, mv_a)
+        assert torch.isfinite(log_a).all()
+        ref_a = torch.softmax(log_a, dim=0)
+        ref_b = torch.softmax(model(pos_b, mv_b), dim=0)
+        _, priors = model.batch_eval(torch.cat([pos_a, pos_b]), [mv_a, mv_b])
+    assert torch.allclose(priors[0], ref_a, atol=1e-4)
+    assert torch.allclose(priors[1], ref_b, atol=1e-4)
+
+
+def test_arch_sidecar_roundtrip_rebuilds_transformer(tmp_path):
+    # save_checkpoint drops a `.arch.json`; load_scorer rebuilds the EXACT trunk
+    # (transformer included) from a bare .pt and reproduces the same logits —
+    # the property the gauntlet relies on to reload a V2T net at its true shape.
+    from chessckers_engine.checkpoints import load_scorer
+    from chessckers_engine.train_az import save_checkpoint
+
+    torch.manual_seed(0)
+    model = ChesskersScorerV2(d_hidden=64, c_filters=32, n_blocks=2,
+                              n_tf_blocks=2, n_heads=4).eval()
+    path = tmp_path / "v2t.pt"
+    save_checkpoint(model, path)
+    assert (tmp_path / "v2t.pt.arch.json").exists()
+    reloaded = load_scorer(path).eval()
+    assert reloaded.arch == model.arch
+    fen, moves = _client_moves(CHAIN_FEN)
+    pos = encode_position_v2(fen).unsqueeze(0)
+    mv = torch.stack([encode_move_v2(m) for m in moves])
+    with torch.no_grad():
+        assert torch.allclose(model(pos, mv), reloaded(pos, mv), atol=1e-6)

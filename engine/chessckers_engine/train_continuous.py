@@ -41,7 +41,7 @@ import torch
 
 from chessckers_engine.checkpoints import load_checkpoint
 from chessckers_engine.device import pick_device
-from chessckers_engine.model import ChesskersScorer
+from chessckers_engine.model import ChesskersScorer, build_model
 from chessckers_engine.runtime import setup_logging
 from chessckers_engine.train_az import _batch_loss, save_checkpoint
 from chessckers_engine.training_chunk import ChunkDecodeError, decode_chunk
@@ -242,6 +242,12 @@ def _publish(model: ChesskersScorer, weights_path: Path) -> None:
     tmp = weights_path.with_suffix(".pt.tmp")
     save_checkpoint(model, tmp)
     os.replace(tmp, weights_path)  # atomic on POSIX
+    # save_checkpoint wrote the arch sidecar against the tmp name; move it to the
+    # final name so offline loaders (checkpoints.load_scorer / eval) can rebuild
+    # the exact net. (The fleet itself reads arch from fleet.env/CLI, not this.)
+    tmp_arch = Path(str(tmp) + ".arch.json")
+    if tmp_arch.exists():
+        os.replace(tmp_arch, Path(str(weights_path) + ".arch.json"))
 
 
 def main() -> int:
@@ -283,6 +289,12 @@ def main() -> int:
     p.add_argument("--d-hidden", type=int, default=256)
     p.add_argument("--c-filters", type=int, default=96)
     p.add_argument("--n-blocks", type=int, default=4)
+    p.add_argument("--arch-version", choices=["v1", "v2"], default="v1",
+                   help="Net arch: v1 (pooled) or v2 (square-grounded gather head + optional transformer).")
+    p.add_argument("--tf-blocks", type=int, default=0,
+                   help="V2 only: Transformer blocks interleaved into the trunk (0 = pure ResNet).")
+    p.add_argument("--tf-heads", type=int, default=4, help="V2 transformer attention heads.")
+    p.add_argument("--tf-ff-mult", type=int, default=4, help="V2 transformer feed-forward expansion.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-steps", type=int, default=0, help="stop after N SGD steps (0 = until STOP)")
     p.add_argument("--max-games", type=int, default=0,
@@ -308,9 +320,16 @@ def main() -> int:
 
     torch.manual_seed(args.seed)
     device = pick_device(args.device)
-    model = ChesskersScorer(
-        d_hidden=args.d_hidden, c_filters=args.c_filters, n_blocks=args.n_blocks,
-    ).to(device)
+    # One arch dict drives the build AND the published `.arch.json` sidecar (so
+    # clients + arena rebuild the exact net). Transformer knobs are V2-only.
+    arch_kwargs = {
+        "d_hidden": args.d_hidden, "c_filters": args.c_filters, "n_blocks": args.n_blocks,
+    }
+    if args.arch_version == "v2":
+        arch_kwargs.update(
+            n_tf_blocks=args.tf_blocks, n_heads=args.tf_heads, tf_ff_mult=args.tf_ff_mult,
+        )
+    model = build_model(version=args.arch_version, **arch_kwargs).to(device)
     if args.base:
         load_checkpoint(model, args.base)
         log.info("[train] warm-started from %s", args.base)

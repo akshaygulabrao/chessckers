@@ -185,12 +185,12 @@ def play_forever(payload: dict) -> int:
     else:
         from chessckers_engine.checkpoints import load_checkpoint
         from chessckers_engine.inference_server import InferenceServer as _IS
-        from chessckers_engine.model import ChesskersScorer as _Scorer
+        from chessckers_engine.model import build_model as _build_model
 
         weights_path = Path(payload["weights_path"])
         poll_s = float(payload.get("weights_poll_seconds", 2.0))
         device = _torch.device(payload["device"])
-        model = _Scorer(**payload["model_arch"]).to(device).eval()
+        model = _build_model(**payload["model_arch"]).to(device).eval()
         # Wait for initial weights to land — otherwise we'd self-play with random init.
         while not weights_path.exists():
             if _stop_requested(stop_path):
@@ -360,7 +360,7 @@ def play_jobs_forever(payload: dict) -> int:
     from chessckers_engine import heartbeat as _hb
     from chessckers_engine.checkpoints import load_checkpoint
     from chessckers_engine.inference_server import InferenceServer as _IS
-    from chessckers_engine.model import ChesskersScorer as _Scorer
+    from chessckers_engine.model import build_model as _build_model
     from chessckers_engine.replay_buffer import ReplayBuffer
     from chessckers_engine.selfplay_az import az_game_to_examples, play_az_game
     from chessckers_engine.variant_py import PyVariantClient as _PVC
@@ -382,7 +382,7 @@ def play_jobs_forever(payload: dict) -> int:
     weights_path = Path(payload["weights_path"])
     poll_s = float(payload.get("weights_poll_seconds", 2.0))
     device = _torch.device(payload["device"])
-    model = _Scorer(**payload["model_arch"]).to(device).eval()
+    model = _build_model(**payload["model_arch"]).to(device).eval()
     use_native = bool(payload.get("use_native", False))
     native_search = None
     net_box = [None]
