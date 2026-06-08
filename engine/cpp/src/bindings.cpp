@@ -891,6 +891,31 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         "Phase 6a: run C=A@B on the Metal GPU via MPSGraph; return max abs diff vs CPU (-1 no "
         "GPU, -2 built without Metal).");
 
+    // Phase 6b: run the V2 spatial trunk on the Metal GPU for a full leaf batch; returns
+    // (ok, [feature_map per board]). ok=False if no GPU or an unsupported (transformer) block.
+    m.def(
+        "metal_trunk_v2",
+        [](const cc::ChesskersNet& net,
+           const std::vector<std::vector<float>>& positions) -> py::tuple {
+#ifdef CC_HAVE_METAL
+            cc::MetalTrunkV2 t(net);
+            if (!t.ok()) return py::make_tuple(false, py::list());
+            std::vector<std::vector<float>> feats;
+            {
+                py::gil_scoped_release rel;
+                feats = t.run(positions);
+            }
+            py::list out;
+            for (auto& f : feats) out.append(py::cast(f));
+            return py::make_tuple(true, out);
+#else
+            (void)net; (void)positions;
+            return py::make_tuple(false, py::list());
+#endif
+        },
+        py::arg("net"), py::arg("positions"),
+        "Phase 6b: V2 spatial trunk on the Metal GPU (batched). (ok, feature maps).");
+
     py::class_<cc::ChesskersNet>(m, "ChesskersNet")
         .def(py::init<const std::string&>(), py::arg("weights_path"),
              "Slice 6: native NN forward, loaded from native_net.export_state_dict.")
