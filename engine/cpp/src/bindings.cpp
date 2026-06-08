@@ -1153,4 +1153,24 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         py::arg("seq_start") = 1,
         "Run the standalone self-play client loop (next_game -> get_network -> play -> upload) "
         "against base_url. Train jobs only (match = Phase 4). Returns games uploaded.");
+    m.def(
+        "run_jobs_local",
+        [](const std::string& run_dir, const std::string& start_fen, int worker_id,
+           const std::string& machine, uint64_t base_seed, int max_jobs, long seq_start) {
+            int n;
+            {
+                py::gil_scoped_release release;
+                n = cc::run_jobs_local(run_dir, start_fen, worker_id, machine, base_seed, max_jobs,
+                                       seq_start);
+            }
+            return n;
+        },
+        py::arg("run_dir"), py::arg("start_fen"), py::arg("worker_id") = 400,
+        py::arg("machine") = "cpp-client", py::arg("base_seed") = 0, py::arg("max_jobs") = 0,
+        py::arg("seq_start") = 1,
+        "Run the local-job ENGINE loop (NO HTTP): claim jobs from run_dir/jobs/ (atomic), play "
+        "the native engine, write train chunks to run_dir/buffer/ + gate outcomes to "
+        "run_dir/match_out/. The train net is run_dir/weights.bin (mtime hot-reload); match nets "
+        "are the job's local cand_bin/opp_bin paths. max_jobs<=0 runs until run_dir/STOP. Returns "
+        "the count handled.");
 }
