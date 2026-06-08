@@ -13,6 +13,7 @@
 
 #include "apply.hpp"
 #include "board.hpp"
+#include "chunk.hpp"
 #include "encode.hpp"
 #include "movegen.hpp"
 #include "movegen_white.hpp"
@@ -618,6 +619,28 @@ static py::object play_games_native(cc::Board board, const cc::ChesskersNet& net
     return out;
 }
 
+// Phase 3A: play one native game and encode it to a ccz1 training chunk (gzipped
+// JSON) entirely in C++ — the self-play CLIENT primitive (play -> chunk -> upload).
+// seed S here matches play_game_native(seed=S) / play_games_native(base_seed=S)[0].
+static py::bytes play_game_chunk(cc::Board board, const cc::ChesskersNet& net, int n_sims,
+                                 double c_puct, double temperature, int temp_cutoff_plies,
+                                 int max_plies, double dirichlet_alpha, double dirichlet_eps,
+                                 uint64_t seed, double resign_threshold, double resign_no_resign_frac,
+                                 int resign_consecutive, int resign_min_ply) {
+    const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
+    const double gamma = g ? std::atof(g) : 1.0;
+    std::string bytes;
+    {
+        py::gil_scoped_release release;
+        cc::PureGame game = cc::play_game_pure(
+            board, net, n_sims, c_puct, temperature, temp_cutoff_plies, max_plies, dirichlet_alpha,
+            dirichlet_eps, seed, resign_threshold, resign_no_resign_frac, resign_consecutive,
+            resign_min_ply, gamma);
+        bytes = cc::encode_chunk(game);
+    }
+    return py::bytes(bytes);
+}
+
 PYBIND11_MODULE(chessckers_cpp, m) {
     m.doc() = "Chessckers C++ engine (Slice 0: board + FEN; Slice 1: §3B capture hops)";
 
@@ -992,4 +1015,15 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         "base_seed+i so the result is thread-count-independent and game i is byte-identical to "
         "play_game_native(seed=base_seed+i). Returns [(records, outcome, final_status)] — one "
         "tuple per game, each shaped exactly like play_game_native's return.");
+
+    m.def(
+        "play_game_chunk", &play_game_chunk, py::arg("board"), py::arg("net"),
+        py::arg("n_sims") = 100, py::arg("c_puct") = 1.5, py::arg("temperature") = 1.0,
+        py::arg("temp_cutoff_plies") = 30, py::arg("max_plies") = 400,
+        py::arg("dirichlet_alpha") = 0.0, py::arg("dirichlet_eps") = 0.25, py::arg("seed") = 0,
+        py::arg("resign_threshold") = 0.0, py::arg("resign_no_resign_frac") = 0.1,
+        py::arg("resign_consecutive") = 2, py::arg("resign_min_ply") = 8,
+        "Phase 3A: play one native game (seed) and encode it to a ccz1 training chunk (gzipped "
+        "JSON bytes) — the self-play client primitive. Decodable by training_chunk.decode_chunk; "
+        "tensor-identical to az_game_to_examples(play_game_native(seed)).");
 }
