@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from chessckers_engine import fleet_server, train_continuous
-from chessckers_engine.model import ChesskersScorer
+from chessckers_engine.model import ChesskersScorer, ChesskersScorerV2
 
 pytest.importorskip("chessckers_cpp")
 
@@ -54,25 +54,25 @@ def server(tmp_path):
         httpd.server_close()
 
 
-@pytest.mark.slow
-def test_spawn_engines_end_to_end(server, tmp_path):
-    if not CC_SELFPLAY.exists():
-        pytest.skip("cc_selfplay not built (run cpp/build.sh)")
+def _run_engine_e2e(server, tmp_path, net, extra_engine_args, machine, queue_depth):
+    """Drive a fleet_client --spawn-engines subprocess against the live server: publish
+    `net`, let it sync weights.bin + spawn a cc_selfplay engine + mint+play+upload jobs,
+    then STOP and assert chunks landed. Returns the subprocess output for diagnostics."""
     base, srv_rd, httpd = server
-    train_continuous._publish(ChesskersScorer(), srv_rd / "weights.pt")  # .pt + .bin twins
+    train_continuous._publish(net, srv_rd / "weights.pt")  # .pt + .bin twins
     (srv_rd / "selfplay.json").write_text(json.dumps({"sims": 12, "max_plies": 20}))
 
     crd = tmp_path / "client"
     crd.mkdir()
-    env = {**os.environ, "CHESSCKERS_START_FEN": SEED_FEN, "MACHINE": "enginebox"}
+    env = {**os.environ, "CHESSCKERS_START_FEN": SEED_FEN, "MACHINE": machine}
     proc = subprocess.Popen(
         [sys.executable, "-m", "chessckers_engine.fleet_client",
          "--server", base, "--run-dir", str(crd), "--spawn-engines",
          "--engine-workers", "1", "--engine-worker-id-base", "500", "--engine-seed", "0",
-         "--poll-seconds", "1", "--queue-depth", "2"],
+         "--poll-seconds", "1", "--queue-depth", str(queue_depth), *extra_engine_args],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
-        deadline = time.time() + 90
+        deadline = time.time() + 120
         while time.time() < deadline and httpd.games_ingested < 1:
             if proc.poll() is not None:
                 break
@@ -92,3 +92,24 @@ def test_spawn_engines_end_to_end(server, tmp_path):
     assert fleet_server._NAME_RE.match(pkls[0].name), pkls[0].name
     # The engine synced + ran off the .bin the orchestrator distributed.
     assert (crd / "weights.bin").exists()
+    return out
+
+
+@pytest.mark.slow
+def test_spawn_engines_end_to_end(server, tmp_path):
+    if not CC_SELFPLAY.exists():
+        pytest.skip("cc_selfplay not built (run cpp/build.sh)")
+    _run_engine_e2e(server, tmp_path, ChesskersScorer(), [], "enginebox", queue_depth=2)
+
+
+@pytest.mark.slow
+def test_spawn_engines_gpu_batched_end_to_end(server, tmp_path):
+    """Phase 6f capstone: the kept orchestrator drives a GPU-BATCHED engine end-to-end
+    (--engine-gpu --engine-batch-size). A V2 net so the Metal trunk path is exercised on
+    Apple (falls back to the CPU batched trunk where there's no Metal device — either way
+    the full orchestrator -> batched engine -> upload -> ingest chain must work)."""
+    if not CC_SELFPLAY.exists():
+        pytest.skip("cc_selfplay not built (run cpp/build.sh)")
+    net = ChesskersScorerV2(n_blocks=2, n_tf_blocks=1, n_heads=4, tf_ff_mult=2)
+    _run_engine_e2e(server, tmp_path, net, ["--engine-gpu", "--engine-batch-size", "4"],
+                    "gpubox", queue_depth=8)
