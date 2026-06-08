@@ -114,10 +114,13 @@ inline Job parse_job(const std::string& body) {
     return j;
 }
 
-// Upload filename: <worker_id>_<10-digit seq>.pkl — matches fleet_server._NAME_RE.
+// Upload filename: <worker_id>_<10-digit seq>.pkl — matches fleet_server._NAME_RE
+// (`\d{3,}_\d{10}`) AND the Python ReplayBuffer's `{worker_id:03d}_{game_id:010d}`. The
+// worker_id is zero-padded to a MINIMUM of 3 digits (so a low base like local's 0 -> "000"
+// still passes _NAME_RE; bases already >=3 digits, e.g. gcp's 100000+, are unaffected).
 inline std::string client_filename(int worker_id, long seq) {
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "%d_%010ld.pkl", worker_id, seq);
+    std::snprintf(buf, sizeof(buf), "%03d_%010ld.pkl", worker_id, seq);
     return std::string(buf);
 }
 

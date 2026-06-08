@@ -333,21 +333,99 @@ def _spawn_workers(worker_argv: list, run_dir: Path, weights: Path, log_path: Pa
     return proc, f
 
 
+class _EnginePool:
+    """Supervise N `cc_selfplay --jobs-local` engine procs — the lc0 engine-binary half the
+    orchestrator drives (Phase 3B-3 cutover). Each proc claims jobs from run_dir/jobs/ (the N
+    procs race-claim the shared queue via atomic rename), plays the native engine off
+    run_dir/weights.bin, and writes buffer/ + match_out/. Each gets a distinct --worker-id and
+    --seed (so chunk filenames + RNG streams don't collide). Dead procs are restarted
+    individually (a crashed engine only frees its one in-flight claim). The lc0-style
+    orchestrator (HTTP / STOP / self-update / heartbeat) stays in fleet_client; this is just the
+    engine the client owns, swapped Python->C++."""
+
+    def __init__(self, binary: str, run_dir: Path, n: int, worker_id_base: int, seed: int,
+                 machine: str, log_dir: Path) -> None:
+        self.binary = binary
+        self.run_dir = run_dir
+        self.n = max(1, n)
+        self.worker_id_base = worker_id_base
+        self.seed = seed
+        self.machine = machine
+        self.log_dir = log_dir
+        self.procs: list = [None] * self.n
+        self.logs: list = [None] * self.n
+
+    def _spawn_one(self, i: int) -> None:
+        wid = self.worker_id_base + i
+        cmd = [self.binary, "--jobs-local", "--run-dir", str(self.run_dir),
+               "--worker-id", str(wid), "--seed", str(self.seed + i), "--machine", self.machine]
+        f = open(self.log_dir / f"engine-{wid}.log", "a")
+        # cc_selfplay reads CHESSCKERS_START_FEN from the inherited env (the launcher exports it).
+        self.procs[i] = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+        self.logs[i] = f
+        log.info("spawned engine %d (pid %d, cc_selfplay --jobs-local)", wid, self.procs[i].pid)
+
+    def ensure(self) -> None:
+        """Spawn any engine that isn't running (first start) or has died (restart)."""
+        for i in range(self.n):
+            p = self.procs[i]
+            if p is None:
+                self._spawn_one(i)
+            elif p.poll() is not None:
+                log.warning("engine %d exited (rc=%s) — restarting", self.worker_id_base + i,
+                            p.returncode)
+                if self.logs[i] is not None:
+                    self.logs[i].close()
+                self._spawn_one(i)
+
+    def started(self) -> bool:
+        return any(p is not None for p in self.procs)
+
+    def any_alive(self) -> bool:
+        return any(p is not None and p.poll() is None for p in self.procs)
+
+    def status(self) -> str:
+        """Heartbeat tag (X-Client-Workers): off (none spawned) / up (all alive) / down (any dead)."""
+        if not self.started():
+            return "off"
+        return "up" if all(p is not None and p.poll() is None for p in self.procs) else "down"
+
+    def stop(self, timeout: float = 30.0) -> None:
+        """Wind the pool down: the engines self-exit on run_dir/STOP (touched by the caller);
+        wait, then terminate any straggler."""
+        for p in self.procs:
+            if p is None:
+                continue
+            try:
+                p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                p.terminate()
+            except OSError:
+                pass
+
+
 def _self_update(want: str, current: str, update_cmd: str, run_dir: Path,
-                 stop_path: Path, worker_proc) -> None:
+                 stop_path: Path, worker_proc, engine_pool=None) -> None:
     """Pull + rebuild this box onto code sha `want` via `update_cmd`, then re-exec this
     client onto the fresh code (lc0's client-updates-itself, adapted). On success
     os.execv replaces this process and never returns. On failure (cmd errored, or the
     working tree didn't actually advance to `want`) it logs and returns, leaving the box
     visibly on `current` — the caller's backoff retries later (e.g. once the code lands).
-    Owned workers are wound down before the rebuild so a stale .so isn't mid-search."""
+    Owned workers/engines are wound down before the rebuild so a stale .so / binary isn't
+    mid-search."""
     log.warning("code self-update: server on %s, running %s — running update-cmd", want, current)
-    if worker_proc is not None:
+    if worker_proc is not None or engine_pool is not None:
         try:
             stop_path.touch()
-            worker_proc.terminate()
         except OSError:
             pass
+        if worker_proc is not None:
+            try:
+                worker_proc.terminate()
+            except OSError:
+                pass
+        if engine_pool is not None:
+            engine_pool.stop(timeout=5.0)
     try:
         r = subprocess.run(update_cmd, shell=True, cwd=str(run_dir.parent),
                            timeout=600, capture_output=True, text=True)
@@ -679,6 +757,21 @@ def main() -> int:
                    help="Own the self-play worker subprocess (lc0-style): launch "
                         "selfplay_workers_only, restart it if it dies, report liveness. "
                         "Worker flags follow a `--` separator; --run-dir/--weights injected.")
+    p.add_argument("--spawn-engines", action="store_true",
+                   help="Own N cc_selfplay --jobs-local ENGINE procs instead of the Python "
+                        "selfplay_workers_only (Phase 3B-3 cutover, true lc0 engine binary). "
+                        "Each claims jobs from run-dir/jobs/ and plays off run-dir/weights.bin. "
+                        "Mutually exclusive with --spawn-workers.")
+    p.add_argument("--engine-binary", default="",
+                   help="Path to the cc_selfplay executable (default: engine/cpp/build/cc_selfplay "
+                        "relative to this client).")
+    p.add_argument("--engine-workers", type=int, default=os.cpu_count() or 4,
+                   help="--spawn-engines: number of cc_selfplay procs (default: ncpu).")
+    p.add_argument("--engine-worker-id-base", type=int, default=0,
+                   help="--spawn-engines: first --worker-id (distinct per box, like the Python "
+                        "worker-id-base; engine i gets base+i).")
+    p.add_argument("--engine-seed", type=int, default=0,
+                   help="--spawn-engines: base RNG seed (engine i gets seed+i).")
     p.add_argument("--update-cmd", default="",
                    help="Shell command that pulls + rebuilds this box's code when the server "
                         "advertises a newer version (e.g. 'cd ~/chessckers && git pull --ff-only "
@@ -711,11 +804,29 @@ def main() -> int:
     jobs_dir.mkdir(parents=True, exist_ok=True)
     match_out.mkdir(parents=True, exist_ok=True)
 
+    if args.spawn_workers and args.spawn_engines:
+        log.error("--spawn-workers and --spawn-engines are mutually exclusive")
+        return 2
+
     log.info("fleet client up: server=%s run-dir=%s poll=%.0fs id=%s version=%s",
              server, run_dir, args.poll_seconds, client_id, client_version)
+    # The engine pool (Phase 3B-3): N cc_selfplay --jobs-local procs the orchestrator owns,
+    # spawned once weights.bin lands. Built here (no procs yet); .ensure()d in step 4.
+    engine_pool = None
+    if args.spawn_engines:
+        binary = args.engine_binary or str(
+            Path(__file__).resolve().parent.parent / "cpp" / "build" / "cc_selfplay")
+        engine_pool = _EnginePool(
+            binary=binary, run_dir=run_dir, n=args.engine_workers,
+            worker_id_base=args.engine_worker_id_base, seed=args.engine_seed,
+            machine=os.environ.get("MACHINE", "unknown"), log_dir=run_dir)
+        log.info("owning engines (lc0 client-drives, job-driven): %d x cc_selfplay --jobs-local "
+                 "(%s) | worker-id-base=%d queue-depth=%d", args.engine_workers, binary,
+                 args.engine_worker_id_base, args.queue_depth)
     # A box can play gate games iff it owns per-worker workers (a shared-inference pool has no
-    # standalone model to load arbitrary gate nets); a self-play-only box declines match jobs.
-    can_match = args.spawn_workers and "--shared-inference" not in worker_argv
+    # standalone model to load arbitrary gate nets) OR the C++ engine (cc_selfplay plays match
+    # jobs natively); a self-play-only box declines match jobs.
+    can_match = (args.spawn_workers and "--shared-inference" not in worker_argv) or args.spawn_engines
     if args.spawn_workers:
         log.info("owning workers (lc0 client-drives, job-driven): selfplay_workers_only %s "
                  "| queue-depth=%d gate=%s", " ".join(worker_argv) or "(no extra args)",
@@ -727,6 +838,7 @@ def main() -> int:
     total_gate = 0           # gate outcomes shipped to /match_result
     worker_proc = None
     worker_log = None
+    engines_started = False  # reset the job queue once, on the pool's first spawn
     job_seq = 0              # monotonic job-file sequence (unique <seq>.json names in jobs/)
     update_cmd = args.update_cmd
     update_backoff: dict = {}  # sha -> last attempt time, so a self-update isn't retried every tick
@@ -745,6 +857,9 @@ def main() -> int:
             if args.spawn_workers:
                 ws = ("down" if (worker_proc is not None and worker_proc.poll() is not None)
                       else "up" if worker_proc is not None else "off")
+                hb_tick = {**hb, "X-Client-Workers": ws}
+            elif args.spawn_engines:
+                ws = engine_pool.status()
                 hb_tick = {**hb, "X-Client-Workers": ws}
             else:
                 ws = "n/a"
@@ -788,7 +903,7 @@ def main() -> int:
                     log.info("health: control=%s net=%s workers=%s uploaded=%d",
                              control, (have_sha[:12] if have_sha else last_version) or "none", ws, total_up)
             if control == "STOP":
-                log.info("server signaled STOP -> stopping local workers + exiting")
+                log.info("server signaled STOP -> stopping local workers/engines + exiting")
                 try:
                     stop_path.touch()
                 except OSError:
@@ -799,6 +914,8 @@ def main() -> int:
                     except subprocess.TimeoutExpired:
                         log.warning("workers slow to stop; terminating")
                         worker_proc.terminate()
+                if engine_pool is not None:
+                    engine_pool.stop(timeout=30)
                 break
             # 1b. code self-update (lc0-style): re-exec onto the trainer host's code if
             #     we booted on an older sha. Backoff so it self-corrects if the code lands
@@ -816,7 +933,8 @@ def main() -> int:
                     log.warning("code drift: server on %s, this box booted on %s "
                                 "(no --update-cmd; update manually)", want, client_version)
                 else:
-                    _self_update(want, client_version, update_cmd, run_dir, stop_path, worker_proc)
+                    _self_update(want, client_version, update_cmd, run_dir, stop_path,
+                                 worker_proc, engine_pool)
             # 2. net — content-addressed sync off /control's X-Network-Sha (preferred), or the
             #    legacy /version+/weights poll for a server that doesn't advertise the sha.
             #    Skipped when control failed (server unreachable — nothing to pull this tick).
@@ -855,13 +973,24 @@ def main() -> int:
                     _reset_queue(jobs_dir, match_out)
                     worker_proc, worker_log = _spawn_workers(
                         worker_argv, run_dir, weights, run_dir / "workers.log")
-            # 5. lc0 client-drives-each-game: keep the owned workers fed with server-assigned
-            #    jobs. While the queue is below --queue-depth, POST /next_game and queue the reply
-            #    for a worker to claim (a `train` job -> a self-play game; a `match` job -> a gate
-            #    game, the two nets pre-fetched by sha). The workers claim + play; their outputs
-            #    ship in steps 3/3b. Skipped when control failed (server unreachable) or the pool
-            #    isn't up yet (nothing to claim the jobs).
-            if control_ok and worker_proc is not None and worker_proc.poll() is None:
+            elif args.spawn_engines and weights_bin.exists():
+                # Engines need the C++-loadable net; spawn once weights.bin has landed, then
+                # keep the pool full (dead procs restart individually). Reset the shared queue
+                # ONCE on first spawn so a fresh pool never claims a stale job; a single engine
+                # restart does NOT reset (it would disrupt the other N-1's in-flight claims).
+                if not engines_started:
+                    _reset_queue(jobs_dir, match_out)
+                    engines_started = True
+                engine_pool.ensure()
+            # 5. lc0 client-drives-each-game: keep the owned workers/engines fed with server-
+            #    assigned jobs. While the queue is below --queue-depth, POST /next_game and queue
+            #    the reply for a worker to claim (a `train` job -> a self-play game; a `match` job
+            #    -> a gate game, the two nets pre-fetched by sha). The workers claim + play; their
+            #    outputs ship in steps 3/3b. Skipped when control failed (server unreachable) or
+            #    the pool isn't up yet (nothing to claim the jobs).
+            pool_up = ((worker_proc is not None and worker_proc.poll() is None)
+                       or (engine_pool is not None and engine_pool.any_alive()))
+            if control_ok and pool_up:
                 job_seq = _mint_jobs(server, jobs_dir, gate_dir, args.queue_depth, job_seq,
                                      can_match, args.timeout, hb_tick)
         except Exception as e:  # noqa: BLE001 — unattended box: never die on an unexpected tick error
