@@ -13,9 +13,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -43,8 +46,114 @@ struct PureGame {
     std::string final_status;   // "" == None (resigned/maxplies games)
 };
 
+// ---- leaf evaluator indirection (Phase 6d: GPU leaf batching) ----
+// The NN FORWARD is the only thing that varies between the serial path and the batched
+// GPU path; encoding stays inline (it needs the net's arch). DirectEvaluator is the
+// byte-identical default (calls net.eval). BatchEvaluator gathers leaves from ALL
+// in-flight games into ONE eval_batch — the lc0 design (many concurrent games, one
+// shared batched backend). Because eval_batch is byte-identical to K serial eval()
+// calls, every game played through the batcher is byte-identical to its serial self,
+// no matter how the threads pack leaves into batches — the parity gate is NOT loosened.
+struct Evaluator {
+    virtual ~Evaluator() = default;
+    virtual std::pair<float, std::vector<float>> eval(
+        const std::vector<float>& pos, const std::vector<std::vector<float>>& moves) = 0;
+};
+
+struct DirectEvaluator : Evaluator {
+    const ChesskersNet& net;
+    explicit DirectEvaluator(const ChesskersNet& n) : net(n) {}
+    std::pair<float, std::vector<float>> eval(
+        const std::vector<float>& pos, const std::vector<std::vector<float>>& moves) override {
+        return net.eval(pos, moves);
+    }
+};
+
+// The batched forward: K leaves -> K (value, priors). Either net.eval_batch (CPU) or
+// MetalTrunkV2::eval_batch (GPU) — selfplay.hpp stays backend-agnostic (the binding
+// supplies it; cc_selfplay supplies the CPU one), so Metal types never leak in here.
+using BatchForwardFn = std::function<std::vector<std::pair<float, std::vector<float>>>(
+    const std::vector<std::vector<float>>&, const std::vector<std::vector<std::vector<float>>>&)>;
+
+// Shared batching evaluator. Each game thread calls eval() and BLOCKS; a gatherer
+// drains the submitted leaves once every running game has submitted (or the cap is
+// reached), runs ONE batched forward, and wakes the blocked threads with their result.
+struct BatchEvaluator : Evaluator {
+    BatchForwardFn forward;
+    int cap;                    // max leaves per batch (== concurrent games)
+    std::mutex m;
+    std::condition_variable cv_gather;
+    int active;                 // games still able to submit (workers not yet exhausted)
+
+    struct Req {
+        const std::vector<float>* pos;
+        const std::vector<std::vector<float>>* moves;
+        std::pair<float, std::vector<float>> result;
+        bool ready = false;
+        std::condition_variable cv;
+    };
+    std::vector<Req*> pending;
+
+    BatchEvaluator(BatchForwardFn f, int cap_, int active_)
+        : forward(std::move(f)), cap(cap_), active(active_) {}
+
+    std::pair<float, std::vector<float>> eval(
+        const std::vector<float>& pos, const std::vector<std::vector<float>>& moves) override {
+        std::unique_lock<std::mutex> lk(m);
+        Req req;
+        req.pos = &pos;
+        req.moves = &moves;
+        pending.push_back(&req);
+        cv_gather.notify_one();
+        req.cv.wait(lk, [&] { return req.ready; });
+        return std::move(req.result);
+    }
+
+    // A worker calls this exactly once when it will never submit another leaf (its
+    // game queue is exhausted) so the gatherer stops waiting on it.
+    void worker_exit() {
+        std::unique_lock<std::mutex> lk(m);
+        --active;
+        cv_gather.notify_one();
+    }
+
+    // Runs on the launching thread until every worker has exited. Funnels ALL forward
+    // calls through this one thread (so the GPU command queue is single-threaded).
+    void run_gatherer() {
+        std::unique_lock<std::mutex> lk(m);
+        while (true) {
+            cv_gather.wait(lk, [&] {
+                return active == 0 || (int)pending.size() >= active || (int)pending.size() >= cap;
+            });
+            if (pending.empty()) {
+                if (active == 0) return;
+                continue;
+            }
+            const int take = std::min((int)pending.size(), cap);
+            std::vector<Req*> batch(pending.begin(), pending.begin() + take);
+            pending.erase(pending.begin(), pending.begin() + take);
+            std::vector<std::vector<float>> P;
+            std::vector<std::vector<std::vector<float>>> M;
+            P.reserve(take);
+            M.reserve(take);
+            for (auto* r : batch) {
+                P.push_back(*r->pos);
+                M.push_back(*r->moves);
+            }
+            lk.unlock();
+            auto res = forward(P, M);  // the one batched NN forward — GIL already released
+            lk.lock();
+            for (int i = 0; i < take; ++i) {
+                batch[i]->result = std::move(res[i]);
+                batch[i]->ready = true;
+                batch[i]->cv.notify_one();
+            }
+        }
+    }
+};
+
 // ---- leaf expansion (pure mirror of bindings.cpp mcts_expand_native) ----
-inline double mcts_expand_pure(PuctNode* node, const ChesskersNet& net) {
+inline double mcts_expand_pure(PuctNode* node, const ChesskersNet& net, Evaluator& ev) {
     auto legal = gen_legal_native(node->board);
     const size_t n = legal.size();
     node->expanded = true;
@@ -58,7 +167,7 @@ inline double mcts_expand_pure(PuctNode* node, const ChesskersNet& net) {
     std::vector<std::vector<float>> move_encs;
     move_encs.reserve(n);
     for (const auto& m : legal) move_encs.push_back(encode_native_move(net, m));
-    const auto r = net.eval(pos_enc, move_encs);
+    const auto r = ev.eval(pos_enc, move_encs);
     for (size_t i = 0; i < n; ++i) {
         auto child = std::make_unique<PuctNode>();
         child->board = apply_native(node->board, legal[i]);
@@ -76,26 +185,27 @@ inline double mcts_expand_pure(PuctNode* node, const ChesskersNet& net) {
     return r.first;
 }
 
-inline void mcts_simulate_pure(PuctNode* root, const ChesskersNet& net, double c_puct,
-                               double gamma) {
+inline void mcts_simulate_pure(PuctNode* root, const ChesskersNet& net, Evaluator& ev,
+                               double c_puct, double gamma) {
     const auto path = select_to_leaf(root, c_puct);
     PuctNode* leaf = path.back();
     double value;
     if (leaf->is_terminal) value = terminal_value(*leaf);
-    else if (!leaf->expanded) value = mcts_expand_pure(leaf, net);
-    else value = net.eval(net.is_v2 ? encode_position_v2(leaf->board) : encode_position(leaf->board),
-                          {})
+    else if (!leaf->expanded) value = mcts_expand_pure(leaf, net, ev);
+    else value = ev.eval(net.is_v2 ? encode_position_v2(leaf->board) : encode_position(leaf->board),
+                         {})
                      .first;
     backup(path, value, gamma);
 }
 
 // Expand root + Dirichlet root noise + search to the n_sims budget (carried reuse
 // visits count). Pure mirror of bindings.cpp expand_dirichlet_search.
-inline void expand_dirichlet_search_pure(PuctNode* root, const ChesskersNet& net, int n_sims,
-                                         double c_puct, double gamma, double dirichlet_alpha,
-                                         double dirichlet_eps, std::mt19937_64& rng) {
+inline void expand_dirichlet_search_pure(PuctNode* root, const ChesskersNet& net, Evaluator& ev,
+                                         int n_sims, double c_puct, double gamma,
+                                         double dirichlet_alpha, double dirichlet_eps,
+                                         std::mt19937_64& rng) {
     if (n_sims > 0 && !(root->expanded && !root->children.empty()))
-        mcts_simulate_pure(root, net, c_puct, gamma);
+        mcts_simulate_pure(root, net, ev, c_puct, gamma);
     if (dirichlet_alpha > 0.0 && !root->children.empty()) {
         std::gamma_distribution<double> gd(dirichlet_alpha, 1.0);
         const int nch = (int)root->children.size();
@@ -114,7 +224,7 @@ inline void expand_dirichlet_search_pure(PuctNode* root, const ChesskersNet& net
         }
     }
     const int remaining = std::max(0, n_sims - root->visits);
-    for (int i = 0; i < remaining; ++i) mcts_simulate_pure(root, net, c_puct, gamma);
+    for (int i = 0; i < remaining; ++i) mcts_simulate_pure(root, net, ev, c_puct, gamma);
 }
 
 // temp<=0 -> argmax (first max); temp>0 -> sample ∝ visits^(1/temp). Pure mirror
@@ -159,10 +269,10 @@ inline std::string outcome_from_pure(const std::string& status, const std::strin
 // One fully-native self-play game. Byte-identical to play_game_native (same
 // per-ply search, sample, apply, record, Lc0 tree reuse, resignation) but with no
 // py:: anywhere — safe to call with the GIL released.
-inline PureGame play_game_pure(Board board, const ChesskersNet& net, int n_sims, double c_puct,
-                               double temperature, int temp_cutoff_plies, int max_plies,
-                               double dirichlet_alpha, double dirichlet_eps, uint64_t seed,
-                               double resign_threshold, double resign_no_resign_frac,
+inline PureGame play_game_pure(Board board, const ChesskersNet& net, Evaluator& ev, int n_sims,
+                               double c_puct, double temperature, int temp_cutoff_plies,
+                               int max_plies, double dirichlet_alpha, double dirichlet_eps,
+                               uint64_t seed, double resign_threshold, double resign_no_resign_frac,
                                int resign_consecutive, int resign_min_ply, double gamma) {
     std::mt19937_64 rng(seed);
     const bool resign_enabled = resign_threshold > 0.0;
@@ -195,7 +305,7 @@ inline PureGame play_game_pure(Board board, const ChesskersNet& net, int n_sims,
             root = std::make_unique<PuctNode>();
             root->board = board;
         }
-        expand_dirichlet_search_pure(root.get(), net, n_sims, c_puct, gamma, dirichlet_alpha,
+        expand_dirichlet_search_pure(root.get(), net, ev, n_sims, c_puct, gamma, dirichlet_alpha,
                                      dirichlet_eps, rng);
 
         // Visit counts aligned to `legal` by uci (robust to any gen-order detail).
@@ -248,6 +358,19 @@ inline PureGame play_game_pure(Board board, const ChesskersNet& net, int n_sims,
     return game;
 }
 
+// Serial overload: the byte-identical default path (DirectEvaluator -> net.eval). Every
+// existing caller (play_games_pure, play_game_chunk, play_game_native) routes here.
+inline PureGame play_game_pure(Board board, const ChesskersNet& net, int n_sims, double c_puct,
+                               double temperature, int temp_cutoff_plies, int max_plies,
+                               double dirichlet_alpha, double dirichlet_eps, uint64_t seed,
+                               double resign_threshold, double resign_no_resign_frac,
+                               int resign_consecutive, int resign_min_ply, double gamma) {
+    DirectEvaluator ev(net);
+    return play_game_pure(std::move(board), net, ev, n_sims, c_puct, temperature, temp_cutoff_plies,
+                          max_plies, dirichlet_alpha, dirichlet_eps, seed, resign_threshold,
+                          resign_no_resign_frac, resign_consecutive, resign_min_ply, gamma);
+}
+
 // One keep-best GATE game between two nets. white_net plays the White plies,
 // black_net the Black plies.
 struct MatchGame {
@@ -279,10 +402,11 @@ inline MatchGame play_match_game(const ChesskersNet& white_net, const ChesskersN
         auto legal = gen_legal_native(board);
         if (legal.empty()) break;  // no moves, not flagged terminal — end as draw
         const ChesskersNet& net = board.turn_white ? white_net : black_net;
+        DirectEvaluator ev(net);  // gate play stays serial (per-move fresh tree)
         auto root = std::make_unique<PuctNode>();  // fresh tree per move
         root->board = board;
         std::mt19937_64 rng(dir_seed_base + (uint64_t)ply);
-        expand_dirichlet_search_pure(root.get(), net, n_sims, c_puct, gamma, dirichlet_alpha,
+        expand_dirichlet_search_pure(root.get(), net, ev, n_sims, c_puct, gamma, dirichlet_alpha,
                                      dirichlet_eps, rng);
         // argmax visit (first max in child/gen order) — the run_mcts_native `chosen`.
         std::string chosen;
@@ -337,6 +461,47 @@ inline std::vector<PureGame> play_games_pure(const Board& start, const Chesskers
     std::vector<std::thread> pool;
     pool.reserve(nthreads);
     for (int t = 0; t < nthreads; ++t) pool.emplace_back(worker);
+    for (auto& th : pool) th.join();
+    return games;
+}
+
+// Phase 6d — GPU leaf batching (the lc0 design). Fan `num_games` across `batch_size`
+// concurrent game threads, ALL sharing one BatchEvaluator: every running game submits
+// its current leaf, the gatherer runs ONE batched forward over them (`forward`, the GPU
+// path), and the games resume. Each game still runs an ordinary sequential search, so
+// game i is BYTE-IDENTICAL to play_game_pure(seed=base_seed+i) whenever `forward` is
+// byte-identical to serial eval (CPU eval_batch is; the Metal forward is ~1e-4-close).
+// The win is GPU: one forward over `batch_size` leaves instead of `batch_size` small
+// forwards. Call with the GIL released.
+inline std::vector<PureGame> play_games_batched_pure(
+    const Board& start, const ChesskersNet& net, int num_games, int batch_size, int n_sims,
+    double c_puct, double temperature, int temp_cutoff_plies, int max_plies, double dirichlet_alpha,
+    double dirichlet_eps, uint64_t base_seed, double resign_threshold, double resign_no_resign_frac,
+    int resign_consecutive, int resign_min_ply, double gamma, BatchForwardFn forward) {
+    std::vector<PureGame> games(std::max(0, num_games));
+    if (num_games <= 0) return games;
+    const int nworkers = std::max(1, std::min(batch_size, num_games));
+
+    BatchEvaluator bev(std::move(forward), nworkers, nworkers);
+    std::atomic<int> next{0};
+    auto worker = [&]() {
+        for (;;) {
+            const int i = next.fetch_add(1);
+            if (i >= num_games) {
+                bev.worker_exit();  // exhausted: stop the gatherer waiting on this slot
+                break;
+            }
+            games[i] = play_game_pure(start, net, bev, n_sims, c_puct, temperature,
+                                      temp_cutoff_plies, max_plies, dirichlet_alpha, dirichlet_eps,
+                                      base_seed + (uint64_t)i, resign_threshold,
+                                      resign_no_resign_frac, resign_consecutive, resign_min_ply,
+                                      gamma);
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(nworkers);
+    for (int t = 0; t < nworkers; ++t) pool.emplace_back(worker);
+    bev.run_gatherer();  // drives the batched forwards on THIS thread until all workers exit
     for (auto& th : pool) th.join();
     return games;
 }

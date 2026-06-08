@@ -581,6 +581,28 @@ static py::dict native_move_to_dict(const cc::NativeMove& m) {
         m.black_src);
 }
 
+// Convert native self-play games to the Python record shape (records, outcome,
+// final_status) — one entry per game, exactly like play_game_native's return. Shared
+// by play_games_native and play_games_batched_native so the two can never drift.
+static py::list pure_games_to_py(std::vector<cc::PureGame>& games) {
+    py::list out;
+    for (auto& game : games) {
+        py::list records;
+        for (auto& rec : game.records) {
+            py::list legal;
+            for (auto& mv : rec.legal) legal.append(native_move_to_dict(mv));
+            py::list vc;
+            for (int v : rec.visits) vc.append(v);
+            records.append(py::make_tuple(rec.fen, legal, vc,
+                                          std::string(rec.side_white ? "white" : "black")));
+        }
+        out.append(py::make_tuple(
+            records, game.outcome,
+            game.final_status.empty() ? py::none() : py::cast(game.final_status)));
+    }
+    return out;
+}
+
 // Phase 2: batched, multi-threaded native self-play. Plays `num_games` games
 // across `num_threads` worker threads with the GIL released (the hot loop is pure
 // C++ — see selfplay.hpp); re-acquires the GIL only to convert the games to the
@@ -604,22 +626,62 @@ static py::object play_games_native(cc::Board board, const cc::ChesskersNet& net
                                     base_seed, resign_threshold, resign_no_resign_frac,
                                     resign_consecutive, resign_min_ply, gamma);
     }
-    py::list out;
-    for (auto& game : games) {
-        py::list records;
-        for (auto& rec : game.records) {
-            py::list legal;
-            for (auto& mv : rec.legal) legal.append(native_move_to_dict(mv));
-            py::list vc;
-            for (int v : rec.visits) vc.append(v);
-            records.append(py::make_tuple(rec.fen, legal, vc,
-                                          std::string(rec.side_white ? "white" : "black")));
+    return pure_games_to_py(games);
+}
+
+// Phase 6d — GPU leaf batching. Same as play_games_native but the K concurrent games
+// share ONE batched forward per round (net.eval_batch on CPU, or MetalTrunkV2 on GPU
+// when use_gpu and a Metal device exist). Each game stays byte-identical to
+// play_game_native(seed=base_seed+i) under the CPU forward; the Metal forward is float-
+// close (~1e-4). batch_size = the number of concurrent games == the max batch width.
+static py::object play_games_batched_native(cc::Board board, const cc::ChesskersNet& net,
+                                            int num_games, int batch_size, int n_sims,
+                                            double c_puct, double temperature, int temp_cutoff_plies,
+                                            int max_plies, double dirichlet_alpha,
+                                            double dirichlet_eps, uint64_t base_seed,
+                                            double resign_threshold, double resign_no_resign_frac,
+                                            int resign_consecutive, int resign_min_ply,
+                                            bool use_gpu) {
+    const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
+    const double gamma = g ? std::atof(g) : 1.0;
+
+    cc::BatchForwardFn forward;
+    bool gpu = false;
+#ifdef CC_HAVE_METAL
+    std::unique_ptr<cc::MetalTrunkV2> trunk;
+    if (use_gpu) {
+        trunk = std::make_unique<cc::MetalTrunkV2>(net);
+        if (trunk->ok()) {
+            gpu = true;
+            cc::MetalTrunkV2* tp = trunk.get();
+            forward = [tp](const std::vector<std::vector<float>>& P,
+                           const std::vector<std::vector<std::vector<float>>>& M) {
+                return tp->eval_batch(P, M);
+            };
         }
-        out.append(py::make_tuple(
-            records, game.outcome,
-            game.final_status.empty() ? py::none() : py::cast(game.final_status)));
     }
-    return out;
+#else
+    (void)use_gpu;
+#endif
+    if (!gpu) {  // CPU fallback (also the non-Apple / no-GPU path)
+        const cc::ChesskersNet* np = &net;
+        forward = [np](const std::vector<std::vector<float>>& P,
+                       const std::vector<std::vector<std::vector<float>>>& M) {
+            return np->eval_batch(P, M);
+        };
+    }
+
+    std::vector<cc::PureGame> games;
+    {
+        py::gil_scoped_release release;
+        games = cc::play_games_batched_pure(board, net, num_games, batch_size, n_sims, c_puct,
+                                            temperature, temp_cutoff_plies, max_plies,
+                                            dirichlet_alpha, dirichlet_eps, base_seed,
+                                            resign_threshold, resign_no_resign_frac,
+                                            resign_consecutive, resign_min_ply, gamma,
+                                            std::move(forward));
+    }
+    return pure_games_to_py(games);
 }
 
 // Phase 3A: play one native game and encode it to a ccz1 training chunk (gzipped
@@ -1099,6 +1161,19 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         "base_seed+i so the result is thread-count-independent and game i is byte-identical to "
         "play_game_native(seed=base_seed+i). Returns [(records, outcome, final_status)] — one "
         "tuple per game, each shaped exactly like play_game_native's return.");
+
+    m.def(
+        "play_games_batched_native", &play_games_batched_native, py::arg("board"), py::arg("net"),
+        py::arg("num_games"), py::arg("batch_size") = 8, py::arg("n_sims") = 100,
+        py::arg("c_puct") = 1.5, py::arg("temperature") = 1.0, py::arg("temp_cutoff_plies") = 30,
+        py::arg("max_plies") = 400, py::arg("dirichlet_alpha") = 0.0, py::arg("dirichlet_eps") = 0.25,
+        py::arg("base_seed") = 0, py::arg("resign_threshold") = 0.0,
+        py::arg("resign_no_resign_frac") = 0.1, py::arg("resign_consecutive") = 2,
+        py::arg("resign_min_ply") = 8, py::arg("use_gpu") = false,
+        "Phase 6d: GPU leaf batching. Plays num_games games across batch_size concurrent threads "
+        "sharing ONE batched forward per round (net.eval_batch, or MetalTrunkV2 when use_gpu and a "
+        "Metal device exist). Game i is byte-identical to play_game_native(seed=base_seed+i) under "
+        "the CPU forward (float-close ~1e-4 under Metal). Same return shape as play_games_native.");
 
     m.def(
         "play_game_chunk", &play_game_chunk, py::arg("board"), py::arg("net"),
