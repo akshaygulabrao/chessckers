@@ -48,6 +48,18 @@ inline const char* wpiece_name(WPiece p) {
     return "?";
 }
 
+// Inverse of wpiece_name: piece word -> WPiece (default King, matching the
+// bindings' historical fallback). Used by both the dict parse and the pure
+// WCandidate->WhiteMove converter.
+inline WPiece wpiece_from_name(const std::string& n) {
+    if (n == "pawn") return WPiece::Pawn;
+    if (n == "knight") return WPiece::Knight;
+    if (n == "bishop") return WPiece::Bishop;
+    if (n == "rook") return WPiece::Rook;
+    if (n == "queen") return WPiece::Queen;
+    return WPiece::King;
+}
+
 struct WCandidate {
     int from_sq, to_sq;
     WPiece piece;

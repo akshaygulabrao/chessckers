@@ -62,3 +62,28 @@ def make_native_search_fn(net_box: list):
                              value=float(root_value), root=_RootShim(tree))
 
     return search_fn
+
+
+def play_game_native(net, *, start_fen: str, n_sims: int = 100, c_puct: float = 1.5,
+                     temperature: float = 1.0, temp_cutoff_plies: int = 30,
+                     max_plies: int = 400, dirichlet_alpha: float | None = 0.3,
+                     dirichlet_eps: float = 0.25, seed: int = 0,
+                     resign_threshold: float = 0.0, resign_no_resign_frac: float = 0.1,
+                     resign_consecutive: int = 2, resign_min_ply: int = 8):
+    """Play one FULLY-NATIVE self-play game (cpp.play_game_native — search+sample+
+    apply+record per ply, zero Python in the hot loop) and adapt it to an AZGame so
+    the existing `az_game_to_examples` → chunk path is unchanged. `net` is a
+    cc::ChesskersNet. Phase 1 of the lc0-split migration (see the migration plan)."""
+    from chessckers_engine.selfplay_az import AZGame, AZRecord
+
+    records_raw, outcome, final_status = cpp.play_game_native(
+        cpp.parse_fen(start_fen), net, int(n_sims), float(c_puct), float(temperature),
+        int(temp_cutoff_plies), int(max_plies), float(dirichlet_alpha or 0.0),
+        float(dirichlet_eps), int(seed), float(resign_threshold),
+        float(resign_no_resign_frac), int(resign_consecutive), int(resign_min_ply),
+    )
+    records = [
+        AZRecord(fen=fen, legal_moves=list(legal), visit_counts=list(vc), side_to_move=side)
+        for (fen, legal, vc, side) in records_raw
+    ]
+    return AZGame(records=records, final_status=final_status, outcome=outcome)

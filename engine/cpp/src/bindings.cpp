@@ -16,19 +16,12 @@
 #include "encode.hpp"
 #include "movegen.hpp"
 #include "movegen_white.hpp"
+#include "native_move.hpp"
 #include "nn.hpp"
 #include "search.hpp"
+#include "selfplay.hpp"
 
 namespace py = pybind11;
-
-static cc::WPiece wpiece_from_name(const std::string& n) {
-    if (n == "pawn") return cc::WPiece::Pawn;
-    if (n == "knight") return cc::WPiece::Knight;
-    if (n == "bishop") return cc::WPiece::Bishop;
-    if (n == "rook") return cc::WPiece::Rook;
-    if (n == "queen") return cc::WPiece::Queen;
-    return cc::WPiece::King;
-}
 
 // Reconstruct a White move from its dict. Castling is a White king from e1 to a
 // corner/2-away square (covers both the e1g1 and the e1h1 notation forms).
@@ -36,9 +29,9 @@ static cc::WhiteMove parse_white_move(const py::dict& move) {
     cc::WhiteMove mv;
     int from = cc::parse_square(move["from"].cast<std::string>());
     int to = cc::parse_square(move["to"].cast<std::string>());
-    mv.piece = wpiece_from_name(move["piece"].cast<std::string>());
+    mv.piece = cc::wpiece_from_name(move["piece"].cast<std::string>());
     mv.has_promotion = !move["promotion"].is_none();
-    if (mv.has_promotion) mv.promotion = wpiece_from_name(move["promotion"].cast<std::string>());
+    if (mv.has_promotion) mv.promotion = cc::wpiece_from_name(move["promotion"].cast<std::string>());
     if (!move["capture"].is_none()) mv.capture_sq = cc::parse_square(move["capture"].cast<std::string>());
     if (mv.piece == cc::WPiece::King && from == 4 && (to == 0 || to == 2 || to == 6 || to == 7)) {
         mv.is_castling = true;
@@ -385,6 +378,246 @@ struct NativeTree {
     std::unique_ptr<cc::PuctNode> root;
 };
 
+// One move's search on `root`: expand it (first sim), mix Dirichlet root noise
+// (alpha>0, drawn from `rng`), then search to the n_sims visit budget (carried
+// reuse visits count, so only the shortfall runs). Shared by run_mcts_native and
+// play_game_native so the per-move search can never drift between them.
+static void expand_dirichlet_search(cc::PuctNode* root, const cc::ChesskersNet& net, int n_sims,
+                                    double c_puct, double gamma, double dirichlet_alpha,
+                                    double dirichlet_eps, std::mt19937_64& rng) {
+    if (n_sims > 0 && !(root->expanded && !root->children.empty()))
+        mcts_simulate_native(root, net, c_puct, gamma);
+    if (dirichlet_alpha > 0.0 && !root->children.empty()) {
+        std::gamma_distribution<double> gd(dirichlet_alpha, 1.0);
+        const int nch = (int)root->children.size();
+        std::vector<double> noise(nch);
+        double s = 0.0;
+        for (int i = 0; i < nch; ++i) {
+            noise[i] = gd(rng);
+            s += noise[i];
+        }
+        if (s > 0.0) {
+            int i = 0;
+            for (auto& c : root->children) {
+                c->prior = (1.0 - dirichlet_eps) * c->prior + dirichlet_eps * (noise[i] / s);
+                ++i;
+            }
+        }
+    }
+    const int remaining = std::max(0, n_sims - root->visits);
+    for (int i = 0; i < remaining; ++i)
+        mcts_simulate_native(root, net, c_puct, gamma);
+}
+
+// Mirror selfplay_az._sample_move_index_from_visits: temp<=0 -> argmax (first max,
+// matching Python's max(range, key=...)); temp>0 -> sample ∝ visits^(1/temp).
+static int sample_move_index(const std::vector<int>& visits, double temperature,
+                             std::mt19937_64& rng) {
+    const int n = (int)visits.size();
+    if (n == 0) return 0;
+    if (temperature <= 0.0) {
+        int best = 0;
+        for (int i = 1; i < n; ++i)
+            if (visits[i] > visits[best]) best = i;
+        return best;
+    }
+    long total = 0;
+    for (int v : visits) total += v;
+    if (total == 0) return 0;
+    std::vector<double> probs(n);
+    double s = 0.0;
+    for (int i = 0; i < n; ++i) {
+        probs[i] = std::pow((double)visits[i], 1.0 / temperature);
+        s += probs[i];
+    }
+    std::uniform_real_distribution<double> u(0.0, s);
+    const double r = u(rng);
+    double acc = 0.0;
+    for (int i = 0; i < n; ++i) {
+        acc += probs[i];
+        if (r <= acc) return i;
+    }
+    return n - 1;
+}
+
+// Mirror selfplay_az._outcome_from_state: winner takes precedence, else map status.
+static std::string outcome_from(const std::string& status, const std::string& winner) {
+    if (winner == "white") return "white";
+    if (winner == "black") return "black";
+    if (status == "mate") return "black";
+    if (status == "variantEnd") return "white";
+    return "draw";
+}
+
+// Phase 1: fully-native self-play game loop — search+sample+apply+record per ply
+// with Lc0 tree reuse, ZERO Python in the hot loop. A 1:1 port of
+// selfplay_az.play_az_game running the native search. Returns
+// (records, outcome, final_status) where records = [(fen, legal_move_dicts,
+// visit_counts, side)] so Python builds AZExample exactly as before.
+static py::object play_game_native(cc::Board board, const cc::ChesskersNet& net, int n_sims,
+                                   double c_puct, double temperature, int temp_cutoff_plies,
+                                   int max_plies, double dirichlet_alpha, double dirichlet_eps,
+                                   uint64_t seed, double resign_threshold,
+                                   double resign_no_resign_frac, int resign_consecutive,
+                                   int resign_min_ply) {
+    const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
+    const double gamma = g ? std::atof(g) : 1.0;
+    std::mt19937_64 rng(seed);
+
+    const bool resign_enabled = resign_threshold > 0.0;
+    // A fraction of games never resign (lc0 false-positive calibration). Short-
+    // circuits when disabled so the rng stream is untouched (deterministic path).
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    const bool no_resign_game = !resign_enabled || (u01(rng) < resign_no_resign_frac);
+    int consec_resign = 0;
+
+    py::list records;
+    std::unique_ptr<cc::PuctNode> reuse;  // detached subtree from the previous ply
+    int ply = 0;
+    std::string final_status, final_winner, outcome;
+    bool resigned = false;
+
+    while (ply < max_plies) {
+        const auto st = cc::detect_status(board);
+        if (!st.status.empty()) {
+            final_status = st.status;
+            final_winner = st.winner;
+            break;
+        }
+        py::list legal = gen_legal_dicts(board);
+        const int nlegal = (int)py::len(legal);
+        if (nlegal == 0) break;  // no moves but not flagged terminal — end as draw
+
+        // Re-root the reused subtree iff it matches this position (it always does:
+        // it's the child of the move we just applied); else search fresh.
+        std::unique_ptr<cc::PuctNode> root;
+        if (reuse && cc::serialize_fen(reuse->board) == cc::serialize_fen(board)) {
+            root = std::move(reuse);
+            root->uci.clear();
+        } else {
+            root = std::make_unique<cc::PuctNode>();
+            root->board = board;
+        }
+        expand_dirichlet_search(root.get(), net, n_sims, c_puct, gamma, dirichlet_alpha,
+                                dirichlet_eps, rng);
+
+        // Visit counts aligned to `legal` (by uci — robust to any gen-order detail).
+        std::map<std::string, int> vmap;
+        for (auto& c : root->children) vmap[c->uci] = c->visits;
+        std::vector<int> visits(nlegal, 0);
+        py::list vc;
+        for (int i = 0; i < nlegal; ++i) {
+            const std::string u = legal[i].cast<py::dict>()["uci"].cast<std::string>();
+            const auto it = vmap.find(u);
+            visits[i] = (it != vmap.end()) ? it->second : 0;
+            vc.append(visits[i]);
+        }
+        const double root_value = root->q();
+
+        records.append(py::make_tuple(cc::serialize_fen(board), legal, vc,
+                                      std::string(board.turn_white ? "white" : "black")));
+
+        if (resign_enabled && !no_resign_game && ply >= resign_min_ply) {
+            if (root_value <= -resign_threshold) {
+                if (++consec_resign >= resign_consecutive) {
+                    outcome = board.turn_white ? "black" : "white";  // STM resigns
+                    resigned = true;
+                    break;
+                }
+            } else {
+                consec_resign = 0;
+            }
+        }
+
+        const double eff_temp = (ply < temp_cutoff_plies) ? temperature : 0.0;
+        const int idx = sample_move_index(visits, eff_temp, rng);
+        py::dict chosen = legal[idx].cast<py::dict>();
+        const std::string chosen_uci = chosen["uci"].cast<std::string>();
+
+        board = apply_dict(board, chosen);
+
+        // Lc0 tree reuse: detach the chosen child to re-root next ply.
+        reuse.reset();
+        for (auto& c : root->children) {
+            if (c && c->uci == chosen_uci) {
+                reuse = std::move(c);
+                break;
+            }
+        }
+        ++ply;
+    }
+
+    if (!resigned) outcome = outcome_from(final_status, final_winner);
+    return py::make_tuple(records, outcome,
+                          final_status.empty() ? py::none() : py::cast(final_status));
+}
+
+// Phase 2: reconstruct the Python move dict for a NativeMove (cold path — runs
+// once per recorded legal move under the GIL, after the threads join). Reuses the
+// exact gen_legal_dicts builders off the stored original move, so the dicts are
+// byte-identical to the Phase-1 path.
+static py::dict native_move_to_dict(const cc::NativeMove& m) {
+    if (m.is_white) {
+        return m.is_castling_alt ? white_castling_alt_to_dict(m.white_src)
+                                 : white_move_to_dict(m.white_src);
+    }
+    return std::visit(
+        [&](auto&& x) -> py::dict {
+            using T = std::decay_t<decltype(x)>;
+            if constexpr (std::is_same_v<T, cc::QuietMove>)
+                return simple_move_dict(x.uci, x.from_name, x.to_name, x.piece, py::none());
+            else if constexpr (std::is_same_v<T, cc::DeployMove>)
+                return simple_move_dict(x.uci, x.from_name, x.to_name, x.piece,
+                                        py::cast(x.deploy_count));
+            else if constexpr (std::is_same_v<T, cc::ChargeMove>)
+                return charge_to_dict(x);
+            else
+                return chain_to_dict(x);
+        },
+        m.black_src);
+}
+
+// Phase 2: batched, multi-threaded native self-play. Plays `num_games` games
+// across `num_threads` worker threads with the GIL released (the hot loop is pure
+// C++ — see selfplay.hpp); re-acquires the GIL only to convert the games to the
+// Python record shape. Game i is seeded base_seed+i, so the output is independent
+// of num_threads and each game equals a single-threaded play_game_native(seed=
+// base_seed+i). Returns [ (records, outcome, final_status) ] — one entry per game,
+// each shaped exactly like play_game_native's return.
+static py::object play_games_native(cc::Board board, const cc::ChesskersNet& net, int num_games,
+                                    int num_threads, int n_sims, double c_puct, double temperature,
+                                    int temp_cutoff_plies, int max_plies, double dirichlet_alpha,
+                                    double dirichlet_eps, uint64_t base_seed,
+                                    double resign_threshold, double resign_no_resign_frac,
+                                    int resign_consecutive, int resign_min_ply) {
+    const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
+    const double gamma = g ? std::atof(g) : 1.0;
+    std::vector<cc::PureGame> games;
+    {
+        py::gil_scoped_release release;
+        games = cc::play_games_pure(board, net, num_games, num_threads, n_sims, c_puct, temperature,
+                                    temp_cutoff_plies, max_plies, dirichlet_alpha, dirichlet_eps,
+                                    base_seed, resign_threshold, resign_no_resign_frac,
+                                    resign_consecutive, resign_min_ply, gamma);
+    }
+    py::list out;
+    for (auto& game : games) {
+        py::list records;
+        for (auto& rec : game.records) {
+            py::list legal;
+            for (auto& mv : rec.legal) legal.append(native_move_to_dict(mv));
+            py::list vc;
+            for (int v : rec.visits) vc.append(v);
+            records.append(py::make_tuple(rec.fen, legal, vc,
+                                          std::string(rec.side_white ? "white" : "black")));
+        }
+        out.append(py::make_tuple(
+            records, game.outcome,
+            game.final_status.empty() ? py::none() : py::cast(game.final_status)));
+    }
+    return out;
+}
+
 PYBIND11_MODULE(chessckers_cpp, m) {
     m.doc() = "Chessckers C++ engine (Slice 0: board + FEN; Slice 1: §3B capture hops)";
 
@@ -702,31 +935,11 @@ PYBIND11_MODULE(chessckers_cpp, m) {
                 root = std::make_unique<cc::PuctNode>();
                 root->board = std::move(board);
             }
-            // First sim expands the root so Dirichlet noise has children to mix into
-            // (skipped when a reused root is already expanded).
-            if (n_sims > 0 && !(root->expanded && !root->children.empty()))
-                mcts_simulate_native(root.get(), net, c_puct, gamma);
-            if (dirichlet_alpha > 0.0 && !root->children.empty()) {
-                std::mt19937_64 rng(seed);
-                std::gamma_distribution<double> gd(dirichlet_alpha, 1.0);
-                const int nch = (int)root->children.size();
-                std::vector<double> noise(nch);
-                double s = 0.0;
-                for (int i = 0; i < nch; ++i) {
-                    noise[i] = gd(rng);
-                    s += noise[i];
-                }
-                if (s > 0.0) {
-                    int i = 0;
-                    for (auto& c : root->children) {
-                        c->prior = (1.0 - dirichlet_eps) * c->prior + dirichlet_eps * (noise[i] / s);
-                        ++i;
-                    }
-                }
-            }
-            const int remaining = std::max(0, n_sims - root->visits);
-            for (int i = 0; i < remaining; ++i)
-                mcts_simulate_native(root.get(), net, c_puct, gamma);
+            // Expand root + Dirichlet noise + search to budget (shared with
+            // play_game_native's per-ply search so the two can't drift).
+            std::mt19937_64 rng(seed);
+            expand_dirichlet_search(root.get(), net, n_sims, c_puct, gamma, dirichlet_alpha,
+                                    dirichlet_eps, rng);
             py::dict visit_dist;
             std::string chosen;
             int best = -1;
@@ -751,4 +964,32 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         "move's expected outcome at the root (negamax Q in [-1,1], for resignation); `tree` is a "
         "NativeTree — pass tree.child(uci) back as `reuse` next ply for Lc0 tree reuse (carried "
         "visits count toward n_sims).");
+
+    m.def(
+        "play_game_native", &play_game_native, py::arg("board"), py::arg("net"),
+        py::arg("n_sims") = 100, py::arg("c_puct") = 1.5, py::arg("temperature") = 1.0,
+        py::arg("temp_cutoff_plies") = 30, py::arg("max_plies") = 400,
+        py::arg("dirichlet_alpha") = 0.0, py::arg("dirichlet_eps") = 0.25, py::arg("seed") = 0,
+        py::arg("resign_threshold") = 0.0, py::arg("resign_no_resign_frac") = 0.1,
+        py::arg("resign_consecutive") = 2, py::arg("resign_min_ply") = 8,
+        "Phase 1: fully-native self-play game loop (search+sample+apply+record per ply, Lc0 tree "
+        "reuse, zero Python in the hot loop). Mirrors selfplay_az.play_az_game on the native "
+        "search. Returns (records, outcome, final_status) where records = "
+        "[(fen, legal_move_dicts, visit_counts, side)] -> Python builds AZExample as before. "
+        "Set temperature=0 + dirichlet_alpha=0 + resign_threshold=0 for a deterministic game "
+        "(parity-checkable against play_az_game).");
+
+    m.def(
+        "play_games_native", &play_games_native, py::arg("board"), py::arg("net"),
+        py::arg("num_games"), py::arg("num_threads") = 1, py::arg("n_sims") = 100,
+        py::arg("c_puct") = 1.5, py::arg("temperature") = 1.0, py::arg("temp_cutoff_plies") = 30,
+        py::arg("max_plies") = 400, py::arg("dirichlet_alpha") = 0.0, py::arg("dirichlet_eps") = 0.25,
+        py::arg("base_seed") = 0, py::arg("resign_threshold") = 0.0,
+        py::arg("resign_no_resign_frac") = 0.1, py::arg("resign_consecutive") = 2,
+        py::arg("resign_min_ply") = 8,
+        "Phase 2: batched, multi-threaded native self-play. Plays num_games games across "
+        "num_threads std::threads with the GIL released (pure-C++ hot loop); game i is seeded "
+        "base_seed+i so the result is thread-count-independent and game i is byte-identical to "
+        "play_game_native(seed=base_seed+i). Returns [(records, outcome, final_status)] — one "
+        "tuple per game, each shaped exactly like play_game_native's return.");
 }

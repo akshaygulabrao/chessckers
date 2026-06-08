@@ -289,12 +289,13 @@ inline Board parse_fen(const std::string& fen_in) {
 
 inline std::string serialize_fen(const Board& b) {
     const std::string board_part = board_fen(b);
-    // NOTE: en passant is emitted verbatim here. python-chess's board.fen()
-    // applies an en_passant="legal" canonicalization (a set ep square can be
-    // downgraded to '-' when no pawn can actually capture). That check is
-    // move-gen-dependent, so it is deferred to the move-gen slices; the Slice-0
-    // golden corpus is all ep='-', where verbatim emission already matches.
-    const std::string ep = (b.ep_square < 0) ? "-" : square_name(b.ep_square);
+    // En passant is STRUCTURALLY IMPOSSIBLE in Chessckers: only White has FIDE
+    // pawns, and Black (Stones, not pawns) can never ep-capture — so python-chess's
+    // board.fen() (en_passant="legal") ALWAYS downgrades the ep field to '-' here.
+    // Emit '-' unconditionally to stay byte-equal with PyVariant. (The internal
+    // ep_square a White double-push sets is vestigial — never legally capturable,
+    // never used by move-gen — so its staleness across plies doesn't matter.)
+    const std::string ep = "-";
     const std::string rest = std::string(b.turn_white ? "w" : "b") + " " +
                              castling_field(b.castling_rights) + " " + ep + " " +
                              std::to_string(b.halfmove) + " " + std::to_string(b.fullmove);
