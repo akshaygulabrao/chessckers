@@ -1,17 +1,24 @@
-// Chessckers C++ engine — Slice 6/7: native NN forward (Accelerate BLAS).
+// Chessckers C++ engine — Slice 6/7: native NN forward (CBLAS).
 //
 // Hand-rolled forward of ChesskersScorer off the exported PyTorch weights
-// (native_net.export_state_dict). Linear/conv go through Accelerate cblas_sgemm
-// (conv via im2col); the per-leaf policy head is batched over ALL the leaf's
-// moves in single GEMMs. GroupNorm/LayerNorm stay as (cheap) loops, in double.
-// Held within ~1e-4 of PyTorch by tests/test_cpp_nn_parity.py.
+// (native_net.export_state_dict). Linear/conv go through cblas_sgemm (conv via
+// im2col); the per-leaf policy head is batched over ALL the leaf's moves in single
+// GEMMs. GroupNorm/LayerNorm stay as (cheap) loops, in double. Held within ~1e-4 of
+// PyTorch by tests/test_cpp_nn_parity.py.
 //
 //   pos_emb = position_trunk(pos[14,8,8])
 //   value   = wdl[0]-wdl[2],  wdl = softmax(value_head(pos_emb))
 //   logits  = head(cat[pos_emb, move_encoder(M)]) over M=[N,240];  priors = softmax
 #pragma once
 
+// BLAS backend: the forward is portable cblas_sgemm. Apple ships it in Accelerate; every
+// other platform provides the same CBLAS symbols via OpenBLAS / MKL / reference BLAS. So the
+// engine is cross-platform (lc0-style) — only the include + link differ per platform.
+#if defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
