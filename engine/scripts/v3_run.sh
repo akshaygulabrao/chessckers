@@ -19,7 +19,8 @@ echo "=== train V3 (2.52M: 9 residual + 7 transformer, gather head) ==="
 "$PY" -m chessckers_engine.selfplay_az_loop \
   --arch-version v2 --model-blocks 9 --tf-blocks 7 --tf-heads 4 --tf-ff-mult 4 \
   --seed "$SEED" --iterations "$ITERS" --games-per-iter "$GAMES" --sims "$SIMS" \
-  --workers "$WORKERS" --weights-dir weights/ab-v3 --keep-best
+  --workers "$WORKERS" --weights-dir weights/ab-v3 --keep-best \
+  --native --native-gpu --native-batch-size "${NBATCH:-$GAMES}" --native-concurrency "${NCONC:-0}"
 
 g() {  # $1 chal-name $2 chal-path $3 chal-ver  $4 champ-name $5 champ-path $6 champ-ver
   echo "===== $1 (challenger) vs $4 (champion) — temp $GTEMP ====="

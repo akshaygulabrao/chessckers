@@ -33,7 +33,13 @@ from chessckers_engine.inference_server import InferenceServer
 from chessckers_engine.mcts_puct import pick_puct
 from chessckers_engine.model import ChesskersScorer, build_model
 from chessckers_engine.random_player import pick_random
-from chessckers_engine.selfplay_az import JsonlWatchSink, az_game_to_examples, play_az_game
+from chessckers_engine.selfplay_az import (
+    AZGame,
+    AZRecord,
+    JsonlWatchSink,
+    az_game_to_examples,
+    play_az_game,
+)
 from chessckers_engine.train_az import save_checkpoint, train_az
 from chessckers_engine.variant_py import PyVariantClient
 
@@ -502,6 +508,84 @@ def _next_game_num() -> int:
         return -1
 
 
+def _native_game_to_azgame(native_game) -> AZGame:
+    """Convert one cpp.play_games_native game — (records, outcome, final_status) with
+    records as (fen, legal_dicts, visit_counts, side) — into the AZGame the rest of the
+    loop (az_game_to_examples + tallies) consumes. The native record shape is the same
+    data play_az_game records, so az_game_to_examples is reused unchanged."""
+    records_t, outcome, final_status = native_game
+    recs = [
+        AZRecord(fen=fen, legal_moves=list(legal), visit_counts=list(vc), side_to_move=side)
+        for fen, legal, vc, side in records_t
+    ]
+    return AZGame(records=recs, final_status=final_status, outcome=outcome)
+
+
+def _native_game_stream(
+    play_model,
+    start_fen: str,
+    budget: int,
+    *,
+    n_sims: int,
+    c_puct: float,
+    temperature: float,
+    temp_cutoff_plies: int,
+    max_plies: int,
+    dirichlet_alpha: float | None,
+    dirichlet_eps: float,
+    base_seed: int,
+    num_threads: int,
+    weights_dir: Path,
+    use_gpu: bool = False,
+    batch_size: int = 0,
+    concurrency: int = 0,
+):
+    """Self-play `budget` games in ONE GIL-free native process: export play_model to the
+    flat .bin the C++ engine loads, then the native engine fans the games out (the
+    lc0-split engine) instead of Python multiprocess workers. Game gi is seeded
+    base_seed+gi, matching the Python path's per-game seed.
+
+    Two engine paths, both seeded identically per game:
+      - default (batch_size<=1 and not use_gpu): cpp.play_games_native — each of
+        `num_threads` worker threads runs its own CPU forward; byte-equivalent to
+        play_az_game at the same seed (test_cpp_selfplay_native / _threaded).
+      - GPU leaf batching (use_gpu or batch_size>1): cpp.play_games_batched_native —
+        `batch_size` concurrent games share ONE batched forward per round (MetalTrunkV2
+        when use_gpu and a Metal device exist, else net.eval_batch on CPU). `concurrency`
+        > batch_size oversubscribes game threads vs the GPU batch width to keep the GPU
+        fed (lc0 --threads > --minibatch-size). Byte-identical to the CPU path under the
+        CPU forward; float-close (~1e-4) under Metal (test_cpp_selfplay_batched).
+    Yields AZGames."""
+    import chessckers_cpp as cpp
+
+    from chessckers_engine.native_net import export_state_dict
+
+    net_path = weights_dir / "_native_net.bin"
+    export_state_dict(play_model.state_dict(), net_path)
+    net = cpp.ChesskersNet(str(net_path))
+    bs = max(1, batch_size)
+    if use_gpu or bs > 1:
+        games = cpp.play_games_batched_native(
+            cpp.parse_fen(start_fen), net,
+            num_games=budget, batch_size=bs,
+            n_sims=n_sims, c_puct=c_puct, temperature=temperature,
+            temp_cutoff_plies=temp_cutoff_plies, max_plies=max_plies,
+            dirichlet_alpha=dirichlet_alpha or 0.0, dirichlet_eps=dirichlet_eps,
+            base_seed=base_seed, use_gpu=use_gpu, concurrency=max(0, concurrency),
+        )
+    else:
+        games = cpp.play_games_native(
+            cpp.parse_fen(start_fen), net,
+            num_games=budget, num_threads=max(1, num_threads),
+            n_sims=n_sims, c_puct=c_puct, temperature=temperature,
+            temp_cutoff_plies=temp_cutoff_plies, max_plies=max_plies,
+            dirichlet_alpha=dirichlet_alpha or 0.0, dirichlet_eps=dirichlet_eps,
+            base_seed=base_seed,
+        )
+    for g in games:
+        yield _native_game_to_azgame(g)
+
+
 def run_az_iterations(
     model: ChesskersScorer,
     client: PyVariantClient,
@@ -535,6 +619,10 @@ def run_az_iterations(
     model_arch: dict | None = None,
     worker_mode: str = "auto",
     worker_device: torch.device | None = None,
+    native: bool = False,
+    native_gpu: bool = False,
+    native_batch_size: int = 0,
+    native_concurrency: int = 0,
     ingest_dir: Path | None = None,
 ) -> list[dict]:
     # Eval-vs-random uses MCTS on the trained model with no exploration noise;
@@ -578,7 +666,27 @@ def run_az_iterations(
             "'threads' mode workers share the trainer's model, so self-play runs on %s",
             model_device, wdev, model_device,
         )
-    if parallel:
+    # Native engine: ALL self-play runs in this one process via cpp.play_games_native
+    # (GIL-free C++ threads), replacing the Python multiprocess/thread workers. Forcing
+    # effective_mode="native" also keeps gating + eval-vs-random on the sequential Python
+    # path (their process-spawn branches are gated on "processes"), so nothing spawns.
+    start_fen: str = ""
+    native_max_plies = 0
+    if native:
+        effective_mode = "native"
+        start_fen = client.new_game()["fen"]
+        native_max_plies = int(os.environ.get("CHESSCKERS_MAX_PLIES", "400"))
+        if native_gpu or max(1, native_batch_size) > 1:
+            log.info("engine: native cc.play_games_batched_native — batch=%d concurrency=%d "
+                     "gpu=%s, ONE process (start=%s, max_plies=%d); gating + eval stay "
+                     "sequential Python", max(1, native_batch_size),
+                     native_concurrency or max(1, native_batch_size), native_gpu,
+                     _seed_tag(start_fen), native_max_plies)
+        else:
+            log.info("engine: native cc.play_games_native — %d GIL-free thread(s), ONE process "
+                     "(start=%s, max_plies=%d); gating + eval stay sequential Python",
+                     max(1, workers), _seed_tag(start_fen), native_max_plies)
+    elif parallel:
         log.info("worker mode: %s (train-device=%s, worker-device=%s)",
                  effective_mode, model_device.type, wdev.type)
 
@@ -650,6 +758,18 @@ def run_az_iterations(
         def _local_game_stream(budget: int):
             """Yield up to `budget` finished local AZGames per the effective
             worker mode; cleans up the pool/executor on early close()."""
+            if effective_mode == "native":
+                # ONE GIL-free native process plays the whole batch (no Python workers).
+                yield from _native_game_stream(
+                    play_model, start_fen, budget,
+                    n_sims=n_sims, c_puct=c_puct, temperature=temp,
+                    temp_cutoff_plies=temp_cutoff_plies, max_plies=native_max_plies,
+                    dirichlet_alpha=dirichlet_alpha, dirichlet_eps=dirichlet_eps,
+                    base_seed=seed + it * games_per_iter, num_threads=workers,
+                    weights_dir=weights_dir, use_gpu=native_gpu,
+                    batch_size=native_batch_size, concurrency=native_concurrency,
+                )
+                return
             if not parallel:
                 for gi in range(budget):
                     yield _play_one_game(
@@ -968,6 +1088,26 @@ def main() -> int:
                    help="auto: processes for CUDA, threads for CPU/MPS. processes: always "
                         "spawn subprocesses (true GIL-free parallelism, required for CUDA "
                         "to drive the GPU). threads: legacy ThreadPoolExecutor.")
+    p.add_argument("--native", action="store_true",
+                   help="Self-play via the native C++ engine (cpp.play_games_native): all "
+                        "games run in ONE GIL-free process over --workers C++ threads, instead "
+                        "of Python multiprocess/thread workers. Byte-equivalent to the Python "
+                        "loop per seed (test_cpp_selfplay_native). Gating + eval stay sequential "
+                        "Python. The trained model is exported to a flat .bin each iter for the "
+                        "engine to load; supersedes --worker-mode for collection.")
+    p.add_argument("--native-gpu", action="store_true",
+                   help="With --native: use the GPU-batched engine (play_games_batched_native) "
+                        "— concurrent games share ONE batched forward per round on the Metal "
+                        "device (MetalTrunkV2), else CPU eval_batch. Float-close (~1e-4) to the "
+                        "per-thread path, not byte-identical.")
+    p.add_argument("--native-batch-size", type=int, default=0,
+                   help="With --native: GPU batch width (concurrent games sharing one forward). "
+                        ">1 selects the batched engine even without --native-gpu (CPU eval_batch, "
+                        "byte-identical). 0/1 = per-thread engine.")
+    p.add_argument("--native-concurrency", type=int, default=0,
+                   help="With --native batched: game threads to oversubscribe vs the GPU batch "
+                        "width to keep the GPU fed (lc0 --threads > --minibatch-size). 0 = batch "
+                        "size. Ignored by the per-thread engine.")
     p.add_argument("--train-device", default="",
                    help="Device for the TRAINER (SGD) only; self-play workers use --device. "
                         "Empty = same as --device (no split). 'auto'/'mps'/'cuda' trains on "
@@ -1055,6 +1195,10 @@ def main() -> int:
         resume=args.resume,
         worker_mode=args.worker_mode,
         worker_device=device,
+        native=args.native,
+        native_gpu=args.native_gpu,
+        native_batch_size=args.native_batch_size,
+        native_concurrency=args.native_concurrency,
         ingest_dir=Path(args.ingest_dir) if args.ingest_dir else None,
         model_arch={"version": args.arch_version, **arch_kwargs},
     )
