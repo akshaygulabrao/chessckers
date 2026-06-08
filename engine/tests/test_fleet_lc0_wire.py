@@ -19,8 +19,8 @@ Phase E (client-drives-each-game: the client mints jobs, the workers claim + pla
 no autonomous self-play and no in-client gate play / PAUSE; both were RETIRED):
   - fleet_client._mint_jobs            tops up run-dir/jobs/ via POST /next_game — a train job
     verbatim; a match job with the two nets pre-fetched by sha (/get_network) + their paths added
-  - fleet_client._ship_match_results   POSTs each worker-written gate outcome to /match_result
-  - selfplay_worker_async._claim_job   the worker's atomic (rename) claim of one queued job
+  - fleet_client._ship_match_results   POSTs each engine-written gate outcome to /match_result
+    (the engine's atomic job claim is covered natively by test_cpp_jobs_local)
 
 and assert the LEGACY self-play endpoints (POST /game, GET /version) still work — the lc0 mirror
 must not break the existing fleet_client self-play path. Stdlib HTTP only: fast, no torch/nets.
@@ -394,25 +394,3 @@ def test_client_ships_match_results(server, tmp_path):
     assert len(files) == 1
     rec = json.loads(files[0].read_text())
     assert rec["outcome"] == "white" and rec["opp"] == "net-1" and rec["match_id"] == 7
-
-
-# --- the worker's atomic job claim (no torch) ----------------------------------
-
-def test_worker_claim_job_atomic(tmp_path):
-    """selfplay_worker_async._claim_job claims one queued job by atomic rename (so N racing
-    workers can't double-claim), parses it, and drops a malformed file instead of wedging."""
-    from chessckers_engine.selfplay_worker_async import _claim_job
-    jobs = tmp_path / "jobs"
-    jobs.mkdir()
-    (jobs / "0.json").write_text(json.dumps({"type": "train", "params": {"sims": 3}}))
-
-    seq, claimed, job = _claim_job(jobs, 5)
-    assert seq == "0" and job["type"] == "train" and job["params"]["sims"] == 3
-    assert claimed.name == "0.json.c5"                     # renamed out of the unclaimed glob
-    assert not list(jobs.glob("*.json"))
-    # a second worker finds nothing claimable (the file is already taken)
-    assert _claim_job(jobs, 6) is None
-    # a malformed job is claimed-then-dropped, never returned, never wedging the queue
-    (jobs / "1.json").write_text("{not valid json")
-    assert _claim_job(jobs, 7) is None
-    assert not list(jobs.glob("*.json"))

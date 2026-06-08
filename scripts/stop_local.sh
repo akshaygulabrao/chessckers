@@ -14,17 +14,18 @@ say(){ echo "[stop-local] $*" >&2; }
 say "STOP -> $RUN/STOP (graceful: trainer + arena + server + clients finish + exit)"
 touch "$RUN/STOP"
 
-# Clients see STOP via the server within a poll (~15s); workers only check between games, so
-# a 200-ply game can delay exit ~a minute. Wait for all of them to drain.
+# Clients see STOP via the server within a poll (~15s); the cc_selfplay engines only check
+# between games, so a 200-ply game can delay exit ~a minute. Wait for all of them to drain.
 for _ in $(seq 240); do
-  pgrep -f 'chessckers_engine\.(train_continuous|fleet_arena|fleet_client|selfplay_workers_only)' >/dev/null || break
+  pgrep -f 'chessckers_engine\.(train_continuous|fleet_arena|fleet_client)' >/dev/null || break
   sleep 1
 done
 
-# Safety net: kill any straggler parents + orphaned mp-spawn children.
-pkill -f 'chessckers_engine\.(train_continuous|fleet_arena|fleet_server|fleet_client|selfplay_workers_only)' 2>/dev/null || true
+# Safety net: kill any straggler parents + orphaned cc_selfplay engines + mp-spawn children.
+pkill -f 'chessckers_engine\.(train_continuous|fleet_arena|fleet_server|fleet_client)' 2>/dev/null || true
+pkill -f 'cc_selfplay .*--jobs-local' 2>/dev/null || true
 pkill -f 'multiprocessing.spawn' 2>/dev/null || true
 
 rm -f "$RUN/STOP" "$CRUN/STOP" 2>/dev/null || true
 say "done. remaining:"
-pgrep -fl 'chessckers_engine\.(train_continuous|fleet_arena|fleet_server|fleet_client|selfplay_workers_only)' || say "  (none)"
+pgrep -fl 'chessckers_engine\.(train_continuous|fleet_arena|fleet_server|fleet_client)' || say "  (none)"

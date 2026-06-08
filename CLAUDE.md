@@ -73,7 +73,7 @@ Key invariant: for every Black square, `stacks[sq]`'s top piece matches the bitb
 
 ### AlphaZero engine
 
-`model.py` (`ChesskersScorer`: policy + value heads), `encoding.py` (board/move tensors), `mcts_puct.py` (PUCT MCTS), `selfplay_az.py` / `selfplay_az_async.py` / `selfplay_az_loop.py` (self-play + training loop), `selfplay_worker_async.py` / `selfplay_workers_only.py` (subprocess workers), `inference_server.py` + `cross_inference.py` (batched GPU eval shared across workers), `replay_buffer.py`, `train_az.py`, `trainer_loop.py`. Self-play correctness depends on the move-gen + check detection above; `n_sims` should be ≥ 50 (lower yields degenerate visit distributions).
+`model.py` (`ChesskersScorer`: policy + value heads), `encoding.py` (board/move tensors), `mcts_puct.py` (PUCT MCTS), `selfplay_az.py` (`play_az_game` — the reference self-play loop + parity oracle, used by `train_az`/`replay_buffer`/`native_search`) / `selfplay_az_loop.py` (synchronous collect-then-train loop), `inference_server.py` + `cross_inference.py` (batched GPU eval), `replay_buffer.py`, `train_az.py`, `trainer_loop.py`. **Production self-play no longer runs in Python**: the lc0-split cutover retired the Python self-play engine (`selfplay_worker_async`/`selfplay_workers_only`/`selfplay_az_async`); every fleet game is played by the native `cc_selfplay` engine (`cpp/`), which `fleet_client` owns. Self-play correctness depends on the move-gen + check detection above; `n_sims` should be ≥ 50 (lower yields degenerate visit distributions).
 
 ### FEN Extension
 

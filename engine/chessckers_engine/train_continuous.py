@@ -1,9 +1,9 @@
 """Async / continuous AlphaZero trainer — decoupled from self-play.
 
 This is the real-AZ architecture (vs the synchronous collect-200-then-train loop
-in `selfplay_az_loop`). Self-play runs SEPARATELY as `selfplay_workers_only`
-processes (local + leena), continuously writing game pkls into `<run-dir>/buffer`.
-This trainer never pauses:
+in `selfplay_az_loop`). Self-play runs SEPARATELY as native `cc_selfplay` engines
+(local + leena, owned by `fleet_client`), continuously writing game chunks into
+`<run-dir>/buffer`. This trainer never pauses:
 
   - continuously INGESTS new game pkls into a rolling replay buffer (cap N positions),
   - does SGD steps NON-STOP on sampled minibatches,

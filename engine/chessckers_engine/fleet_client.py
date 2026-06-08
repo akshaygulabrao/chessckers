@@ -1,26 +1,26 @@
-"""Fleet client — lc0-style self-play client sync bridge.
+"""Fleet client — lc0-style orchestrator (owns the cc_selfplay engine pool).
 
 Runs on every self-play box (the local machine over loopback AND leena / future
-volunteers over the LAN). The lc0 *client-drives-each-game* model: the client is the
-ONLY thing that talks to the server, and the server assigns EVERY game. With
-`--spawn-workers` the client owns a pool of `selfplay_workers_only --job-driven`
-processes; it keeps their run-dir job queue topped up by POSTing /next_game, and the
-workers claim + play one assigned game at a time (train -> a self-play game into
-buffer/; match -> a keep-best gate game into match_out/). There is NO autonomous
-self-play — a box plays exactly what /next_game hands out, so the trainer controls the
-train/gate mix fleet-wide. A volunteer needs no inbound SSH (just outbound HTTP) and
-the workers themselves never touch the network. It replaces the rsync `leena_sync.sh`
-sidecar.
+volunteers over the LAN). This is the lc0 ORCHESTRATOR (the lczero-client analog): the
+ONLY thing that talks to the server, owning a pool of native `cc_selfplay --jobs-local`
+ENGINE procs (the lc0 engine-binary analog). The *client-drives-each-game* model — the
+server assigns EVERY game: the client keeps the engines' run-dir job queue topped up by
+POSTing /next_game, and the engines claim + play one assigned game at a time (train -> a
+self-play game into buffer/; match -> a keep-best gate game into match_out/). There is NO
+autonomous self-play — a box plays exactly what /next_game hands out, so the trainer
+controls the train/gate mix fleet-wide. A volunteer needs no inbound SSH (just outbound
+HTTP) and the engines themselves never touch the network. It replaces the rsync
+`leena_sync.sh` sidecar.
 
-It spawns the pool once weights land, restarts it if it dies, and heartbeats its
-liveness — so a zombie box (client up, workers dead, producing nothing) shows up in
+It spawns the pool once the net lands, restarts dead engines, and heartbeats its
+liveness — so a zombie box (client up, engines dead, producing nothing) shows up in
 /status instead of silently lying.
 
 Each tick (`--poll-seconds`):
   1. GET /control (carrying `X-Client-Id` + `X-Client-Version` heartbeat headers so
      the server can list live boxes AND their code version in /status — a box on a
      stale commit is then visible, not a silent runtime crash) — if STOP, signal the
-     local workers (touch run-dir/STOP) and exit. A tick that raises an unexpected
+     local engines (touch run-dir/STOP) and exit. A tick that raises an unexpected
      error is logged and retried next poll — the loop never dies (an unattended
      volunteer box must outlive transient faults).
   1b. GET /client-version — the trainer host's code sha. With --update-cmd set, a
@@ -29,43 +29,43 @@ Each tick (`--poll-seconds`):
      corrects even if the code lands here just after the server advertises it). Without
      --update-cmd the drift is only logged, so a stale box stays visible in /status.
   2. Net sync (content-addressed, lc0 get_network): /control's response carries an
-     X-Network-Sha header (the current net's sha256); on a change, GET /get_network?sha=
-     and write run-dir/weights.pt atomically (the workers hot-reload on their own mtime
-     poll). The client gets back exactly the bytes it asked for, keyed by hash, not an
-     opaque version. Falls back to the legacy /version+/weights poll against a server
-     that doesn't advertise the sha. Fires once per trainer ITERATION / promotion.
+     X-Network-Sha header (the .pt net's sha256, for the fleet net-consistency view) and
+     an X-Network-Bin-Sha header (the C++-loadable .bin twin's sha256); on a change, GET
+     /get_network?sha= and write run-dir/weights.{pt,bin} atomically. The cc_selfplay
+     engines hot-reload weights.bin on their own mtime poll. The client gets back exactly
+     the bytes it asked for, keyed by hash. Falls back to the legacy /version+/weights
+     poll against a server that doesn't advertise the sha. Fires once per trainer
+     ITERATION / promotion.
   3. Upload finished self-play games (train job output): each settled buffer/*.pkl (a
      gzipped-JSON `ccz` chunk, not a pickle — moved opaquely) is POSTed with its `.meta`
      in ONE multipart /upload_game request (server lands meta-before-pkl), then deleted —
      each game uploaded exactly once.
   3b. Ship finished gate outcomes (match job output): each match_out/*.json -> POST
      /match_result, then deleted.
-  4. (--spawn-workers) Supervise the worker pool: spawn `selfplay_workers_only --job-driven`
-     once weights.pt has landed, restart it on unexpected exit, and heartbeat its state
+  4. (--spawn-engines) Supervise the engine pool: spawn N `cc_selfplay --jobs-local` procs
+     once weights.bin has landed, restart any that die, and heartbeat their state
      (X-Client-Workers: up/down/off) so /status can flag a zombie box. The run-dir job queue
-     is reset on each (re)spawn so a fresh pool never claims a stale job (one minted against
+     is reset once on first spawn so a fresh pool never claims a stale job (one minted against
      an old net / left by a crashed pool).
   5. Mint jobs (the lc0 next_game loop): while fewer than --queue-depth jobs sit unclaimed in
-     run-dir/jobs/, POST /next_game and queue the reply for a worker to claim — a `train` job
+     run-dir/jobs/, POST /next_game and queue the reply for an engine to claim — a `train` job
      verbatim; a `match` job with the candidate + opponent nets pre-fetched by content address
-     (/get_network?sha=) and their local paths added, so the worker plays it without touching
-     the network. Roughly one /next_game per game, the server arbitrating train vs gate every
-     time. A self-play-only box (no gate deps) declines match jobs; the arena + per-worker
-     boxes carry the gate.
+     (/get_network?sha=) and their local .bin paths added, so the engine plays it without
+     touching the network. Roughly one /next_game per game, the server arbitrating train vs
+     gate every time. A self-play-only box (no gate deps) declines match jobs; the arena +
+     engine boxes carry the gate.
 
 The client is stdlib only (urllib) — no requests/aiohttp dep, so it runs on a bare
-volunteer venv. It shells out to the workers (never imports them), so the client never
-pulls in torch / the move-gen ext; the workers carry those and play every game.
+volunteer venv. It shells out to the cc_selfplay engine (never imports it), so the client
+never pulls in torch / the native ext at import; the engine carries the rules+NN and plays
+every game.
 
 Run (on a self-play box):
 
     python -m chessckers_engine.fleet_client \\
       --server http://192.168.1.50:8000 --run-dir ~/chessckers/run --poll-seconds 15 \\
-      --queue-depth 4 --spawn-workers -- --workers 4 --native --device cpu \\
-      --d-hidden 256 --c-filters 96 --n-blocks 4 --worker-id-base 300
-
-Everything after `--` is the worker command (selfplay_workers_only's flags); the client
-injects --run-dir/--weights/--job-driven, so the launcher only passes box-specific config.
+      --queue-depth 4 --spawn-engines --engine-workers 4 \\
+      --engine-binary engine/cpp/build/cc_selfplay --engine-worker-id-base 300
 """
 from __future__ import annotations
 
@@ -307,32 +307,6 @@ def _deep_diag(server: str, bind_iface: str, cached_idx) -> str:
     return "\n    ".join(L)
 
 
-def _split_worker_argv(argv: list) -> tuple:
-    """Split CLI args at the first literal `--`: everything before is the client's own
-    flags, everything after is the worker command (for --spawn-workers). No `--` => no
-    worker command."""
-    if "--" in argv:
-        i = argv.index("--")
-        return argv[:i], argv[i + 1:]
-    return argv, []
-
-
-def _spawn_workers(worker_argv: list, run_dir: Path, weights: Path, log_path: Path):
-    """Launch selfplay_workers_only as a supervised child (lc0's client-owns-engine
-    model). The client injects --run-dir/--weights/--job-driven (it owns those paths and
-    drives every game via the job queue); `worker_argv` carries the box-specific config the
-    launcher passed after `--`. Worker stdout/stderr go to workers.log so the client's own
-    log stays readable. Shelling out (not importing) keeps the client stdlib-only. Returns
-    (Popen, open-file)."""
-    cmd = [sys.executable, "-m", "chessckers_engine.selfplay_workers_only",
-           "--run-dir", str(run_dir), "--weights", str(weights), "--job-driven", *worker_argv]
-    f = open(log_path, "a")
-    proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
-    log.info("spawned workers (pid %d) -> %s | args: %s",
-             proc.pid, log_path, " ".join(worker_argv) or "(none)")
-    return proc, f
-
-
 class _EnginePool:
     """Supervise N `cc_selfplay --jobs-local` engine procs — the lc0 engine-binary half the
     orchestrator drives (Phase 3B-3 cutover). Each proc claims jobs from run_dir/jobs/ (the N
@@ -405,27 +379,21 @@ class _EnginePool:
 
 
 def _self_update(want: str, current: str, update_cmd: str, run_dir: Path,
-                 stop_path: Path, worker_proc, engine_pool=None) -> None:
+                 stop_path: Path, engine_pool=None) -> None:
     """Pull + rebuild this box onto code sha `want` via `update_cmd`, then re-exec this
     client onto the fresh code (lc0's client-updates-itself, adapted). On success
     os.execv replaces this process and never returns. On failure (cmd errored, or the
     working tree didn't actually advance to `want`) it logs and returns, leaving the box
     visibly on `current` — the caller's backoff retries later (e.g. once the code lands).
-    Owned workers/engines are wound down before the rebuild so a stale .so / binary isn't
+    The owned engine pool is wound down before the rebuild so a stale binary isn't
     mid-search."""
     log.warning("code self-update: server on %s, running %s — running update-cmd", want, current)
-    if worker_proc is not None or engine_pool is not None:
+    if engine_pool is not None:
         try:
             stop_path.touch()
         except OSError:
             pass
-        if worker_proc is not None:
-            try:
-                worker_proc.terminate()
-            except OSError:
-                pass
-        if engine_pool is not None:
-            engine_pool.stop(timeout=5.0)
+        engine_pool.stop(timeout=5.0)
     try:
         r = subprocess.run(update_cmd, shell=True, cwd=str(run_dir.parent),
                            timeout=600, capture_output=True, text=True)
@@ -628,9 +596,9 @@ def _fetch_net(server: str, sha: str, cache_dir: Path, timeout: float,
 
 
 def _reset_queue(jobs_dir: Path, match_out: Path) -> None:
-    """Clear the run-dir job queue + any un-shipped gate outcomes — called right before
-    (re)spawning the worker pool so a fresh pool starts on an EMPTY queue: no stale claims left
-    by a crashed pool, and no jobs minted against a now-superseded net. Best-effort per file."""
+    """Clear the run-dir job queue + any un-shipped gate outcomes — called once right before
+    the engine pool's first spawn so it starts on an EMPTY queue: no stale claims left by a
+    crashed pool, and no jobs minted against a now-superseded net. Best-effort per file."""
     for d in (jobs_dir, match_out):
         try:
             entries = list(d.glob("*"))
@@ -730,14 +698,11 @@ def _ship_match_results(server: str, match_out: Path, timeout: float) -> int:
 
 def main() -> int:
     setup_logging()
-    # The worker command (for --spawn-workers) is everything after a literal `--`;
-    # split it off before argparse so the client's own flags parse cleanly.
-    argv, worker_argv = _split_worker_argv(sys.argv[1:])
-    p = argparse.ArgumentParser(description="Fleet client: pull net / push games over HTTP (lc0-style).")
+    p = argparse.ArgumentParser(description="Fleet client: lc0 orchestrator over HTTP (owns cc_selfplay).")
     p.add_argument("--server", required=True, help="e.g. http://192.168.1.50:8000")
     p.add_argument("--run-dir", required=True, type=Path,
-                   help="Self-play run-dir (shared with selfplay_workers_only): "
-                        "weights.pt is written here, games are read from buffer/.")
+                   help="Self-play run-dir (shared with the cc_selfplay engines): "
+                        "weights.{pt,bin} are written here, games are read from buffer/.")
     p.add_argument("--poll-seconds", type=float, default=15.0)
     p.add_argument("--min-age", type=float, default=2.0,
                    help="Only upload pkls older than this (s) so their .meta has flushed.")
@@ -753,15 +718,10 @@ def main() -> int:
                    help="pin outbound HTTP to this interface via macOS IP_BOUND_IF (e.g. en0) — "
                         "use where a VPN scopes sockets onto a tunnel and the LAN server becomes "
                         "unreachable; empty = default routing.")
-    p.add_argument("--spawn-workers", action="store_true",
-                   help="Own the self-play worker subprocess (lc0-style): launch "
-                        "selfplay_workers_only, restart it if it dies, report liveness. "
-                        "Worker flags follow a `--` separator; --run-dir/--weights injected.")
     p.add_argument("--spawn-engines", action="store_true",
-                   help="Own N cc_selfplay --jobs-local ENGINE procs instead of the Python "
-                        "selfplay_workers_only (Phase 3B-3 cutover, true lc0 engine binary). "
+                   help="Own N cc_selfplay --jobs-local ENGINE procs (the lc0 engine binary). "
                         "Each claims jobs from run-dir/jobs/ and plays off run-dir/weights.bin. "
-                        "Mutually exclusive with --spawn-workers.")
+                        "Without it the client is a pure orchestrator (uploads/ships only).")
     p.add_argument("--engine-binary", default="",
                    help="Path to the cc_selfplay executable (default: engine/cpp/build/cc_selfplay "
                         "relative to this client).")
@@ -777,7 +737,7 @@ def main() -> int:
                         "advertises a newer version (e.g. 'cd ~/chessckers && git pull --ff-only "
                         "&& cd engine && PATH=.venv/bin:$PATH cpp/build.sh'). On success the "
                         "client re-execs onto the fresh code. Empty = warn on drift only.")
-    args = p.parse_args(argv)
+    args = p.parse_args()
 
     server = args.server.rstrip("/")
     bound_idx = None  # the iface index the bound opener cached at startup (for drift checks in _deep_diag)
@@ -804,10 +764,6 @@ def main() -> int:
     jobs_dir.mkdir(parents=True, exist_ok=True)
     match_out.mkdir(parents=True, exist_ok=True)
 
-    if args.spawn_workers and args.spawn_engines:
-        log.error("--spawn-workers and --spawn-engines are mutually exclusive")
-        return 2
-
     log.info("fleet client up: server=%s run-dir=%s poll=%.0fs id=%s version=%s",
              server, run_dir, args.poll_seconds, client_id, client_version)
     # The engine pool (Phase 3B-3): N cc_selfplay --jobs-local procs the orchestrator owns,
@@ -823,21 +779,14 @@ def main() -> int:
         log.info("owning engines (lc0 client-drives, job-driven): %d x cc_selfplay --jobs-local "
                  "(%s) | worker-id-base=%d queue-depth=%d", args.engine_workers, binary,
                  args.engine_worker_id_base, args.queue_depth)
-    # A box can play gate games iff it owns per-worker workers (a shared-inference pool has no
-    # standalone model to load arbitrary gate nets) OR the C++ engine (cc_selfplay plays match
-    # jobs natively); a self-play-only box declines match jobs.
-    can_match = (args.spawn_workers and "--shared-inference" not in worker_argv) or args.spawn_engines
-    if args.spawn_workers:
-        log.info("owning workers (lc0 client-drives, job-driven): selfplay_workers_only %s "
-                 "| queue-depth=%d gate=%s", " ".join(worker_argv) or "(no extra args)",
-                 args.queue_depth, "on" if can_match else "off")
+    # A box plays gate games iff it owns the engine pool (cc_selfplay plays match jobs
+    # natively); a pure orchestrator declines match jobs.
+    can_match = args.spawn_engines
     last_version = ""        # legacy /version fallback tracking (servers without X-Network-Sha)
     have_sha = ""            # content sha of the net currently materialized at weights.pt
     have_bin = ""            # content sha of the .bin twin materialized at weights.bin (cc_selfplay)
     total_up = 0
     total_gate = 0           # gate outcomes shipped to /match_result
-    worker_proc = None
-    worker_log = None
     engines_started = False  # reset the job queue once, on the pool's first spawn
     job_seq = 0              # monotonic job-file sequence (unique <seq>.json names in jobs/)
     update_cmd = args.update_cmd
@@ -851,14 +800,10 @@ def main() -> int:
     while True:
         try:
             now = time.time()
-            # 0. worker liveness for this tick's heartbeat (so the server can flag a
-            #    zombie box: client heartbeating but its workers dead). off = not yet
-            #    spawned (waiting on weights); up/down = supervised child alive/exited.
-            if args.spawn_workers:
-                ws = ("down" if (worker_proc is not None and worker_proc.poll() is not None)
-                      else "up" if worker_proc is not None else "off")
-                hb_tick = {**hb, "X-Client-Workers": ws}
-            elif args.spawn_engines:
+            # 0. engine liveness for this tick's heartbeat (so the server can flag a
+            #    zombie box: client heartbeating but its engines dead). off = not yet
+            #    spawned (waiting on weights.bin); up/down = pool all-alive / any-exited.
+            if args.spawn_engines:
                 ws = engine_pool.status()
                 hb_tick = {**hb, "X-Client-Workers": ws}
             else:
@@ -903,17 +848,11 @@ def main() -> int:
                     log.info("health: control=%s net=%s workers=%s uploaded=%d",
                              control, (have_sha[:12] if have_sha else last_version) or "none", ws, total_up)
             if control == "STOP":
-                log.info("server signaled STOP -> stopping local workers/engines + exiting")
+                log.info("server signaled STOP -> stopping local engines + exiting")
                 try:
                     stop_path.touch()
                 except OSError:
                     pass
-                if worker_proc is not None:
-                    try:
-                        worker_proc.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        log.warning("workers slow to stop; terminating")
-                        worker_proc.terminate()
                 if engine_pool is not None:
                     engine_pool.stop(timeout=30)
                 break
@@ -934,7 +873,7 @@ def main() -> int:
                                 "(no --update-cmd; update manually)", want, client_version)
                 else:
                     _self_update(want, client_version, update_cmd, run_dir, stop_path,
-                                 worker_proc, engine_pool)
+                                 engine_pool)
             # 2. net — content-addressed sync off /control's X-Network-Sha (preferred), or the
             #    legacy /version+/weights poll for a server that doesn't advertise the sha.
             #    Skipped when control failed (server unreachable — nothing to pull this tick).
@@ -957,39 +896,24 @@ def main() -> int:
             if g:
                 total_gate += g
                 log.info("shipped %d gate result(s) <%s> (total %d)", g, client_id, total_gate)
-            # 4. own the worker subprocess (lc0 client-owns-engine). Spawn once weights
-            #    have landed; restart on unexpected exit (self-heal). STOP is handled
-            #    above, so reaching here always means a (re)start is wanted.
-            if args.spawn_workers:
-                if worker_proc is None:
-                    if weights.exists():
-                        _reset_queue(jobs_dir, match_out)  # fresh pool -> empty queue (no stale claims)
-                        worker_proc, worker_log = _spawn_workers(
-                            worker_argv, run_dir, weights, run_dir / "workers.log")
-                elif worker_proc.poll() is not None:
-                    log.warning("workers exited (rc=%s) — restarting", worker_proc.returncode)
-                    if worker_log is not None:
-                        worker_log.close()
-                    _reset_queue(jobs_dir, match_out)
-                    worker_proc, worker_log = _spawn_workers(
-                        worker_argv, run_dir, weights, run_dir / "workers.log")
-            elif args.spawn_engines and weights_bin.exists():
-                # Engines need the C++-loadable net; spawn once weights.bin has landed, then
-                # keep the pool full (dead procs restart individually). Reset the shared queue
-                # ONCE on first spawn so a fresh pool never claims a stale job; a single engine
-                # restart does NOT reset (it would disrupt the other N-1's in-flight claims).
+            # 4. own the cc_selfplay engine pool (lc0 client-owns-engine). Engines need the
+            #    C++-loadable net; spawn once weights.bin has landed, then keep the pool full
+            #    (dead procs restart individually). Reset the shared queue ONCE on first spawn
+            #    so a fresh pool never claims a stale job; a single engine restart does NOT
+            #    reset (it would disrupt the other N-1's in-flight claims). STOP is handled
+            #    above, so reaching here always means the pool should be kept up.
+            if args.spawn_engines and weights_bin.exists():
                 if not engines_started:
                     _reset_queue(jobs_dir, match_out)
                     engines_started = True
                 engine_pool.ensure()
-            # 5. lc0 client-drives-each-game: keep the owned workers/engines fed with server-
-            #    assigned jobs. While the queue is below --queue-depth, POST /next_game and queue
-            #    the reply for a worker to claim (a `train` job -> a self-play game; a `match` job
-            #    -> a gate game, the two nets pre-fetched by sha). The workers claim + play; their
+            # 5. lc0 client-drives-each-game: keep the owned engines fed with server-assigned
+            #    jobs. While the queue is below --queue-depth, POST /next_game and queue the
+            #    reply for an engine to claim (a `train` job -> a self-play game; a `match` job
+            #    -> a gate game, the two nets pre-fetched by sha). The engines claim + play; their
             #    outputs ship in steps 3/3b. Skipped when control failed (server unreachable) or
             #    the pool isn't up yet (nothing to claim the jobs).
-            pool_up = ((worker_proc is not None and worker_proc.poll() is None)
-                       or (engine_pool is not None and engine_pool.any_alive()))
+            pool_up = engine_pool is not None and engine_pool.any_alive()
             if control_ok and pool_up:
                 job_seq = _mint_jobs(server, jobs_dir, gate_dir, args.queue_depth, job_seq,
                                      can_match, args.timeout, hb_tick)

@@ -33,7 +33,7 @@ PER_GAME_KEEP="${PER_GAME_KEEP:-0.5}"   # keep ~half of each game's plies in the
 
 say(){ echo "[launch-server] $*" >&2; }
 
-if pgrep -f 'chessckers_engine\.(train_continuous|fleet_server|fleet_arena|fleet_client|selfplay_workers_only)' >/dev/null; then
+if pgrep -f 'chessckers_engine\.(train_continuous|fleet_server|fleet_arena|fleet_client)' >/dev/null; then
   say "ABORT: a fleet process is already running. Stop it first:  scripts/stop_local.sh"
   exit 1
 fi

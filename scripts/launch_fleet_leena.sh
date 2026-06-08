@@ -104,10 +104,9 @@ nohup caffeinate -ims >/dev/null 2>&1 </dev/null &
 CAFF_PID=$!; disown
 
 # Never double-launch. The client owns the engines, so killing it is enough, but also reap any
-# stray engines (and any worker left by an older Python-engine launch) before starting.
+# stray engines before starting.
 pkill -f "chessckers_engine.fleet_client" 2>/dev/null || true
 pkill -f "cc_selfplay .*--jobs-local" 2>/dev/null || true
-pkill -f "chessckers_engine.selfplay_workers_only" 2>/dev/null || true
 sleep 1
 
 # Native C++ engine (lc0-split cutover, Phase 3B-3): leena (Apple silicon) runs the

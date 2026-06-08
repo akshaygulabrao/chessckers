@@ -2,9 +2,9 @@
 
 `cpp.run_jobs_local(run_dir, ...)` is the engine half: fleet_client.py (the orchestrator)
 mints jobs into run_dir/jobs/ and syncs run_dir/weights.bin; this loop claims each job
-(atomic rename, mirroring selfplay_worker_async._claim_job), plays it with the NATIVE
-engine, and writes the output to run_dir/buffer/ (train chunk) or run_dir/match_out/
-(gate outcome) — exactly the files the Python worker wrote, for the orchestrator to ship.
+(atomic rename), plays it with the NATIVE engine, and writes the output to
+run_dir/buffer/ (train chunk) or run_dir/match_out/ (gate outcome) — exactly the files
+the orchestrator then ships to the server.
 
 Gate (stronger than tensor equality): each train chunk in buffer/ is FIELD-identical to
 `decode_chunk(play_game_chunk(seed=base_seed+k))` for the k-th train job, and each gate
