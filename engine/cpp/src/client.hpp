@@ -26,10 +26,8 @@
 #include "fleet_http.hpp"
 #include "json_parse.hpp"
 #include "nn.hpp"
+#include "nn_backend.hpp"  // pluggable NN backend registry (cpu/metal/...; runtime --backend)
 #include "selfplay.hpp"
-#ifdef CC_HAVE_METAL
-#include "nn_metal.h"  // Phase 6f: GPU-batched engine (Apple). Absent on the CPU build.
-#endif
 
 namespace cc {
 
@@ -312,22 +310,14 @@ inline bool claim_job_local(const std::string& jobs_dir, int worker_id, std::str
     return false;
 }
 
-// Build the batched TRUNK forward for `net` (Phase 6f). On Apple with use_gpu and a Metal
-// device, that's MetalTrunkV2::run (the cached MPSGraph trunk, ~2x self-play); otherwise
-// the BLAS batched trunk net.trunk_v2_batch. The MetalTrunkV2 is owned by the returned
-// closure (shared_ptr); `net` must outlive it (the caller holds train_net while it's used).
-inline TrunkForwardFn make_engine_trunk_forward(const ChesskersNet& net, bool use_gpu) {
-#ifdef CC_HAVE_METAL
-    if (use_gpu) {
-        auto trunk = std::make_shared<MetalTrunkV2>(net);
-        if (trunk->ok())
-            return [trunk](const std::vector<std::vector<float>>& P) { return trunk->run(P); };
-    }
-#else
-    (void)use_gpu;
-#endif
-    const ChesskersNet* np = &net;
-    return [np](const std::vector<std::vector<float>>& P) { return np->trunk_v2_batch(P); };
+// Build the batched TRUNK forward for `net` (Phase 6f) by asking the BackendRegistry for the
+// `backend` device (lc0 --backend; ""/"auto" = highest-priority that loads, cpu floor). On Apple
+// "auto"/"metal" yields MetalTrunkV2::run (cached MPSGraph trunk, ~2x self-play); elsewhere/cpu it
+// is the BLAS net.trunk_v2_batch. The Backend (owning any MetalTrunkV2) is held by the returned
+// closure; `net` must outlive it (the caller holds train_net while it's used).
+inline TrunkForwardFn make_engine_trunk_forward(const ChesskersNet& net, const std::string& backend) {
+    std::shared_ptr<Backend> b = BackendRegistry::get().create(net, backend);
+    return [b](const std::vector<std::vector<float>>& P) { return b->trunk_batch(P); };
 }
 
 // Run the local-job engine loop in run_dir. Claims jobs until `max_jobs` are handled
@@ -354,7 +344,7 @@ inline TrunkForwardFn make_engine_trunk_forward(const ChesskersNet& net, bool us
 inline int run_jobs_local(const std::string& run_dir, const std::string& start_fen,
                           int worker_id, const std::string& machine, uint64_t base_seed,
                           int max_jobs = 0, long seq_start = 1, int batch_size = 1,
-                          bool use_gpu = false, int concurrency = 0) {
+                          const std::string& backend = "auto", int concurrency = 0) {
     const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
     const double gamma = g ? std::atof(g) : 1.0;
     const std::string jobs_dir = run_dir + "/jobs";
@@ -426,7 +416,7 @@ inline int run_jobs_local(const std::string& run_dir, const std::string& start_f
                     train_net = std::make_shared<ChesskersNet>(weights_bin);
                     last_wt = wt;
                     have_wt = true;
-                    if (batched) train_forward = make_engine_trunk_forward(*train_net, use_gpu);
+                    if (batched) train_forward = make_engine_trunk_forward(*train_net, backend);
                 } catch (...) { /* mid-write — retry */ }
             }
         }

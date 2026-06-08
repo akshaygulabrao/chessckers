@@ -56,14 +56,16 @@ int main(int argc, char** argv) {
             return 2;
         }
         int batch_size = std::atoi(arg_val(argc, argv, "--batch-size", "1").c_str());
-        bool use_gpu = has_flag(argc, argv, "--gpu");
+        // NN backend (lc0 --backend): explicit name wins; else --gpu (legacy alias) => "metal",
+        // else "auto" (highest-priority device that loads, cpu floor). See nn_backend.hpp.
+        std::string backend = arg_val(argc, argv, "--backend", "");
+        if (backend.empty()) backend = has_flag(argc, argv, "--gpu") ? "metal" : "auto";
         int concurrency = std::atoi(arg_val(argc, argv, "--concurrency", "0").c_str());
         std::cout << "cc_selfplay: jobs-local run-dir=" << run_dir << " worker=" << worker_id
                   << " machine=" << machine << " batch-size=" << batch_size
-                  << " gpu=" << (use_gpu ? "on" : "off") << " concurrency=" << concurrency
-                  << std::endl;
+                  << " backend=" << backend << " concurrency=" << concurrency << std::endl;
         int handled = cc::run_jobs_local(run_dir, start_fen, worker_id, machine, base_seed,
-                                         /*max_jobs*/ 0, /*seq_start*/ 1, batch_size, use_gpu,
+                                         /*max_jobs*/ 0, /*seq_start*/ 1, batch_size, backend,
                                          concurrency);
         std::cout << "cc_selfplay: handled " << handled << " jobs" << std::endl;
         return 0;

@@ -645,27 +645,10 @@ static py::object play_games_batched_native(cc::Board board, const cc::Chesskers
     const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
     const double gamma = g ? std::atof(g) : 1.0;
 
-    cc::TrunkForwardFn trunk_forward;
-    bool gpu = false;
-#ifdef CC_HAVE_METAL
-    std::unique_ptr<cc::MetalTrunkV2> trunk;
-    if (use_gpu) {
-        trunk = std::make_unique<cc::MetalTrunkV2>(net);
-        if (trunk->ok()) {
-            gpu = true;
-            cc::MetalTrunkV2* tp = trunk.get();
-            trunk_forward = [tp](const std::vector<std::vector<float>>& P) { return tp->run(P); };
-        }
-    }
-#else
-    (void)use_gpu;
-#endif
-    if (!gpu) {  // CPU fallback (also the non-Apple / no-GPU path): BLAS batched trunk
-        const cc::ChesskersNet* np = &net;
-        trunk_forward = [np](const std::vector<std::vector<float>>& P) {
-            return np->trunk_v2_batch(P);
-        };
-    }
+    // Route through the backend registry: use_gpu -> "auto" (metal-if-present-else-cpu, the old
+    // fallback semantics), !use_gpu -> "cpu" (byte-identical to serial eval). See nn_backend.hpp.
+    cc::TrunkForwardFn trunk_forward =
+        cc::make_engine_trunk_forward(net, use_gpu ? "auto" : "cpu");
 
     std::vector<cc::PureGame> games;
     {
@@ -1311,11 +1294,12 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         [](const std::string& run_dir, const std::string& start_fen, int worker_id,
            const std::string& machine, uint64_t base_seed, int max_jobs, long seq_start,
            int batch_size, bool use_gpu, int concurrency) {
+            const std::string backend = use_gpu ? "auto" : "cpu";  // bool kwarg -> registry name
             int n;
             {
                 py::gil_scoped_release release;
                 n = cc::run_jobs_local(run_dir, start_fen, worker_id, machine, base_seed, max_jobs,
-                                       seq_start, batch_size, use_gpu, concurrency);
+                                       seq_start, batch_size, backend, concurrency);
             }
             return n;
         },
