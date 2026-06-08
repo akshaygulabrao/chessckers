@@ -19,9 +19,16 @@ find_package(ZLIB REQUIRED)     # gzip for Phase-3A training-chunk encoding
 # else the generic CMake BLAS find. To build on Linux: apt-get install libopenblas-dev.
 set(CC_BLAS_DEFS "")
 set(CC_BLAS_INCLUDES "")
+# Phase 6 Metal (MPSGraph) GPU backend — Apple only, linked into the pybind module (not the
+# standalone client). The .mm TU compiles as Objective-C++; CC_HAVE_METAL gates the binding.
+set(CC_METAL_SRC "")
+set(CC_METAL_LIBS "")
 if(APPLE)
   set(CC_BLAS_LIBS "-framework Accelerate")
   set(CC_BLAS_DEFS ACCELERATE_NEW_LAPACK)
+  enable_language(OBJCXX)
+  set(CC_METAL_SRC src/nn_metal.mm)
+  set(CC_METAL_LIBS "-framework Metal" "-framework MetalPerformanceShadersGraph" "-framework Foundation")
 else()
   find_library(OPENBLAS_LIB NAMES openblas)
   find_path(CBLAS_INCLUDE_DIR NAMES cblas.h PATH_SUFFIXES openblas)
@@ -46,8 +53,12 @@ function(cc_configure_target tgt)
   target_link_libraries(${tgt} PRIVATE ${CC_BLAS_LIBS} Threads::Threads ZLIB::ZLIB)
 endfunction()
 
-pybind11_add_module(chessckers_cpp src/bindings.cpp)
+pybind11_add_module(chessckers_cpp src/bindings.cpp ${CC_METAL_SRC})
 cc_configure_target(chessckers_cpp)
+if(APPLE)
+  target_link_libraries(chessckers_cpp PRIVATE ${CC_METAL_LIBS})
+  target_compile_definitions(chessckers_cpp PRIVATE CC_HAVE_METAL)
+endif()
 
 # Phase 3B-2b: standalone self-play client executable — NO Python (lc0-shaped, a
 # volunteer box runs just this binary). Shares the header-only core TUs.

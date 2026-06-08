@@ -21,6 +21,7 @@
 #include "movegen_white.hpp"
 #include "native_move.hpp"
 #include "nn.hpp"
+#include "nn_metal.h"
 #include "search.hpp"
 #include "selfplay.hpp"
 
@@ -873,6 +874,22 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         "encode_move_v2", [](const py::dict& mv) { return encode_move_v2_dict(mv); }, py::arg("move"),
         "V2: encode a move dict to the flat 114-dim gather move features "
         "([from_idx, to_idx, path_mask(100), scalars(12)]). Mirrors encoding.encode_move_v2.");
+
+    // Phase 6a: Metal/MPSGraph toolchain spike. Returns max|MPSGraph - CPU| for a batched
+    // matmul (≈0 ⇒ the GPU backend links + runs + agrees with BLAS). -2 if built without Metal.
+    m.def(
+        "metal_matmul_selftest",
+        [](int M, int K, int N) {
+#ifdef CC_HAVE_METAL
+            return cc::metal_matmul_selftest(M, K, N);
+#else
+            (void)M; (void)K; (void)N;
+            return -2.0f;
+#endif
+        },
+        py::arg("m") = 64, py::arg("k") = 96, py::arg("n") = 256,
+        "Phase 6a: run C=A@B on the Metal GPU via MPSGraph; return max abs diff vs CPU (-1 no "
+        "GPU, -2 built without Metal).");
 
     py::class_<cc::ChesskersNet>(m, "ChesskersNet")
         .def(py::init<const std::string&>(), py::arg("weights_path"),
