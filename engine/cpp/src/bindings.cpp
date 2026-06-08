@@ -645,7 +645,7 @@ static py::object play_games_batched_native(cc::Board board, const cc::Chesskers
     const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
     const double gamma = g ? std::atof(g) : 1.0;
 
-    cc::BatchForwardFn forward;
+    cc::TrunkForwardFn trunk_forward;
     bool gpu = false;
 #ifdef CC_HAVE_METAL
     std::unique_ptr<cc::MetalTrunkV2> trunk;
@@ -654,20 +654,16 @@ static py::object play_games_batched_native(cc::Board board, const cc::Chesskers
         if (trunk->ok()) {
             gpu = true;
             cc::MetalTrunkV2* tp = trunk.get();
-            forward = [tp](const std::vector<std::vector<float>>& P,
-                           const std::vector<std::vector<std::vector<float>>>& M) {
-                return tp->eval_batch(P, M);
-            };
+            trunk_forward = [tp](const std::vector<std::vector<float>>& P) { return tp->run(P); };
         }
     }
 #else
     (void)use_gpu;
 #endif
-    if (!gpu) {  // CPU fallback (also the non-Apple / no-GPU path)
+    if (!gpu) {  // CPU fallback (also the non-Apple / no-GPU path): BLAS batched trunk
         const cc::ChesskersNet* np = &net;
-        forward = [np](const std::vector<std::vector<float>>& P,
-                       const std::vector<std::vector<std::vector<float>>>& M) {
-            return np->eval_batch(P, M);
+        trunk_forward = [np](const std::vector<std::vector<float>>& P) {
+            return np->trunk_v2_batch(P);
         };
     }
 
@@ -679,7 +675,7 @@ static py::object play_games_batched_native(cc::Board board, const cc::Chesskers
                                             dirichlet_alpha, dirichlet_eps, base_seed,
                                             resign_threshold, resign_no_resign_frac,
                                             resign_consecutive, resign_min_ply, gamma,
-                                            std::move(forward));
+                                            std::move(trunk_forward));
     }
     return pure_games_to_py(games);
 }

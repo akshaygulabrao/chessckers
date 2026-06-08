@@ -69,17 +69,22 @@ struct DirectEvaluator : Evaluator {
     }
 };
 
-// The batched forward: K leaves -> K (value, priors). Either net.eval_batch (CPU) or
-// MetalTrunkV2::eval_batch (GPU) — selfplay.hpp stays backend-agnostic (the binding
-// supplies it; cc_selfplay supplies the CPU one), so Metal types never leak in here.
-using BatchForwardFn = std::function<std::vector<std::pair<float, std::vector<float>>>(
-    const std::vector<std::vector<float>>&, const std::vector<std::vector<std::vector<float>>>&)>;
+// The batched TRUNK forward: K positions -> K feature maps [c_filters*100]. Either
+// net.trunk_v2_batch (CPU BLAS) or MetalTrunkV2::run (GPU) — selfplay.hpp stays
+// backend-agnostic (the binding supplies it; cc_selfplay supplies the CPU one), so Metal
+// types never leak in here. Only the trunk batches; the per-board value/policy heads run
+// on the GAME threads (Phase 6e) — they don't batch well and parallelize off the gatherer.
+using TrunkForwardFn =
+    std::function<std::vector<std::vector<float>>(const std::vector<std::vector<float>>&)>;
 
-// Shared batching evaluator. Each game thread calls eval() and BLOCKS; a gatherer
-// drains the submitted leaves once every running game has submitted (or the cap is
-// reached), runs ONE batched forward, and wakes the blocked threads with their result.
+// Shared batching evaluator. Each game thread calls eval() and BLOCKS while the gatherer
+// batches the trunk; on wake the thread computes its OWN head_v2 (value + policy) from its
+// features, in parallel with the other game threads. The gatherer fires once every running
+// game has submitted (or the cap is reached). V1 nets skip the gatherer entirely (their
+// trunk doesn't have the batched path) and just eval serially on the calling thread.
 struct BatchEvaluator : Evaluator {
-    BatchForwardFn forward;
+    const ChesskersNet& net;
+    TrunkForwardFn trunk_forward;
     int cap;                    // max leaves per batch (== concurrent games)
     std::mutex m;
     std::condition_variable cv_gather;
@@ -87,26 +92,29 @@ struct BatchEvaluator : Evaluator {
 
     struct Req {
         const std::vector<float>* pos;
-        const std::vector<std::vector<float>>* moves;
-        std::pair<float, std::vector<float>> result;
+        std::vector<float> feat;  // trunk features, filled by the gatherer
         bool ready = false;
         std::condition_variable cv;
     };
     std::vector<Req*> pending;
 
-    BatchEvaluator(BatchForwardFn f, int cap_, int active_)
-        : forward(std::move(f)), cap(cap_), active(active_) {}
+    BatchEvaluator(const ChesskersNet& n, TrunkForwardFn f, int cap_, int active_)
+        : net(n), trunk_forward(std::move(f)), cap(cap_), active(active_) {}
 
     std::pair<float, std::vector<float>> eval(
         const std::vector<float>& pos, const std::vector<std::vector<float>>& moves) override {
-        std::unique_lock<std::mutex> lk(m);
-        Req req;
-        req.pos = &pos;
-        req.moves = &moves;
-        pending.push_back(&req);
-        cv_gather.notify_one();
-        req.cv.wait(lk, [&] { return req.ready; });
-        return std::move(req.result);
+        if (!net.is_v2) return net.eval(pos, moves);  // V1: no batched trunk -> serial
+        std::vector<float> feat;
+        {
+            std::unique_lock<std::mutex> lk(m);
+            Req req;
+            req.pos = &pos;
+            pending.push_back(&req);
+            cv_gather.notify_one();
+            req.cv.wait(lk, [&] { return req.ready; });
+            feat = std::move(req.feat);
+        }
+        return net.head_v2(feat, moves);  // head on THIS game thread (parallel), not the gatherer
     }
 
     // A worker calls this exactly once when it will never submit another leaf (its
@@ -133,18 +141,13 @@ struct BatchEvaluator : Evaluator {
             std::vector<Req*> batch(pending.begin(), pending.begin() + take);
             pending.erase(pending.begin(), pending.begin() + take);
             std::vector<std::vector<float>> P;
-            std::vector<std::vector<std::vector<float>>> M;
             P.reserve(take);
-            M.reserve(take);
-            for (auto* r : batch) {
-                P.push_back(*r->pos);
-                M.push_back(*r->moves);
-            }
+            for (auto* r : batch) P.push_back(*r->pos);
             lk.unlock();
-            auto res = forward(P, M);  // the one batched NN forward — GIL already released
+            auto feats = trunk_forward(P);  // the one batched trunk forward — GIL already released
             lk.lock();
             for (int i = 0; i < take; ++i) {
-                batch[i]->result = std::move(res[i]);
+                batch[i]->feat = std::move(feats[i]);
                 batch[i]->ready = true;
                 batch[i]->cv.notify_one();
             }
@@ -477,12 +480,12 @@ inline std::vector<PureGame> play_games_batched_pure(
     const Board& start, const ChesskersNet& net, int num_games, int batch_size, int n_sims,
     double c_puct, double temperature, int temp_cutoff_plies, int max_plies, double dirichlet_alpha,
     double dirichlet_eps, uint64_t base_seed, double resign_threshold, double resign_no_resign_frac,
-    int resign_consecutive, int resign_min_ply, double gamma, BatchForwardFn forward) {
+    int resign_consecutive, int resign_min_ply, double gamma, TrunkForwardFn trunk_forward) {
     std::vector<PureGame> games(std::max(0, num_games));
     if (num_games <= 0) return games;
     const int nworkers = std::max(1, std::min(batch_size, num_games));
 
-    BatchEvaluator bev(std::move(forward), nworkers, nworkers);
+    BatchEvaluator bev(net, std::move(trunk_forward), nworkers, nworkers);
     std::atomic<int> next{0};
     auto worker = [&]() {
         for (;;) {

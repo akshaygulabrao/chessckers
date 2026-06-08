@@ -567,21 +567,27 @@ struct ChesskersNet {
         return logits;
     }
 
+    // V2 head: (value, softmax priors) from already-computed trunk features F. Split out of
+    // eval/eval_batch so the batched driver can run the GPU/BLAS trunk ONCE for K leaves and
+    // then compute these per-board heads on the game threads (Phase 6e — the heads don't batch
+    // well and parallelize better off the gatherer). Byte-identical to eval's V2 tail.
+    std::pair<float, std::vector<float>> head_v2(const std::vector<float>& F,
+                                                 const std::vector<std::vector<float>>& moves) const {
+        const float v = value_v2(F);
+        const int N = (int)moves.size();
+        std::vector<float> priors(N);
+        if (N == 0) return {v, priors};
+        const auto logits = policy_logits_v2(F, moves);
+        const float mx = *std::max_element(logits.begin(), logits.end());
+        double s = 0.0;
+        for (float l : logits) s += std::exp(l - mx);
+        for (int i = 0; i < N; ++i) priors[i] = (float)(std::exp(logits[i] - mx) / s);
+        return {v, priors};
+    }
+
     std::pair<float, std::vector<float>> eval(const std::vector<float>& pos,
                                               const std::vector<std::vector<float>>& moves) const {
-        if (is_v2) {
-            const auto F = trunk_v2(pos);
-            const float v = value_v2(F);
-            const int N = (int)moves.size();
-            std::vector<float> priors(N);
-            if (N == 0) return {v, priors};
-            const auto logits = policy_logits_v2(F, moves);
-            const float mx = *std::max_element(logits.begin(), logits.end());
-            double s = 0.0;
-            for (float l : logits) s += std::exp(l - mx);
-            for (int i = 0; i < N; ++i) priors[i] = (float)(std::exp(logits[i] - mx) / s);
-            return {v, priors};
-        }
+        if (is_v2) return head_v2(trunk_v2(pos), moves);
         const auto pe = trunk(pos);
         const float v = value(pe);
         const int N = (int)moves.size();
@@ -611,18 +617,7 @@ struct ChesskersNet {
             return out;
         }
         const auto Fs = trunk_v2_batch(positions);
-        for (int k = 0; k < K; ++k) {
-            const float v = value_v2(Fs[k]);
-            const int N = (int)moves_per[k].size();
-            std::vector<float> priors(N);
-            if (N == 0) { out[k] = {v, priors}; continue; }
-            const auto logits = policy_logits_v2(Fs[k], moves_per[k]);
-            const float mx = *std::max_element(logits.begin(), logits.end());
-            double s = 0.0;
-            for (float l : logits) s += std::exp(l - mx);
-            for (int i = 0; i < N; ++i) priors[i] = (float)(std::exp(logits[i] - mx) / s);
-            out[k] = {v, priors};
-        }
+        for (int k = 0; k < K; ++k) out[k] = head_v2(Fs[k], moves_per[k]);
         return out;
     }
 };
