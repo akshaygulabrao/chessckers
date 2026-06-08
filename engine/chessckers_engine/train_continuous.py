@@ -248,6 +248,14 @@ def _publish(model: ChesskersScorer, weights_path: Path) -> None:
     tmp_arch = Path(str(tmp) + ".arch.json")
     if tmp_arch.exists():
         os.replace(tmp_arch, Path(str(weights_path) + ".arch.json"))
+    # Phase 3B (lc0-split): also publish a C++-loadable native .bin so the no-Python
+    # self-play client can fetch the net by sha (GET /get_network) and load it
+    # directly — additive, the .pt path (Python clients) is untouched.
+    from chessckers_engine.native_net import export_state_dict
+    bin_path = weights_path.with_suffix(".bin")
+    bin_tmp = bin_path.with_name(bin_path.name + ".tmp")
+    export_state_dict(model.state_dict(), bin_tmp)
+    os.replace(bin_tmp, bin_path)  # atomic on POSIX
 
 
 def main() -> int:

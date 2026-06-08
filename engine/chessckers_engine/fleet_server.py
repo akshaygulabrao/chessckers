@@ -114,6 +114,13 @@ def _net_path(run_dir: Path) -> Path:
     return best if best.exists() else run_dir / "weights.pt"
 
 
+def _net_bin_path(run_dir: Path) -> Path:
+    """The C++-loadable native .bin twin of the servable net (best.bin / weights.bin) —
+    what the no-Python self-play client fetches by sha. Published by the trainer
+    (train_continuous._publish) alongside the .pt; '' sha if it doesn't exist yet."""
+    return _net_path(run_dir).with_suffix(".bin")
+
+
 def _version(run_dir: Path) -> str:
     """Net version the clients key off. When keep-best gating is active, tracks
     `best.pt`'s promotion mtime — clients refresh once per PROMOTION. With no
@@ -198,13 +205,15 @@ def _net_files(run_dir: Path) -> list:
     """Every net the server can serve by sha: the gated champion, the raw weights, the
     candidate, and each archived gate opponent. Order is the preferred-match order."""
     files = []
-    for name in ("best.pt", "weights.pt", "cand.pt"):
+    for name in ("best.pt", "weights.pt", "cand.pt",
+                 "best.bin", "weights.bin", "cand.bin"):  # .bin = C++-client nets (Phase 3B)
         p = run_dir / name
         if p.exists():
             files.append(p)
     mn = run_dir / "match_nets"
     if mn.exists():
         files.extend(sorted(mn.glob("*.pt")))
+        files.extend(sorted(mn.glob("*.bin")))
     return files
 
 
@@ -485,7 +494,11 @@ class _Handler(BaseHTTPRequestHandler):
         seeds = (m or {}).get("seeds") or []
         opps = (m or {}).get("opponents") or ["best"]
         if not m or not seeds:
+            # `sha` = the .pt net (Python clients); `bin_sha` = its C++-loadable .bin
+            # twin (the no-Python client fetches THIS by sha). bin_sha is "" until the
+            # trainer has published a .bin — additive, never breaks the .pt path.
             job = {"type": "train", "sha": _file_sha(_net_path(rd)) or "",
+                   "bin_sha": _file_sha(_net_bin_path(rd)) or "",
                    "params": _selfplay_params(rd)}
             self._send(200, json.dumps(job).encode(), "application/json")
             return
