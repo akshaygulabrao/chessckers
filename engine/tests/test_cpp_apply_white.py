@@ -24,7 +24,6 @@ from chessckers_engine.variant_py.client import PyVariantClient
 from chessckers_engine.variant_py.state import STARTING_FEN, parse_fen
 
 cpp = pytest.importorskip("chessckers_cpp")
-rs = pytest.importorskip("chessckers_movegen")
 
 SEEDS = [
     STARTING_FEN,
@@ -32,15 +31,6 @@ SEEDS = [
     "k7/8/8/8/8/8/8/R3K2R[a8:kk,h8:kk] w KQ - 0 1",   # castling-rich
     "7p/8/8/8/8/8/8/4K3[h8:ssss] w - - 0 1",
 ]
-
-
-def _wb(fen):
-    b = parse_fen(fen).board
-    stacks = {int(s): p for s, p in parse_fen(fen).stacks.items()}
-    ep = -1 if b.ep_square is None else int(b.ep_square)
-    return (int(b.occupied), int(b.occupied_co[chess.WHITE]), int(b.pawns), int(b.knights),
-            int(b.bishops), int(b.rooks), int(b.queens), int(b.kings), int(b.castling_rights), ep,
-            stacks)
 
 
 def _py_fields(b: chess.Board) -> tuple:
@@ -81,7 +71,7 @@ def test_apply_white_matches_pyvariant():
     fens = _collect(only_white=True)
     n = 0
     for fen in fens:
-        for mv in rs.white_legal_moves(*_wb(fen)):
+        for mv in mw.white_legal_moves(parse_fen(fen)):
             cb = cpp.apply_white_move(cpp.parse_fen(fen), mv)
             ps = mw.apply_white_move(parse_fen(fen), mv["uci"])
             assert _cpp_fields(cb) == _py_fields(ps.board), f"fen={fen} uci={mv['uci']}"
@@ -91,16 +81,9 @@ def test_apply_white_matches_pyvariant():
 
 
 def _legal_dicts(state):
-    b = state.board
-    stacks = {int(s): p for s, p in state.stacks.items()}
-    if b.turn == chess.WHITE:
-        ep = -1 if b.ep_square is None else int(b.ep_square)
-        return rs.white_legal_moves(int(b.occupied), int(b.occupied_co[chess.WHITE]), int(b.pawns),
-                                    int(b.knights), int(b.bishops), int(b.rooks), int(b.queens),
-                                    int(b.kings), int(b.castling_rights), ep, stacks)
-    wk = b.king(chess.WHITE)
-    return rs.all_black_legal_moves(int(b.occupied), int(b.occupied_co[chess.WHITE]),
-                                    -1 if wk is None else int(wk), stacks)
+    if state.board.turn == chess.WHITE:
+        return mw.white_legal_moves(state)
+    return mb._all_black_legal(state)
 
 
 def test_cpp_driven_replay_matches_pyvariant():

@@ -1,11 +1,6 @@
 """Slice 2a oracle test: C++ Black diagonal capture moves (chains + first-hop
-rams) vs two oracles.
-
-  * SET-equality vs the pure-Python reference (moves_black, _rs forced off) —
-    the canonical move-set must match, like tests/test_white_rust_equiv.py.
-  * EXACT ORDERED-list equality vs the live Rust extension — the Rust order is
-    the authoritative move order the policy head indexes, so the C++ port must
-    reproduce it move-for-move, not just as a set.
+rams) vs the pure-Python reference (moves_black) — SET-equality: the canonical
+move-set must match.
 
 Positions exercise multi-hop chains, branching, first-hop rams, off-grid
 overshoot in a chain, and a king-capturing chain (the white-king short-circuit).
@@ -58,12 +53,7 @@ def _bb(state):
 
 
 def _py_moves(state):
-    saved = mb._rs_movegen
-    mb._rs_movegen = None
-    try:
-        return mb.black_diagonal_capture_moves(state)
-    finally:
-        mb._rs_movegen = saved
+    return mb.black_diagonal_capture_moves(state)
 
 
 @pytest.mark.parametrize("fen", CORPUS)
@@ -85,17 +75,3 @@ def test_corpus_actually_exercises_captures():
         state = parse_fen(fen)
         occ, occw, king_sq, stacks = _bb(state)
         assert cpp.black_diagonal_capture_moves(occ, occw, king_sq, stacks), fen
-
-
-@pytest.mark.parametrize("fen", CORPUS)
-def test_capture_moves_ordered_vs_rust(fen: str):
-    rs = mb._rs_movegen
-    if rs is None:
-        pytest.skip("rust extension not built")
-    state = parse_fen(fen)
-    occ, occw, king_sq, stacks = _bb(state)
-    rs_moves = [_canon(m) for m in rs.black_diagonal_capture_moves(occ, occw, king_sq, stacks)]
-    cpp_moves = [_canon(m) for m in cpp.black_diagonal_capture_moves(occ, occw, king_sq, stacks)]
-    assert cpp_moves == rs_moves, (
-        f"order/content mismatch\n cpp={cpp_moves}\n  rs={rs_moves}"
-    )

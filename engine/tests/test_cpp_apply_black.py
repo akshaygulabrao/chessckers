@@ -21,7 +21,6 @@ from chessckers_engine.variant_py.client import PyVariantClient
 from chessckers_engine.variant_py.state import STARTING_FEN, parse_fen
 
 cpp = pytest.importorskip("chessckers_cpp")
-rs = pytest.importorskip("chessckers_movegen")
 
 SEEDS = [
     "8/8/3kkk2/8/8/8/PPPPPPPP/4K3[d6:kk,e6:kk,f6:kk] b - - 0 1",
@@ -70,12 +69,7 @@ def test_apply_black_matches_pyvariant():
     n = 0
     for fen in fens:
         state = parse_fen(fen)
-        occ = int(state.board.occupied)
-        occw = int(state.board.occupied_co[chess.WHITE])
-        wk = state.board.king(chess.WHITE)
-        king_sq = -1 if wk is None else int(wk)
-        stacks = {int(s): p for s, p in state.stacks.items()}
-        for mv in rs.all_black_legal_moves(occ, occw, king_sq, stacks):
+        for mv in mb._all_black_legal(state):
             cb = cpp.apply_black_move(cpp.parse_fen(fen), mv)
             ps = mb.apply_black_move_known(parse_fen(fen), mv)
             assert _cpp_fields(cb) == _py_fields(ps.board), f"fen={fen} mv={mv['uci']}"

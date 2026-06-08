@@ -120,27 +120,6 @@ _FEN_HEAD = re.compile(r"^([^\s\[]+)(?:\[([^\]]*)\])?\s+([wb])\b")
 # search is unambiguous.
 _FEN_R8 = re.compile(r"\br8:(\d+)")
 
-# Optional Rust acceleration for the per-leaf encodings — byte-for-byte
-# equivalent to the Python below (see rust/chessckers_movegen). Bypassed by
-# CHESSCKERS_NO_RUST or when the extension isn't built; tests monkeypatch
-# `encoding._rs = None` to force the Python path.
-import os as _os
-
-_rs = None
-if not _os.environ.get("CHESSCKERS_NO_RUST"):
-    try:
-        import chessckers_movegen as _rs
-    except ImportError:
-        _rs = None
-
-
-def _buf(b: bytes) -> torch.Tensor:
-    """Wrap raw f32 bytes from the Rust encoders as a 1-D float32 tensor.
-    bytearray makes the buffer writable (avoids torch's non-writable warning);
-    the copy is a few KB — far cheaper than materializing N Python floats."""
-    return torch.frombuffer(bytearray(b), dtype=torch.float32)
-
-
 def square_xy(square: str) -> tuple[int, int]:
     """Return (file 0..7, rank 0..7) for a square name like 'a1' or 'h8'."""
     return ord(square[0]) - ord("a"), int(square[1]) - 1
@@ -153,10 +132,7 @@ def square_index(square: str) -> int:
 
 
 def encode_position(fen: str) -> torch.Tensor:
-    """Encode a Chessckers FEN as a (15, 8, 8) float32 tensor (Rust fast path
-    when available; identical result either way)."""
-    if _rs is not None:
-        return _buf(_rs.encode_position(fen)).view(POS_C, 8, 8)
+    """Encode a Chessckers FEN as a (15, 8, 8) float32 tensor."""
     return _encode_position_py(fen)
 
 
@@ -238,20 +214,7 @@ def _bb_to_ch_table() -> dict[tuple[bool, int], int]:
 
 def encode_position_state(state: Any) -> torch.Tensor:
     """Encode a `variant_py.State` directly to the (15, 8, 8) tensor — the
-    per-leaf hot-path encoder (Rust fast path from piece bitboards when
-    available; identical result either way)."""
-    if _rs is not None:
-        import chess
-        b = state.board
-        wp, wn, wb, wr, wq, wk = (
-            int(b.pieces(pt, chess.WHITE))
-            for pt in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING)
-        )
-        bp = int(b.pieces(chess.PAWN, chess.BLACK))   # Stone-top
-        bk = int(b.pieces(chess.KING, chess.BLACK))   # King-top
-        return _buf(
-            _rs.encode_position_bb(wp, wn, wb, wr, wq, wk, bp, bk, state.stacks, b.turn == chess.BLACK, state.rank8_count)
-        ).view(POS_C, 8, 8)
+    per-leaf hot-path encoder."""
     return _encode_position_state_py(state)
 
 
@@ -303,10 +266,7 @@ def _encode_position_state_py(state: Any) -> torch.Tensor:
 
 
 def encode_move(move: dict[str, Any]) -> torch.Tensor:
-    """Encode a LegalMove dict as a (MOVE_D,) float32 vector (Rust fast path
-    when available; identical result either way)."""
-    if _rs is not None:
-        return _buf(_rs.encode_move(move))
+    """Encode a LegalMove dict as a (MOVE_D,) float32 vector."""
     return _encode_move_py(move)
 
 
@@ -348,8 +308,7 @@ def _encode_move_py(move: dict[str, Any]) -> torch.Tensor:
 
 
 # ===========================================================================
-# V2 encoders: 10x10 spatial position + gather-indexed moves (pure Python; a
-# Rust fast path is a deliberate follow-on, mirroring the V1 _rs accel). The
+# V2 encoders: 10x10 spatial position + gather-indexed moves. The
 # (rank10, file10) convention is shared with the V1 waypoint mask, so a board
 # square 'e4' and a rim coord 'z3' map through the SAME _FILE10/_RANK10 tables
 # to the SAME 10x10 flat index the position tensor uses — the gather and the

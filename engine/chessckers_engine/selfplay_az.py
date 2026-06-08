@@ -253,8 +253,21 @@ def play_az_game(
                 consec_resign = 0
         # AlphaZero per-ply temperature: explore the opening, then play sharp.
         eff_temp = temperature if ply < temp_cutoff_plies else 0.0
-        idx = _sample_move_index_from_visits(visits, eff_temp, rng)
-        chosen = legal[idx]
+        if eff_temp <= 0:
+            # Greedy: argmax visits, breaking ties by the SEARCH's own child
+            # order (visit_distribution insertion order) rather than the
+            # separately re-enumerated `legal` list, so the played move is
+            # consistent with the tree that produced the visits — and identical
+            # across search backends that share children but emit `legal` in a
+            # different order (e.g. the native C++ loop, whose white move-gen
+            # order differs from python-chess's). For the pure-Python search the
+            # dict is built from `legal`, so this is the same move as before.
+            best_uci = (max(result.visit_distribution.items(), key=lambda kv: kv[1])[0]
+                        if result.visit_distribution else legal[0]["uci"])
+            chosen = next(m for m in legal if m["uci"] == best_uci)
+        else:
+            idx = _sample_move_index_from_visits(visits, eff_temp, rng)
+            chosen = legal[idx]
         prev_fen = state["fen"]
         history.append({"fen": prev_fen, "uci": chosen["uci"]})
         try:

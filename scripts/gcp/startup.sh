@@ -32,20 +32,21 @@ AUTHKEY="$(curl -s -H "Authorization: Bearer $TOKEN" \
 tailscale up --authkey="$AUTHKEY" --hostname="$(hostname)" --accept-dns=true
 echo "tailnet IP: $(tailscale ip -4 2>/dev/null | head -1)  ->  trainer $SERVER"
 
-# --- app user: code + venv (CPU torch) + Rust ext ---
+# --- app user: code + venv (CPU torch) ---
+# No native accelerator on this Linux box: the C++ engine is Accelerate-only (Apple), and the
+# Rust move-gen accelerator was retired in the lc0-split migration. Self-play here runs on the
+# pure-Python PyVariant move-gen (slower). Restoring acceleration on GCP needs a Linux-portable
+# C++ NN/move-gen backend (deferred Phase 6 of the C++ port).
 id -u sp >/dev/null 2>&1 || useradd -m -s /bin/bash sp
 runuser -u sp -- bash <<'USR'
 set -uxo pipefail
 export HOME=/home/sp
 cd "$HOME"
 curl -LsSf https://astral.sh/uv/install.sh | sh                       # uv (Python pkg mgr)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y   # Rust toolchain (for maturin)
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 [ -d chessckers ] || git clone --depth=1 https://github.com/akshaygulabrao/chessckers.git chessckers
 cd chessckers/engine
 UV_TORCH_BACKEND=cpu uv sync          # force the CPU torch wheel (Linux default is the ~3GB CUDA build)
-cd rust/chessckers_movegen            # build the move-gen accelerator (pure Rust -> builds on Linux)
-VIRTUAL_ENV=../../.venv ../../.venv/bin/maturin develop --release
 USR
 
 # --- run the client as a systemd service (survives startup-script exit; restarts on crash) ---
@@ -59,7 +60,7 @@ Wants=network-online.target
 User=sp
 WorkingDirectory=/home/sp/chessckers
 Environment=SERVER=${SERVER}
-Environment=PATH=/home/sp/.local/bin:/home/sp/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/home/sp/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/sp/chessckers/scripts/launch_gcp.sh
 Restart=always
 RestartSec=10

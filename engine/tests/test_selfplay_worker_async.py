@@ -126,7 +126,7 @@ def test_worker_hot_reloads_weights_on_mtime_change(tmp_path: Path):
     import os
     os.utime(weights_path, (time.time() + 10, time.time() + 10))
 
-    t.join(timeout=30.0)
+    t.join(timeout=90.0)  # pure-Python move-gen (no Rust accel): 3 games need headroom
     assert not t.is_alive()
     assert result["n"] == 3
 

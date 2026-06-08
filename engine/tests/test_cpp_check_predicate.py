@@ -1,5 +1,4 @@
-"""Slice 3a oracle test: the C++ Chessckers check predicate vs the live Rust
-extension.
+"""Slice 3a oracle test: the C++ Chessckers check predicate vs PyVariant.
 
   * black_can_capture_white_king  — full diagonal chain/ram search to the king
   * square_attacked_by_black_chessckers — walk-based attack on a target square
@@ -8,7 +7,11 @@ extension.
 Positions come from random self-play rollouts (real, diverse king-attack states)
 plus hand-crafted in-check positions. square_attacked is swept over all 64
 target squares on a subset. python-chess's is_check is NOT a valid oracle here
-(it mis-models the Black-King encoding), so the Rust extension is the oracle.
+(it mis-models the Black-King encoding); PyVariant's Chessckers-correct check
+functions (moves_white) are the oracle: `_is_white_in_chessckers_check` mirrors
+white_in_chessckers_check, `_square_attacked_by_black_chessckers` mirrors the
+walk-based attack, and the diagonal-capture-generator king scan (the same one
+_is_white_in_chessckers_check uses) mirrors black_can_capture_white_king.
 """
 from __future__ import annotations
 
@@ -17,11 +20,29 @@ import random
 import chess
 import pytest
 
+from chessckers_engine.variant_py import moves_black as mb
+from chessckers_engine.variant_py import moves_white as mw
 from chessckers_engine.variant_py.client import PyVariantClient
 from chessckers_engine.variant_py.state import STARTING_FEN, parse_fen
 
 cpp = pytest.importorskip("chessckers_cpp")
-rs = pytest.importorskip("chessckers_movegen")
+
+
+def _py_can_capture_king(state, king_sq: int) -> bool:
+    """PyVariant mirror of black_can_capture_white_king: a Black diagonal
+    hop/chain captures the white king in transit (ram landings don't capture,
+    so path captures via `_chain_all_captures` are the test). Probes as if it
+    were Black to move, matching the C++ predicate's side-agnostic contract."""
+    if king_sq < 0:
+        return False
+    probe = state if state.board.turn == chess.BLACK else state.copy()
+    if probe is not state:
+        probe.board.turn = chess.BLACK
+    king_name = mw._SQ_NAME[king_sq]
+    for m in mb.black_diagonal_capture_moves(probe):
+        if king_name in (m.get("_chain_all_captures") or ()):
+            return True
+    return False
 
 SEEDS = [
     "8/8/3kkk2/8/8/8/PPPPPPPP/4K3[d6:kk,e6:kk,f6:kk] b - - 0 1",
@@ -63,23 +84,22 @@ def _bb(fen):
     return occ, occw, stacks, king_sq
 
 
-def test_check_predicate_matches_rust_over_rollout():
+def test_check_predicate_matches_pyvariant_over_rollout():
     fens = _collect_positions()
     assert len(fens) > 100, "rollout produced too few positions"
     saw_true = saw_false = False
     for i, fen in enumerate(fens):
         occ, occw, stacks, king_sq = _bb(fen)
+        state = parse_fen(fen)
 
         cpp_cap = cpp.black_can_capture_white_king(occ, occw, king_sq, stacks)
-        rs_cap = rs.black_can_capture_white_king(occ, occw, king_sq, stacks)
-        assert cpp_cap == rs_cap, f"black_can_capture_white_king @ {fen}"
+        py_cap = _py_can_capture_king(state, king_sq)
+        assert cpp_cap == py_cap, f"black_can_capture_white_king @ {fen}"
         saw_true |= bool(cpp_cap)
         saw_false |= not cpp_cap
 
-        rs_check = rs_cap or (
-            king_sq >= 0 and rs.square_attacked_by_black_chessckers(occ, occw, stacks, king_sq)
-        )
-        assert cpp.white_in_chessckers_check(occ, occw, king_sq, stacks) == rs_check, (
+        py_check = mw._is_white_in_chessckers_check(state) if king_sq >= 0 else False
+        assert cpp.white_in_chessckers_check(occ, occw, king_sq, stacks) == py_check, (
             f"white_in_chessckers_check @ {fen}"
         )
 
@@ -88,7 +108,7 @@ def test_check_predicate_matches_rust_over_rollout():
             for t in range(64):
                 assert cpp.square_attacked_by_black_chessckers(
                     occ, occw, stacks, t
-                ) == rs.square_attacked_by_black_chessckers(occ, occw, stacks, t), (
+                ) == mw._square_attacked_by_black_chessckers(state, t), (
                     f"square_attacked @ {fen} target={t}"
                 )
 

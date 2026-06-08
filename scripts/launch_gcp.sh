@@ -3,7 +3,7 @@
 # unit that scripts/gcp/startup.sh installs. Linux sibling of launch_fleet_leena.sh, stripped
 # for a headless GCE box: no caffeinate (servers don't sleep), no en0 bind (the route to the
 # trainer's 100.x is over Tailscale's utun), no C++/Accelerate build (Apple-only -> the client
-# falls back to the Python+Rust engine). Reaches the trainer over the tailnet; SERVER is
+# runs the pure-Python PyVariant move-gen; the Rust accelerator was retired). Reaches the trainer over the tailnet; SERVER is
 # injected by the unit. Same client path + shared scripts/fleet.env shape as local/leena, so
 # this box CANNOT drift from the rest of the fleet.
 set -uo pipefail
@@ -29,10 +29,11 @@ export CHESSCKERS_START_FEN="$(fleet_seed_fens "$SEED_MIX")"
 mkdir -p "$RUN/buffer"
 rm -f "$RUN/STOP" 2>/dev/null || true
 
-# Self-update when the server advertises a newer code sha: pull the public origin + rebuild the
-# Rust ext, then the client re-execs onto fresh code (keeps the box wire-aligned with the
-# trainer). No C++ rebuild — Accelerate is Apple-only, so this box never runs --native.
-UPDATE_CMD="cd '$REPO_ROOT' && git pull --ff-only && cd '$ENG/rust/chessckers_movegen' && VIRTUAL_ENV='$ENG/.venv' '$ENG/.venv/bin/maturin' develop --release"
+# Self-update when the server advertises a newer code sha: pull the public origin, then the client
+# re-execs onto fresh code (keeps the box wire-aligned with the trainer). No native rebuild — the
+# Rust accelerator was retired and the C++ engine is Accelerate-only (Apple), so this Linux box
+# runs the pure-Python PyVariant move-gen (no build step needed).
+UPDATE_CMD="cd '$REPO_ROOT' && git pull --ff-only"
 
 # fleet_client owns the workers: pull net + params, spawn + supervise selfplay_workers_only,
 # upload games, contribute gate games, self-update on a new server version. worker-id-base 400

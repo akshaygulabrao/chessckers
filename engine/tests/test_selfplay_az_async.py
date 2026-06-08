@@ -103,7 +103,7 @@ def test_async_run_writes_eval_log_when_enabled(tmp_path: Path):
         eval_games=2,
         eval_sims=4,
         eval_workers=2,
-        run_seconds=20.0,
+        run_seconds=60.0,  # pure-Python move-gen (no Rust accel): more wall-clock to reach an eval cycle
         main_loop_poll_seconds=0.5,
         seed=7,
     )

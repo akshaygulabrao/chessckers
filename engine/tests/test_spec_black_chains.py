@@ -11,17 +11,7 @@ COMPLETE legal-move set, which lets us assert exact equality.
 """
 from __future__ import annotations
 
-import pytest
-
-import chessckers_engine.variant_py.client as _cl
-import chessckers_engine.variant_py.moves_black as _mb
 from chessckers_engine.variant_py import PyVariantClient
-
-
-@pytest.fixture(autouse=True)
-def _bypass_rust(monkeypatch):
-    monkeypatch.setattr(_mb, "_rs_movegen", None)
-    monkeypatch.setattr(_cl, "_rs_movegen", None)
 
 
 def _ucis(fen: str) -> list[str]:

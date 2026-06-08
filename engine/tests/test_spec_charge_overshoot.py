@@ -16,10 +16,7 @@ rim-overshoot is what makes it a capture, and the notation must say so.
 from __future__ import annotations
 
 import chess
-import pytest
 
-import chessckers_engine.variant_py.client as _cl
-import chessckers_engine.variant_py.moves_black as _mb
 import chessckers_engine.variant_py.moves_white as _mw
 import endgame_solver as es
 from chessckers_engine.variant_py import PyVariantClient
@@ -32,16 +29,6 @@ SEED = "8/8/8/8/8/3kk3/8/4K3[d3:kk,e3:kk] b - - 0 1"
 AFTER_B = "8/8/8/8/8/4k3/4k3/4K3[e2:kk,e3:kk] b - - 0 1"
 # Same board, White to move — the real in-game position after d3e2.
 AFTER_W = "8/8/8/8/8/4k3/4k3/4K3[e2:kk,e3:kk] w - - 0 1"
-
-RUST = pytest.mark.skipif(_mb._rs_movegen is None, reason="Rust extension not built")
-
-
-@pytest.fixture
-def bypass_rust(monkeypatch):
-    """Force the pure-Python move-gen / check path everywhere it is consulted."""
-    monkeypatch.setattr(_mb, "_rs_movegen", None)
-    monkeypatch.setattr(_cl, "_rs_movegen", None)
-    monkeypatch.setattr(_mw, "_rs_movegen", None)
 
 
 def _rim_charge(fen):
@@ -96,33 +83,11 @@ def test_seed_is_mate_in_one():
     assert es.best_black_moves(SEED, 9) == ["d3e2"]
 
 
-# ---- pure-Python path agrees (covers the spec-test / NO_RUST surface) ----
+# ---- pure-Python path ----
 
-def test_pure_python_path(bypass_rust):
+def test_pure_python_path():
     rim = _rim_charge(AFTER_B)
     assert [m["uci"] for m in rim] == ["e2e0->e1"]
     r = PyVariantClient().make_move(AFTER_B, "e2e0->e1")
     assert parse_fen(r["fen"]).board.king(chess.WHITE) is None
     assert _mw._is_white_in_chessckers_check(parse_fen(AFTER_W)) is True
-
-
-# ---- Python and Rust must agree byte-for-byte on this position ----
-
-@RUST
-def test_python_rust_charge_equivalence():
-    """Every Python charge dict appears in the Rust legal-move list with byte-
-    identical fields (no mandate is active here, so no charge is suppressed)."""
-    st = parse_fen(AFTER_B)
-    wk = st.board.king(chess.WHITE)
-    rs_all = _mb._rs_movegen.all_black_legal_moves(
-        st.board.occupied, st.board.occupied_co[chess.WHITE],
-        -1 if wk is None else wk, st.stacks,
-    )
-    rs = {m["uci"]: (m["to"], m["capture"], tuple(m["waypoints"] or ())) for m in rs_all}
-    for m in _mb.black_charge_moves(st):
-        fields = (m["to"], m["capture"], tuple(m["waypoints"] or ()))
-        assert rs.get(m["uci"]) == fields, m["uci"]
-    # The rim charge is present and identical in both engines; the bare form is
-    # absent from both.
-    assert rs.get("e2e0->e1") == ("e1", "e1", ("e0",))
-    assert "e2e1" not in rs

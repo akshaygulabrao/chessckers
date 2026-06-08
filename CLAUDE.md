@@ -6,42 +6,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Chessckers is a chess-vs-checkers hybrid game. The repository is now a single authoritative engine plus its training/operations tooling:
 
-- **engine** (`engine/`) — Python (managed by `uv`) + a Rust extension (`chessckers_movegen`, built with `maturin`). This is the whole stack: the game logic (move generation, validation, FEN/UCI parsing), an AlphaZero-style neural engine (PUCT MCTS, self-play, training), and a terminal board renderer for debugging.
+- **engine** (`engine/`) — Python (managed by `uv`) + a native C++ extension (`chessckers_cpp`, built with `cmake`). This is the whole stack: the game logic (move generation, validation, FEN/UCI parsing), an AlphaZero-style neural engine (PUCT MCTS, self-play, training), and a terminal board renderer for debugging.
 
-The game logic lives in **PyVariant** (`engine/chessckers_engine/variant_py/`), a pure-Python reimplementation of the Chessckers rules. The Rust extension accelerates the hot path (Black move generation + check detection) and is kept byte-for-byte equivalent to PyVariant.
+The game logic lives in **PyVariant** (`engine/chessckers_engine/variant_py/`), a pure-Python reimplementation of the Chessckers rules — the authoritative reference and the parity oracle for the C++ engine. PyVariant is the sole Python move-gen path (it has no native accelerator; the C++ extension owns the production hot path).
 
-> History: the game logic used to live in three forks — `scalachess` (Scala 3 engine), `server` (HTTP API), and `chessground` (browser board UI). All three were removed once PyVariant + Rust became the authority and terminal rendering replaced the browser UI. A 2GB backup of the forks exists at `~/chessckers-backups/forks-20260528.tar.gz`. The `git mv`'d formal spec (`chessckers.md`) and the engine are all that remain.
+> History: the game logic used to live in three Scala/JS forks (`scalachess`, `server`, `chessground`) — all removed once PyVariant became the authority. A Rust move-gen accelerator (`chessckers_movegen`) then served as PyVariant's hot path and one of the C++ port's parity oracles; it was **retired** once the C++ engine became the sole production engine (lc0-split migration), leaving PyVariant as the single oracle. A 2GB backup of the forks exists at `~/chessckers-backups/forks-20260528.tar.gz`. The `git mv`'d formal spec (`chessckers.md`) and the engine are all that remain.
 
 ## Build & Run
 
-Everything runs from `engine/`. Dependencies are managed with `uv`; the Rust extension with `maturin`.
+Everything runs from `engine/`. Dependencies are managed with `uv`; the C++ extension with `cmake`.
 
 ```
 cd engine
 uv sync                  # install Python deps into .venv
 ```
 
-### Rust extension
+### C++ engine (lc0-style)
 
-The move-gen accelerator is a PyO3 crate at `engine/rust/chessckers_movegen/`. After editing `src/lib.rs`, rebuild and reinstall into the venv:
-
-```
-cd engine/rust/chessckers_movegen
-VIRTUAL_ENV=../../.venv ../../.venv/bin/maturin develop --release
-```
-
-Use `--release` for anything performance-sensitive (self-play, the full test suite); the debug build is several× slower. Set `CHESSCKERS_NO_RUST=1` to bypass the extension and run the pure-Python move-gen (used by the spec tests, which also monkeypatch `_rs_movegen = None`).
-
-### C++ engine (lc0-style port, in progress)
-
-A native C++ self-play/search/inference engine is being ported under `engine/cpp/` (pybind11 module `chessckers_cpp`), following lc0 as the reference architecture; **training stays in Python**. The C++ rules are a third implementation (alongside PyVariant + the Rust crate), translated from the validated Rust and held byte-equivalent via the existing parity tests (PyVariant `CHESSCKERS_NO_RUST` is the move-gen oracle; the Rust crate is the cross-check). After editing anything under `cpp/src/`, rebuild + reinstall into the venv:
+The production engine is a native C++ self-play/search/inference build under `engine/cpp/` (pybind11 module `chessckers_cpp` + standalone `cc_selfplay` client), following lc0 as the reference architecture; **training stays in Python**. The C++ rules are held byte-equivalent to PyVariant (the sole oracle) via the parity tests in `tests/test_cpp_*.py`. After editing anything under `cpp/src/`, rebuild + reinstall into the venv:
 
 ```
 cd engine
 cpp/build.sh            # cmake + clang++ -> installs chessckers_cpp.*.so into .venv
 ```
 
-The slice roadmap (0 = board+FEN round-trip, done) lives in the `project-cpp-port` memory. The C++ module mirrors the Rust crate's bb-decomposed call surface so the same parity tests serve as its oracle.
+The slice roadmap lives in the `project-cpp-port` memory. The C++ module's bb-decomposed call surface is what the PyVariant parity tests exercise as its oracle.
 
 ### Tests
 
@@ -70,7 +59,7 @@ A position is a `State` (`variant_py/state.py`): a python-chess `Board` (bitboar
 
 Key invariant: for every Black square, `stacks[sq]`'s top piece matches the bitboard top piece (King = `Black-King`, Stone = `Black-Pawn`). Bitboards are truth for the top piece; the overlay is truth for everything below.
 
-**Rust acceleration:** `engine/rust/chessckers_movegen/src/lib.rs` mirrors the Black generators and the check predicate (`black_can_capture_white_king`, a bool early-exit) for speed. It MUST stay equivalent to the Python — when you change a Black move-gen rule, change both, rebuild with `maturin develop`, and verify equivalence (run the suite with Rust on, and the spec tests with it bypassed).
+**Native acceleration:** the production hot path (Black move-gen + check predicate `black_can_capture_white_king`, plus White gen, apply, status, search, NN inference) lives in the C++ extension `engine/cpp/` and MUST stay equivalent to PyVariant — when you change a move-gen rule, change both PyVariant and the C++ source, rebuild with `cpp/build.sh`, and verify the `tests/test_cpp_*.py` parity tests stay green.
 
 **One Move per chain:** a full diagonal capture chain is computed inside the generator and emitted as a single move with the complete bitboard + overlay delta applied; `waypoints`/`chainHops` carry the path for disambiguation/display.
 
@@ -90,7 +79,7 @@ Key invariant: for every Black square, `stacks[sq]`'s top piece matches the bitb
 
 Chessckers FEN appends a bracketed stack overlay after the standard board field: `[a6:s,a7:k,a8:Sks,...]`. Each entry is `square:pieces` where pieces are bottom-to-top: `s`=Stone(unmoved), `S`=Stone(moved), `k`=King.
 
-An optional trailing `{wm:N,r8:N}` block after the six standard fields carries Chessckers turn/win state: `wm` = White sub-moves left this turn (2 only at the opening double-move; default 1) and `r8` = the rank-8 win counter (0–2; default 0). It is omitted when both are at their defaults (so ordinary FENs are unchanged); `STARTING_FEN` carries `{wm:2}`. Parsed/serialized in `variant_py/state.py`, the Rust `parse_r8`, and the C++ `parse_fen`; encoded as position-tensor channel 14 (`r8/3`).
+An optional trailing `{wm:N,r8:N}` block after the six standard fields carries Chessckers turn/win state: `wm` = White sub-moves left this turn (2 only at the opening double-move; default 1) and `r8` = the rank-8 win counter (0–2; default 0). It is omitted when both are at their defaults (so ordinary FENs are unchanged); `STARTING_FEN` carries `{wm:2}`. Parsed/serialized in `variant_py/state.py` and the C++ `parse_fen`; encoded as position-tensor channel 14 (`r8/3`).
 
 ## Game Rules Reference
 
@@ -106,4 +95,4 @@ The formal spec is in `chessckers.md` (monorepo root). Key points (v3 terms):
 ## Code Style
 
 - **Python**: type hints throughout, dict shapes preserved at the `PyVariantClient` boundary (these mirror what the old Scala server returned). Keep changes surgical.
-- **Rust**: `rustfmt`; the crate mirrors PyVariant and must stay equivalent — any rule change goes in both, with the equivalence verified before committing.
+- **C++** (`cpp/src/`): mirrors PyVariant and must stay equivalent — any rule change goes in both, with the `tests/test_cpp_*.py` parity verified before committing.

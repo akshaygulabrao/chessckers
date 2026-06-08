@@ -10,10 +10,6 @@ Runs the pure-Python path (the Rust mirror still has the pre-§3B rule).
 """
 from __future__ import annotations
 
-import pytest
-
-import chessckers_engine.variant_py.client as _cl
-import chessckers_engine.variant_py.moves_black as _mb
 import chessckers_engine.variant_py.moves_white as _mw
 from chessckers_engine.variant_py import PyVariantClient
 from chessckers_engine.variant_py.state import parse_fen
@@ -22,12 +18,6 @@ from chessckers_engine.variant_py.state import parse_fen
 # ONLY via a chain: f4->d2 (capture e3), turn, d2->f0 (capture King e1). No
 # single diagonal from f4 reaches e1.
 CHAIN_CHECK_FEN = "8/8/8/8/5p2/4P3/8/4K3[f4:ss] w - - 0 1"
-
-
-@pytest.fixture(autouse=True)
-def _bypass_rust(monkeypatch):
-    monkeypatch.setattr(_mb, "_rs_movegen", None)
-    monkeypatch.setattr(_cl, "_rs_movegen", None)
 
 
 def test_chain_threat_is_detected_as_check():

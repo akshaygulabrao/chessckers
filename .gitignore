@@ -3,11 +3,6 @@
 
 .DS_Store
 
-# Rust build artifacts
-engine/rust/*/target/
-engine/rust/*/.venv/
-engine/rust/*/uv.lock
-
 # Training run artifacts (data, not code)
 engine/runs/
 engine/engine/

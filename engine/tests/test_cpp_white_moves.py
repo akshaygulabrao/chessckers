@@ -1,10 +1,10 @@
-"""Slice 3b oracle test: C++ white_legal_moves vs the live Rust extension
-(exact-ordered) and the pure-Python reference (set), over self-play rollouts +
-hand-crafted edge positions (castling both forms, promotions, en passant, check).
+"""Slice 3b oracle test: C++ white_legal_moves vs the pure-Python reference
+(set), over self-play rollouts + hand-crafted edge positions (castling both
+forms, promotions, en passant, check).
 
 White is FIDE pseudo-legal filtered by the CHESSCKERS check predicate, so
-python-chess's own legality is NOT the oracle; the Rust extension is. Castling
-emits both the e1g1 and the king-to-rook e1h1 form, which the port reproduces.
+python-chess's own legality is NOT the oracle; PyVariant is. Castling emits both
+the e1g1 and the king-to-rook e1h1 form, which the port reproduces.
 """
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from chessckers_engine.variant_py.client import PyVariantClient
 from chessckers_engine.variant_py.state import STARTING_FEN, parse_fen
 
 cpp = pytest.importorskip("chessckers_cpp")
-rs = pytest.importorskip("chessckers_movegen")
 
 ROLLOUT_SEEDS = [
     STARTING_FEN,                                                       # full White army
@@ -69,32 +68,19 @@ def _collect(n_games=10, max_plies=40, seed=777):
 ALL_FENS = _collect() + EDGE_FENS
 
 
-def test_white_legal_moves_ordered_vs_rust():
+def test_white_legal_moves_setdiff_vs_python():
     assert len(ALL_FENS) > 100
     for fen in ALL_FENS:
+        state = parse_fen(fen)
+        if state.board.turn != chess.WHITE:
+            continue
         args = _wb(fen)
-        cpp_list = [_canon(m) for m in cpp.white_legal_moves(*args)]
-        rs_list = [_canon(m) for m in rs.white_legal_moves(*args)]
-        assert cpp_list == rs_list, f"\n fen={fen}\n cpp={cpp_list}\n  rs={rs_list}"
-
-
-def test_white_legal_moves_setdiff_vs_python():
-    saved = mw._rs_movegen
-    mw._rs_movegen = None
-    try:
-        for fen in ALL_FENS:
-            state = parse_fen(fen)
-            if state.board.turn != chess.WHITE:
-                continue
-            args = _wb(fen)
-            py_set = {_canon(m) for m in mw.white_legal_moves(state)}
-            cpp_set = {_canon(m) for m in cpp.white_legal_moves(*args)}
-            assert cpp_set == py_set, (
-                f"\n fen={fen}\n only in cpp: {sorted(cpp_set - py_set)}"
-                f"\n only in py:  {sorted(py_set - cpp_set)}"
-            )
-    finally:
-        mw._rs_movegen = saved
+        py_set = {_canon(m) for m in mw.white_legal_moves(state)}
+        cpp_set = {_canon(m) for m in cpp.white_legal_moves(*args)}
+        assert cpp_set == py_set, (
+            f"\n fen={fen}\n only in cpp: {sorted(cpp_set - py_set)}"
+            f"\n only in py:  {sorted(py_set - cpp_set)}"
+        )
 
 
 @pytest.mark.parametrize("fen,expect", [

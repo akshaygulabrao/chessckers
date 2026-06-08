@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build the C++ engine extension and install it into the venv (the C++ analog of
-# `maturin develop` for the Rust crate). Run after editing anything under cpp/src/.
+# Build the C++ engine extension and install it into the venv. Run after editing
+# anything under cpp/src/.
 #
 #   cpp/build.sh
 set -euo pipefail

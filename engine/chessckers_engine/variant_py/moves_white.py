@@ -55,20 +55,6 @@ def white_legal_moves(state: State) -> list[dict[str, Any]]:
     check predicate (defined below)."""
     if state.board.turn != chess.WHITE:
         return []
-    if _rs_movegen is not None:
-        # Native fast path: one Rust call generates + check-filters all White
-        # moves on its own bitboards, eliminating the per-pseudo-move
-        # python-chess apply/copy churn that dominated self-play (see the
-        # equivalence harness tests/test_white_rust_equiv.py for parity).
-        b = state.board
-        return _rs_movegen.white_legal_moves(
-            b.occupied,
-            b.occupied_co[chess.WHITE],
-            b.pawns, b.knights, b.bishops, b.rooks, b.queens, b.kings,
-            b.castling_rights,
-            -1 if b.ep_square is None else b.ep_square,
-            state.stacks,
-        )
     out: list[dict[str, Any]] = []
     for move in state.board.pseudo_legal_moves:
         # Apply tentatively and reject if it leaves white-king in
@@ -106,11 +92,6 @@ _FORWARD_DIAGS_BLACK = [(-1, -1), (1, -1)]
 _ALL_DIAGS = [(-1, -1), (1, -1), (-1, 1), (1, 1)]
 _ORTHO_DIRS = [(0, 1), (0, -1), (1, 0), (-1, 0)]
 
-try:
-    import chessckers_movegen as _rs_movegen  # type: ignore[import-not-found]
-except ImportError:
-    _rs_movegen = None
-
 
 def _on_board(f: int, r: int) -> bool:
     return 0 <= f <= 7 and 0 <= r <= 7
@@ -132,13 +113,6 @@ def _square_owner(board: chess.Board, sq: int) -> int:
 
 
 def _square_attacked_by_black_chessckers(state: State, target_sq: int) -> bool:
-    if _rs_movegen is not None:
-        return _rs_movegen.square_attacked_by_black_chessckers(
-            state.board.occupied,
-            state.board.occupied_co[chess.WHITE],
-            state.stacks,
-            target_sq,
-        )
     return _square_attacked_by_black_chessckers_py(state, target_sq)
 
 
@@ -246,26 +220,13 @@ def _is_white_in_chessckers_check(state: State) -> bool:
     else:
         probe = state.copy()
         probe.board.turn = chess.BLACK
-    # Hot path: a native bool early-exit that runs the same chain search but
-    # stops at the first king-capturing hop and builds no move dicts. This is
-    # called once per White candidate move in white_legal_moves, so avoiding the
-    # full black_diagonal_capture_moves list (and its PyO3 marshalling) is the
-    # difference between ~92µs and a few µs per call. Falls back to scanning the
-    # generated list when the native extension is bypassed (gated on the same
-    # _mb._rs_movegen the tests monkeypatch).
-    if _mb._rs_movegen is not None:
-        if _mb._rs_movegen.black_can_capture_white_king(
-            probe.board.occupied,
-            probe.board.occupied_co[chess.WHITE],
-            king_sq,
-            probe.stacks,
-        ):
+    # Scan the diagonal capture generator for a hop that captures the king in
+    # transit (a ram landing on the king does NOT capture it, so path captures
+    # are the right test).
+    king_name = _SQ_NAME[king_sq]
+    for m in _mb.black_diagonal_capture_moves(probe):
+        if king_name in (m.get("_chain_all_captures") or ()):
             return True
-    else:
-        king_name = _SQ_NAME[king_sq]
-        for m in _mb.black_diagonal_capture_moves(probe):
-            if king_name in (m.get("_chain_all_captures") or ()):
-                return True
     # Single diagonals + orthogonal charges (charges don't chain).
     return _square_attacked_by_black_chessckers(state, king_sq)
 

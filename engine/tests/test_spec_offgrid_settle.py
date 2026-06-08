@@ -10,24 +10,12 @@ so we bypass it here) and pin the intended behavior + notation:
 """
 from __future__ import annotations
 
-import pytest
-
-import chessckers_engine.variant_py.client as _cl
-import chessckers_engine.variant_py.moves_black as _mb
 from chessckers_engine.variant_py import PyVariantClient
 
 # g3 example: King tucked on a1, so the Rook on h2 is the only target.
 G3_FEN = "8/8/8/8/8/6k1/7R/K7[g3:sk] b - - 0 1"
 # f5 example: cadence-3 capture of the Rook (h3, d=2), chain on to the Knight (h1).
 F5_FEN = "8/8/8/5k2/8/7R/8/4K2N[f5:sk] b - - 0 1"
-
-
-@pytest.fixture(autouse=True)
-def _bypass_rust(monkeypatch):
-    """Force the pure-Python capture move-gen (the native extension still has
-    the pre-§3B behavior; it will be re-ported in a later phase)."""
-    monkeypatch.setattr(_mb, "_rs_movegen", None)
-    monkeypatch.setattr(_cl, "_rs_movegen", None)
 
 
 def _ucis(fen: str) -> set[str]:

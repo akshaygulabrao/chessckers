@@ -31,6 +31,5 @@ markers = [
 
 [dependency-groups]
 dev = [
-    "maturin>=1.13.1",
     "pybind11>=3",
 ]
