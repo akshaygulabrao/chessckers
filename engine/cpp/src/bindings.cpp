@@ -15,6 +15,7 @@
 #include "board.hpp"
 #include "chunk.hpp"
 #include "encode.hpp"
+#include "fleet_http.hpp"
 #include "movegen.hpp"
 #include "movegen_white.hpp"
 #include "native_move.hpp"
@@ -1026,4 +1027,45 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         "Phase 3A: play one native game (seed) and encode it to a ccz1 training chunk (gzipped "
         "JSON bytes) — the self-play client primitive. Decodable by training_chunk.decode_chunk; "
         "tensor-identical to az_game_to_examples(play_game_native(seed)).");
+
+    // Phase 3B-2a: the self-play client's HTTP surface (cpp-httplib). The native
+    // socket I/O runs with the GIL released. Each returns (status, bytes).
+    m.def(
+        "fleet_get_network",
+        [](const std::string& base_url, const std::string& sha) {
+            std::pair<int, std::string> r;
+            {
+                py::gil_scoped_release release;
+                r = cc::fleet_get_network(base_url, sha);
+            }
+            return py::make_tuple(r.first, py::bytes(r.second));
+        },
+        py::arg("base_url"), py::arg("sha"),
+        "GET /get_network?sha= — content-addressed net fetch. Returns (status, bytes).");
+    m.def(
+        "fleet_upload_game",
+        [](const std::string& base_url, const std::string& filename, const py::bytes& chunk,
+           const py::bytes& meta) {
+            std::string c = chunk, mt = meta;
+            std::pair<int, std::string> r;
+            {
+                py::gil_scoped_release release;
+                r = cc::fleet_upload_game(base_url, filename, c, mt);
+            }
+            return py::make_tuple(r.first, py::bytes(r.second));
+        },
+        py::arg("base_url"), py::arg("filename"), py::arg("chunk"), py::arg("meta") = py::bytes(),
+        "POST /upload_game (multipart) — land a ccz chunk in the server buffer/. Returns (status, body).");
+    m.def(
+        "fleet_next_game",
+        [](const std::string& base_url) {
+            std::pair<int, std::string> r;
+            {
+                py::gil_scoped_release release;
+                r = cc::fleet_next_game(base_url);
+            }
+            return py::make_tuple(r.first, py::bytes(r.second));
+        },
+        py::arg("base_url"),
+        "POST /next_game — claim a job. Returns (status, raw job JSON bytes).");
 }
