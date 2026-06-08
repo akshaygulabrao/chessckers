@@ -510,6 +510,10 @@ class _Handler(BaseHTTPRequestHandler):
             "type": "match", "match_id": m["match_id"],
             "sha": _file_sha(cand) or "", "candidate_sha": _file_sha(cand) or "",
             "opponent": opp, "opponent_sha": _file_sha(opp_path) or "",
+            # .bin twins (Phase 4): the C++ gate client fetches both nets by these
+            # (additive — Python clients use candidate_sha/opponent_sha; "" if absent).
+            "candidate_bin_sha": _file_sha(cand.with_suffix(".bin")) or "",
+            "opponent_bin_sha": _file_sha(opp_path.with_suffix(".bin")) or "",
             "seed": seed, "cand_white": cand_white,
             "arch": m["arch"], "params": m["params"],
         }

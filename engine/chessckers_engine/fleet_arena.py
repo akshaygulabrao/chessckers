@@ -242,6 +242,18 @@ def _load_model(path: Path, arch: dict, device):
     return m
 
 
+def _export_bin(path: Path, arch: dict, bin_path: Path) -> None:
+    """Export a checkpoint's weights to a flat native .bin (what the C++ client loads
+    via /get_network). Atomic; arch-driven so V1 and the V2 transformer/gather net
+    both serialize."""
+    m = build_model(**arch)
+    load_checkpoint(m, str(path))
+    m.eval()
+    tmp = str(bin_path) + ".tmp"
+    _export_state_dict(m.state_dict(), tmp)
+    os.replace(tmp, bin_path)
+
+
 def _make_net(path: Path, arch: dict, bin_path: Path, device):
     """Load a checkpoint into a gate-playable net. Native: export the state_dict
     to a flat .bin and return a cc::ChesskersNet (CPU C++ search; supports both V1
@@ -249,13 +261,20 @@ def _make_net(path: Path, arch: dict, bin_path: Path, device):
     search when the native extension isn't built."""
     if not NATIVE_OK:
         return _load_model(path, arch, device)
-    m = build_model(**arch)
-    load_checkpoint(m, str(path))
-    m.eval()
-    tmp = str(bin_path) + ".tmp"
-    _export_state_dict(m.state_dict(), tmp)
-    os.replace(tmp, bin_path)
+    _export_bin(path, arch, bin_path)
     return _cpp.ChesskersNet(str(bin_path))
+
+
+def _publish_gate_bin(pt_path: Path, arch: dict) -> None:
+    """Phase 4 (lc0-split): write the C++-client .bin twin beside a SERVED gate net
+    (.pt), so the native client can fetch the candidate / opponent nets by sha (GET
+    /get_network) and play the gate game. Additive + best-effort: a failure never
+    blocks the gate — the .pt path (Python match runner) is unaffected."""
+    try:
+        _export_bin(pt_path, arch, pt_path.with_suffix(".bin"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("gate .bin export failed for %s (%s) — C++ client can't fetch it",
+                    pt_path.name, e)
 
 
 def _atomic_copy(src: Path, dst: Path) -> None:
@@ -462,8 +481,10 @@ def main() -> int:
                 shutil.rmtree(d, ignore_errors=True)
             d.mkdir(parents=True, exist_ok=True)
         _atomic_copy(cand_path, cand_served)
+        _publish_gate_bin(cand_served, arch)  # C++-client candidate net (fetch by sha)
         for oppid, src in panel:
             _atomic_copy(src, served_dir / f"{oppid}.pt")
+            _publish_gate_bin(served_dir / f"{oppid}.pt", arch)  # C++-client opponent net
         _write_json(match_path, {
             "match_id": match_id,
             "seeds": seeds,
@@ -525,6 +546,7 @@ def main() -> int:
             promotions += 1
             ts = int(time.time())
             _atomic_copy(cand_path, best_path)             # server versions on best.pt -> clients pull
+            _publish_gate_bin(best_path, arch)             # C++-client champion net (fetch by sha)
             _atomic_copy(cand_path, nets_dir / f"net-{ts}.pt")
             best_elo += _elo_delta(res["score"])
             rec["best_elo"] = round(best_elo, 1)
