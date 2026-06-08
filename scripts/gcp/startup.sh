@@ -13,9 +13,12 @@ exec > >(tee -a /var/log/chessckers-startup.log) 2>&1
 echo "=== chessckers-sp startup $(date -u) ==="
 
 # Base tools FIRST (curl/python3 are used immediately below; not guaranteed on a bare image).
+# python3-dev is REQUIRED: uv builds the venv on the system python3, and cpp/build.sh's
+# `find_package(Python COMPONENTS Development.Module)` needs Python.h (absent without it) — the
+# native build fails at cmake-configure otherwise (verified on a fresh debian-12 box, 2026-06-07).
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y curl ca-certificates python3 git build-essential cmake pkg-config libopenblas-dev
+apt-get install -y curl ca-certificates python3 python3-dev git build-essential cmake pkg-config libopenblas-dev
 
 md(){ curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/$1"; }
 TRAINER_IP="$(md instance/attributes/trainer-ip)"
