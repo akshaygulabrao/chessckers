@@ -14,6 +14,7 @@
 #include "apply.hpp"
 #include "board.hpp"
 #include "chunk.hpp"
+#include "client.hpp"
 #include "encode.hpp"
 #include "fleet_http.hpp"
 #include "movegen.hpp"
@@ -1068,4 +1069,48 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         },
         py::arg("base_url"),
         "POST /next_game — claim a job. Returns (status, raw job JSON bytes).");
+
+    // Phase 3B-2b: job-JSON parse (unit-testable vs json.loads) + the full client loop.
+    m.def(
+        "parse_job",
+        [](const std::string& body) {
+            cc::Job j = cc::parse_job(body);
+            py::dict params;
+            params["n_sims"] = j.params.n_sims;
+            params["c_puct"] = j.params.c_puct;
+            params["temperature"] = j.params.temperature;
+            params["temp_cutoff_plies"] = j.params.temp_cutoff_plies;
+            params["max_plies"] = j.params.max_plies;
+            params["dirichlet_alpha"] = j.params.dirichlet_alpha;
+            params["dirichlet_eps"] = j.params.dirichlet_eps;
+            params["resign_threshold"] = j.params.resign_threshold;
+            params["resign_no_resign_frac"] = j.params.resign_no_resign_frac;
+            params["resign_consecutive"] = j.params.resign_consecutive;
+            params["resign_min_ply"] = j.params.resign_min_ply;
+            py::dict d;
+            d["type"] = j.type;
+            d["sha"] = j.sha;
+            d["bin_sha"] = j.bin_sha;
+            d["params"] = params;
+            return d;
+        },
+        py::arg("body"), "Parse a next_game job JSON into {type, sha, bin_sha, params}.");
+    m.def(
+        "run_selfplay_client",
+        [](const std::string& base_url, const std::string& start_fen, int num_games, int worker_id,
+           const std::string& machine, uint64_t base_seed, const std::string& net_cache_dir,
+           long seq_start) {
+            int n;
+            {
+                py::gil_scoped_release release;
+                n = cc::run_selfplay_client(base_url, start_fen, num_games, worker_id, machine,
+                                            base_seed, net_cache_dir, seq_start);
+            }
+            return n;
+        },
+        py::arg("base_url"), py::arg("start_fen"), py::arg("num_games"), py::arg("worker_id") = 400,
+        py::arg("machine") = "cpp-client", py::arg("base_seed") = 0, py::arg("net_cache_dir") = ".",
+        py::arg("seq_start") = 1,
+        "Run the standalone self-play client loop (next_game -> get_network -> play -> upload) "
+        "against base_url. Train jobs only (match = Phase 4). Returns games uploaded.");
 }

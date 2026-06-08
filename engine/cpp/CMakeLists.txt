@@ -19,3 +19,11 @@ target_compile_options(chessckers_cpp PRIVATE -O3 -Wall -Wextra)
 # ACCELERATE_NEW_LAPACK uses the current (non-deprecated) cblas headers.
 target_compile_definitions(chessckers_cpp PRIVATE ACCELERATE_NEW_LAPACK)
 target_link_libraries(chessckers_cpp PRIVATE "-framework Accelerate" Threads::Threads ZLIB::ZLIB)
+
+# Phase 3B-2b: standalone self-play client executable — NO Python (lc0-shaped, a
+# volunteer box runs just this binary). Shares the header-only core TUs.
+add_executable(cc_selfplay src/client_main.cpp)
+target_include_directories(cc_selfplay PRIVATE src third_party)
+target_compile_options(cc_selfplay PRIVATE -O3 -Wall -Wextra)
+target_compile_definitions(cc_selfplay PRIVATE ACCELERATE_NEW_LAPACK)
+target_link_libraries(cc_selfplay PRIVATE "-framework Accelerate" Threads::Threads ZLIB::ZLIB)
