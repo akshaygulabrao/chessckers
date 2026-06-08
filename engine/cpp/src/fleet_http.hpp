@@ -70,4 +70,16 @@ inline std::pair<int, std::string> fleet_next_game(const std::string& base_url) 
     return {res->status, res->body};
 }
 
+// POST /match_result — report one client-played GATE outcome (Phase 4b). `json_body`
+// is the result JSON ({match_id, seed, opp, cand_white, outcome}); the server tallies
+// it into match_results/ for the arena (200/"ok", or "stale" for a closed gate).
+inline std::pair<int, std::string> fleet_post_match_result(const std::string& base_url,
+                                                           const std::string& json_body) {
+    httplib::Client cli(base_url.c_str());
+    cli.set_keep_alive(false);
+    auto res = cli.Post("/match_result", json_body, "application/json");
+    if (!res) return {0, std::string()};
+    return {res->status, res->body};
+}
+
 }  // namespace cc

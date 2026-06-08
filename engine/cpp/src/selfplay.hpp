@@ -248,6 +248,66 @@ inline PureGame play_game_pure(Board board, const ChesskersNet& net, int n_sims,
     return game;
 }
 
+// One keep-best GATE game between two nets. white_net plays the White plies,
+// black_net the Black plies.
+struct MatchGame {
+    std::string outcome;             // "white" / "black" / "draw" (winner perspective)
+    std::vector<std::string> moves;  // ucis played, in order (for parity testing)
+};
+
+// Play one gate game from `start_fen`. Pure mirror of fleet_arena._play_from driven
+// by _native_picker: per-move FRESH-tree native PUCT (NO tree reuse — the 2-net gate
+// descends two plies between a side's turns, so single-ply reuse never applies),
+// argmax-visit pick (the run_mcts_native `chosen`; NOT temperature-sampled), and a
+// per-move-incrementing Dirichlet seed (`dir_seed_base + ply`) so repeated gate games
+// of the same unit diverge (light noise — play stays strong). No py:: → GIL-free.
+inline MatchGame play_match_game(const ChesskersNet& white_net, const ChesskersNet& black_net,
+                                 const std::string& start_fen, int n_sims, double c_puct,
+                                 double dirichlet_alpha, double dirichlet_eps, int max_plies,
+                                 uint64_t dir_seed_base, double gamma) {
+    Board board = parse_fen(start_fen);
+    MatchGame g;
+    std::string final_status, final_winner;
+    int ply = 0;
+    while (ply < max_plies) {
+        const auto st = detect_status(board);
+        if (!st.status.empty()) {
+            final_status = st.status;
+            final_winner = st.winner;
+            break;
+        }
+        auto legal = gen_legal_native(board);
+        if (legal.empty()) break;  // no moves, not flagged terminal — end as draw
+        const ChesskersNet& net = board.turn_white ? white_net : black_net;
+        auto root = std::make_unique<PuctNode>();  // fresh tree per move
+        root->board = board;
+        std::mt19937_64 rng(dir_seed_base + (uint64_t)ply);
+        expand_dirichlet_search_pure(root.get(), net, n_sims, c_puct, gamma, dirichlet_alpha,
+                                     dirichlet_eps, rng);
+        // argmax visit (first max in child/gen order) — the run_mcts_native `chosen`.
+        std::string chosen;
+        int best = -1;
+        for (auto& c : root->children)
+            if (c->visits > best) {
+                best = c->visits;
+                chosen = c->uci;
+            }
+        if (chosen.empty()) break;  // no children — picker None -> draw
+        int idx = -1;
+        for (int i = 0; i < (int)legal.size(); ++i)
+            if (legal[i].uci == chosen) {
+                idx = i;
+                break;
+            }
+        if (idx < 0) break;  // chosen not in legal (can't happen) -> draw, like _play_from
+        g.moves.push_back(chosen);
+        board = apply_native(board, legal[idx]);
+        ++ply;
+    }
+    g.outcome = outcome_from_pure(final_status, final_winner);
+    return g;
+}
+
 // Fan `num_games` pure games across `num_threads` worker threads. Game i is
 // seeded `base_seed + i`, so the result is independent of the thread count and
 // equals a single-threaded play_game_pure(seed=base_seed+i). The net is shared

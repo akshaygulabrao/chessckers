@@ -1029,6 +1029,30 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         "JSON bytes) — the self-play client primitive. Decodable by training_chunk.decode_chunk; "
         "tensor-identical to az_game_to_examples(play_game_native(seed)).");
 
+    m.def(
+        "play_match_game",
+        [](const cc::ChesskersNet& white_net, const cc::ChesskersNet& black_net,
+           const std::string& start_fen, int n_sims, double c_puct, double dirichlet_alpha,
+           double dirichlet_eps, int max_plies, uint64_t dir_seed_base) {
+            const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
+            const double gamma = g ? std::atof(g) : 1.0;
+            cc::MatchGame mg;
+            {
+                py::gil_scoped_release release;
+                mg = cc::play_match_game(white_net, black_net, start_fen, n_sims, c_puct,
+                                         dirichlet_alpha, dirichlet_eps, max_plies, dir_seed_base,
+                                         gamma);
+            }
+            return py::make_tuple(mg.outcome, py::cast(mg.moves));
+        },
+        py::arg("white_net"), py::arg("black_net"), py::arg("start_fen"), py::arg("n_sims") = 160,
+        py::arg("c_puct") = 1.5, py::arg("dirichlet_alpha") = 0.0, py::arg("dirichlet_eps") = 0.25,
+        py::arg("max_plies") = 200, py::arg("dir_seed_base") = 0,
+        "Phase 4b: play one keep-best GATE game (white_net vs black_net) from start_fen and "
+        "return (outcome, [ucis]). Mirrors fleet_arena._play_from driven by _native_picker: "
+        "per-move fresh-tree native PUCT, argmax-visit pick, per-move Dirichlet seed "
+        "(dir_seed_base+ply). Parity-checkable against the Python gate path.");
+
     // Phase 3B-2a: the self-play client's HTTP surface (cpp-httplib). The native
     // socket I/O runs with the GIL released. Each returns (status, bytes).
     m.def(
@@ -1092,9 +1116,25 @@ PYBIND11_MODULE(chessckers_cpp, m) {
             d["sha"] = j.sha;
             d["bin_sha"] = j.bin_sha;
             d["params"] = params;
+            if (j.type == "match") {
+                py::dict mm;
+                mm["match_id"] = j.match.match_id;
+                mm["candidate_bin_sha"] = j.match.candidate_bin_sha;
+                mm["opponent_bin_sha"] = j.match.opponent_bin_sha;
+                mm["opponent"] = j.match.opponent;
+                mm["seed"] = j.match.seed_fen;
+                mm["cand_white"] = j.match.cand_white;
+                mm["sims"] = j.match.sims;
+                mm["c_puct"] = j.match.c_puct;
+                mm["dir_alpha"] = j.match.dir_alpha;
+                mm["dir_eps"] = j.match.dir_eps;
+                mm["max_plies"] = j.match.max_plies;
+                d["match"] = mm;
+            }
             return d;
         },
-        py::arg("body"), "Parse a next_game job JSON into {type, sha, bin_sha, params}.");
+        py::arg("body"),
+        "Parse a next_game job JSON into {type, sha, bin_sha, params(, match)}.");
     m.def(
         "run_selfplay_client",
         [](const std::string& base_url, const std::string& start_fen, int num_games, int worker_id,
