@@ -26,7 +26,7 @@ from typing import Any
 
 import torch
 
-from chessckers_engine.encoding import encode_move, encode_position
+from chessckers_engine.encoding import encoders_for
 from chessckers_engine.model import ChesskersScorer
 
 LegalMove = dict[str, Any]
@@ -44,6 +44,11 @@ class InferenceServer:
         log_every: int = 0,
     ) -> None:
         self.model = model
+        # Pick encoders by the model's arch VERSION so the batched path matches
+        # the net: V2/V3 need the 16ch/10x10 position + 114-dim gather move
+        # encoding, NOT V1's 15ch/8x8 + 240-dim. Without this, batch_eval gets
+        # the wrong tensor shapes for a transformer/gather net.
+        self._enc_pos, _, self._enc_move = encoders_for(getattr(model, "VERSION", "v1"))
         self.max_batch_size = max_batch_size
         self.timeout = timeout_ms / 1000.0
         self.log_every = log_every
@@ -75,9 +80,9 @@ class InferenceServer:
         threads encode in parallel rather than serializing through the
         single inference thread. The server only stacks pre-encoded tensors
         and runs the batched forward."""
-        pos_tensor = encode_position(fen)  # (C, 8, 8)
+        pos_tensor = self._enc_pos(fen)  # (15,8,8) v1 / (16,10,10) v2
         if legal_moves:
-            moves_tensor = torch.stack([encode_move(m) for m in legal_moves])
+            moves_tensor = torch.stack([self._enc_move(m) for m in legal_moves])
         else:
             moves_tensor = None
         future: Future = Future()

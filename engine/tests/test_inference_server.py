@@ -8,9 +8,9 @@ import time
 
 import torch
 
-from chessckers_engine.encoding import encode_move, encode_position
+from chessckers_engine.encoding import encode_move, encode_position, encoders_for
 from chessckers_engine.inference_server import InferenceServer
-from chessckers_engine.model import ChesskersScorer
+from chessckers_engine.model import ChesskersScorer, build_model
 
 FEN_W = "8/8/8/8/8/8/8/4K3 w - - 0 1"
 FEN_START = (
@@ -51,6 +51,39 @@ def test_server_matches_direct_single_request():
     assert abs(v - expected_v) < 1e-5
     assert len(priors) == len(expected_priors)
     for p, ep in zip(priors, expected_priors):
+        assert abs(p - ep) < 1e-5
+
+
+def _direct_batch_eval(model, version, fen, legal_moves):
+    """Reference using the SAME method (batch_eval) the server uses, at batch 1.
+    Version-aware: encodes with the model's own encoders."""
+    enc_pos, _, enc_move = encoders_for(version)
+    pos = enc_pos(fen).unsqueeze(0)
+    mv = torch.stack([enc_move(m) for m in legal_moves]) if legal_moves else None
+    with torch.no_grad():
+        values, priors_list = model.batch_eval(pos, [mv])
+    pr = priors_list[0].tolist() if priors_list[0].numel() > 0 else []
+    return float(values[0].item()), pr
+
+
+def test_server_matches_direct_v2_net():
+    """The InferenceServer must encode for the MODEL's arch VERSION. A V2/V3
+    (gather-head) net needs the 16ch/10x10 position + 114-dim move encoding; the
+    pre-fix server hardcoded V1's 15ch/8x8 + 240-dim and shape-mismatched a
+    transformer net. Server output must match the direct V2 batch_eval."""
+    torch.manual_seed(0)
+    model = build_model(
+        version="v2", d_hidden=32, c_filters=16, n_blocks=1,
+        n_tf_blocks=1, n_heads=4, tf_ff_mult=2,
+    ).eval()
+    assert getattr(model, "VERSION", None) == "v2"
+    moves = [_move("e1e2", "e1", "e2"), _move("e1f2", "e1", "f2")]
+    exp_v, exp_p = _direct_batch_eval(model, "v2", FEN_W, moves)
+    with InferenceServer(model, max_batch_size=4) as srv:
+        v, priors = srv.submit(FEN_W, moves).result(timeout=10)
+    assert abs(v - exp_v) < 1e-5
+    assert len(priors) == len(exp_p)
+    for p, ep in zip(priors, exp_p):
         assert abs(p - ep) < 1e-5
 
 
