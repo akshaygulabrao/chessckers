@@ -449,31 +449,38 @@ def _pull_weights_if_new(server: str, weights: Path, last_version: str, timeout:
     return version
 
 
-def _pull_net_by_sha(server: str, weights: Path, want_sha: str | None, have_sha: str,
-                     timeout: float) -> str:
-    """Content-addressed net sync (lc0 get_network): fetch the net whose sha256 is
-    `want_sha` only when it differs from what we last wrote, and materialize it at
-    weights.pt (atomic; bumps mtime -> the local workers hot-reload). `want_sha` comes
-    from the X-Network-Sha header on /control, so an unchanged net costs nothing. Unlike
-    the opaque /version, the client gets back EXACTLY the bytes it asked for (or a 404 if
-    the net rotated mid-fetch -> retry next tick). Returns the sha now on disk (unchanged
-    on empty want / no-op / fetch failure)."""
+def _pull_sha_to(server: str, dest: Path, want_sha: str | None, have_sha: str,
+                 timeout: float, label: str) -> str:
+    """Content-addressed file sync (lc0 get_network): fetch the net whose sha256 is
+    `want_sha` only when it differs from what we last wrote, and materialize it at `dest`
+    (atomic; bumps mtime -> the engine hot-reloads). `want_sha` comes from a /control
+    header, so an unchanged net costs nothing. Unlike the opaque /version, the client gets
+    back EXACTLY the bytes it asked for (or a 404 if the net rotated mid-fetch -> retry
+    next tick). Returns the sha now on disk (unchanged on empty want / no-op / fetch
+    failure). Drives BOTH the .pt (Python workers) and the .bin twin (cc_selfplay)."""
     if not want_sha or want_sha == have_sha:
         return have_sha
     try:
         data = _get(f"{server}/get_network?sha={want_sha}", timeout)
     except (urllib.error.URLError, OSError) as e:
-        log.warning("net fetch (sha %s) failed: %r", want_sha[:12], e)
+        log.warning("%s fetch (sha %s) failed: %r", label, want_sha[:12], e)
         return have_sha  # 404 (rotated) or server blip — retry next tick on the new sha
-    tmp = weights.with_suffix(".pt.tmp")
+    tmp = dest.with_name(dest.name + ".tmp")
     try:
         tmp.write_bytes(data)
-        os.replace(tmp, weights)  # atomic; bumps mtime -> local workers hot-reload
+        os.replace(tmp, dest)  # atomic; bumps mtime -> engine hot-reloads
     except OSError as e:
-        log.warning("weights write failed: %s", e)
+        log.warning("%s write failed: %s", label, e)
         return have_sha
-    log.info("pulled net sha %s -> %s (%d KB)", want_sha[:12], weights, len(data) // 1024)
+    log.info("pulled %s sha %s -> %s (%d KB)", label, want_sha[:12], dest, len(data) // 1024)
     return want_sha
+
+
+def _pull_net_by_sha(server: str, weights: Path, want_sha: str | None, have_sha: str,
+                     timeout: float) -> str:
+    """The .pt net sync (Python workers hot-reload weights.pt) — thin wrapper over
+    _pull_sha_to off the X-Network-Sha header."""
+    return _pull_sha_to(server, weights, want_sha, have_sha, timeout, "net")
 
 
 def _upload_games(server: str, buffer: Path, min_age: float, timeout: float) -> int:
@@ -513,15 +520,17 @@ def _upload_games(server: str, buffer: Path, min_age: float, timeout: float) -> 
     return uploaded
 
 
-def _fetch_net(server: str, sha: str, cache_dir: Path, timeout: float) -> Path | None:
-    """Fetch a gate net by content address (lc0 get_network) into cache_dir/<sha>.pt,
+def _fetch_net(server: str, sha: str, cache_dir: Path, timeout: float,
+               suffix: str = ".pt") -> Path | None:
+    """Fetch a gate net by content address (lc0 get_network) into cache_dir/<sha><suffix>,
     skipping the download when it's already there (sha-named -> content-addressed, so a
     champion reused across gates isn't re-pulled). Routed through the interface-bound opener
-    so leena's en0 pin is honored. None on empty sha / fetch / write failure -> retry next
-    tick (e.g. the net rotated mid-gate -> 404)."""
+    so leena's en0 pin is honored. `suffix` selects the twin: .pt for the Python MatchRunner,
+    .bin for the cc_selfplay engine (same bytes either way — the server serves by sha). None
+    on empty sha / fetch / write failure -> retry next tick (e.g. the net rotated mid-gate -> 404)."""
     if not sha:
         return None
-    dest = cache_dir / f"{sha}.pt"
+    dest = cache_dir / f"{sha}{suffix}"
     if dest.exists():
         return dest
     try:
@@ -530,7 +539,7 @@ def _fetch_net(server: str, sha: str, cache_dir: Path, timeout: float) -> Path |
         log.warning("gate net fetch (sha %s) failed: %r", sha[:12], e)
         return None
     cache_dir.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".pt.tmp")
+    tmp = dest.with_name(dest.name + ".tmp")
     try:
         tmp.write_bytes(data)
         os.replace(tmp, dest)
@@ -595,6 +604,15 @@ def _mint_jobs(server: str, jobs_dir: Path, gate_dir: Path, depth: int, start_se
                 break  # net not ready/reachable — retry next tick
             job["cand_path"] = str(cand)
             job["opp_path"] = str(opp)
+            # Additive: also fetch the C++-loadable .bin twins so a cc_selfplay --jobs-local
+            # engine can play this gate game (it reads cand_bin/opp_bin; the Python MatchRunner
+            # reads cand_path/opp_path). Best-effort — absent until the gate path exports .bin.
+            cand_bin = _fetch_net(server, job.get("candidate_bin_sha", ""), gate_dir, timeout, ".bin")
+            opp_bin = _fetch_net(server, job.get("opponent_bin_sha", ""), gate_dir, timeout, ".bin")
+            if cand_bin is not None:
+                job["cand_bin"] = str(cand_bin)
+            if opp_bin is not None:
+                job["opp_bin"] = str(opp_bin)
         # (a train job is queued verbatim — the worker self-plays with its synced weights.pt)
         tmp = jobs_dir / f"{seq}.json.tmp"
         try:
@@ -683,6 +701,7 @@ def main() -> int:
     hb = {"X-Client-Id": client_id, "X-Client-Version": client_version}
     run_dir = args.run_dir.resolve()
     weights = run_dir / "weights.pt"
+    weights_bin = run_dir / "weights.bin"  # C++-loadable twin for the cc_selfplay engine
     buffer = run_dir / "buffer"
     stop_path = run_dir / "STOP"
     jobs_dir = run_dir / "jobs"        # server-assigned jobs the workers claim (lc0 client-drives)
@@ -703,6 +722,7 @@ def main() -> int:
                  args.queue_depth, "on" if can_match else "off")
     last_version = ""        # legacy /version fallback tracking (servers without X-Network-Sha)
     have_sha = ""            # content sha of the net currently materialized at weights.pt
+    have_bin = ""            # content sha of the .bin twin materialized at weights.bin (cc_selfplay)
     total_up = 0
     total_gate = 0           # gate outcomes shipped to /match_result
     worker_proc = None
@@ -735,11 +755,13 @@ def main() -> int:
             #    /control's X-Network-Sha header carries the current net's content address, so
             #    step 2 syncs the net off this same request (None = control failed / legacy server).
             want_sha = None
+            want_bin = None  # X-Network-Bin-Sha: the .bin twin's content address (cc_selfplay)
             try:
                 cbody, chdrs = _get2(f"{server}/control", args.timeout, hb_tick)
                 control = cbody.decode().strip()
                 control_ok = True
                 want_sha = chdrs.get("X-Network-Sha")
+                want_bin = chdrs.get("X-Network-Bin-Sha")
             except (urllib.error.URLError, OSError) as e:
                 control = "RUN"  # server unreachable — keep self-playing on current weights
                 control_ok = False
@@ -803,6 +825,10 @@ def main() -> int:
                     have_sha = _pull_net_by_sha(server, weights, want_sha, have_sha, args.timeout)
                 else:
                     last_version = _pull_weights_if_new(server, weights, last_version, args.timeout)
+                # The .bin twin (cc_selfplay engine hot-reloads weights.bin). Additive: '' until
+                # the server publishes a .bin, and a Python-worker box simply ignores the file.
+                if want_bin:
+                    have_bin = _pull_sha_to(server, weights_bin, want_bin, have_bin, args.timeout, "bin")
             # 3. finished self-play games (train job output): upload + drop locally.
             n = _upload_games(server, buffer, args.min_age, args.timeout)
             if n:

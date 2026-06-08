@@ -348,7 +348,12 @@ class _Handler(BaseHTTPRequestHandler):
             # net's content address, so the client fetches it via /get_network without an
             # extra round-trip (lc0 content-addressed sync). '' before the first net exists.
             body = b"STOP" if (rd / "STOP").exists() else b"RUN"
-            self._send(200, body, extra={"X-Network-Sha": _file_sha(_net_path(rd)) or ""})
+            # X-Network-Bin-Sha = the C++-loadable .bin twin's content address (Phase 3B-3:
+            # the orchestrator syncs run-dir/weights.bin off this for the cc_selfplay engine,
+            # exactly as it syncs weights.pt off X-Network-Sha). '' until a .bin is published;
+            # additive, so Python clients that only read X-Network-Sha are unaffected.
+            self._send(200, body, extra={"X-Network-Sha": _file_sha(_net_path(rd)) or "",
+                                         "X-Network-Bin-Sha": _file_sha(_net_bin_path(rd)) or ""})
         elif self.path == "/client-version":
             self._send(200, self.server.code_version.encode())  # type: ignore[attr-defined]
         elif self.path == "/selfplay":
