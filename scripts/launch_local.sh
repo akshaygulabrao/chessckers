@@ -42,35 +42,33 @@ rm -f "$RUN/STOP" 2>/dev/null || true
 pkill -f 'chessckers_engine\.fleet_client .*run-local' 2>/dev/null || true
 sleep 1
 
-# Native ext is already built on the dev box; pass --native iff it imports (else fall back
-# to the slower-but-correct Python engine rather than running a stale ext).
-NATIVE=""
-if "$PY" -c "import chessckers_cpp" 2>/dev/null; then
-  NATIVE="--native"; say "native C++ engine (v1+v2) -> --native"
-else
-  say "Python engine (no --native) — ext not importable (build: cd engine && cpp/build.sh)"
+# lc0-split cutover (Phase 3B-3): the engine is the native cc_selfplay binary, not the
+# Python worker. Require it — there is no Python self-play fallback anymore.
+CC_SELFPLAY="$ENG/cpp/build/cc_selfplay"
+if [ ! -x "$CC_SELFPLAY" ]; then
+  say "cc_selfplay not built at $CC_SELFPLAY — build it: cd engine && cpp/build.sh"; exit 1
 fi
+say "native C++ engine -> cc_selfplay --jobs-local ($WORKERS procs)"
 
-# fleet_client owns the workers: pull net + live params from the server, spawn + supervise
-# selfplay_workers_only, upload finished games, contribute keep-best gate games. No
-# --update-cmd (this box is the code source). worker-id-base 0 -> games attribute to [local].
+# fleet_client owns the engine pool: pull net (weights.bin) + live params from the server,
+# spawn + supervise N cc_selfplay --jobs-local procs, upload finished games, contribute
+# keep-best gate games. No --update-cmd (this box is the code source). worker-id-base 0 ->
+# games attribute to [local]. cc_selfplay loads the .bin (self-describing) + reads sims/
+# max-plies/start-fen from the job + env, so the arch/device/sims knobs aren't passed here.
 CLIENT_ARGS=(
   -m chessckers_engine.fleet_client
   --server "$SERVER" --run-dir "$RUN" --client-id local --poll-seconds "$FLEET_POLL_S"
-  --queue-depth "$WORKERS" --spawn-workers --
-  --workers "$WORKERS" --worker-id-base 0 --seed 1000
-  --device "$FLEET_DEVICE" --d-hidden "$FLEET_DH" --c-filters "$FLEET_CF" --n-blocks "$FLEET_NB"
-  --arch-version "$FLEET_ARCH_VERSION" --tf-blocks "$FLEET_TF_BLOCKS" --tf-heads "$FLEET_TF_HEADS" --tf-ff-mult "$FLEET_TF_FF"
-  --max-plies "$FLEET_MAX_PLIES" --sims "$FLEET_SIMS_FALLBACK" --weights-poll-seconds "$FLEET_WEIGHTS_POLL_S"
+  --queue-depth "$WORKERS" --spawn-engines
+  --engine-binary "$CC_SELFPLAY"
+  --engine-workers "$WORKERS" --engine-worker-id-base 0 --engine-seed 1000
 )
-[ -n "$NATIVE" ] && CLIENT_ARGS+=("$NATIVE")
 
-# Foreground: this tab OWNS the local workers. Ctrl-C winds them down (STOP + reap) and exits.
+# Foreground: this tab OWNS the local engines. Ctrl-C winds them down (STOP + reap) and exits.
 # Loopback (127.0.0.1) is never "local network", so this isn't the macOS TCC fix leena needs
 # — here foreground is just for in-tab logs + clean teardown. Streams to the tab AND the log.
-cleanup(){ echo; say "stopping local workers…"; touch "$RUN/STOP" 2>/dev/null || true; pkill -f 'chessckers_engine\.selfplay_workers_only' 2>/dev/null || true; }
+cleanup(){ echo; say "stopping local engines…"; touch "$RUN/STOP" 2>/dev/null || true; pkill -f 'cc_selfplay .*--jobs-local' 2>/dev/null || true; }
 trap 'cleanup; exit 0' INT TERM
-say "local client -> $SERVER  ($WORKERS workers, run-dir $RUN). Ctrl-C stops everything."
-say "  worker self-play output also at: $RUN/workers.log"
+say "local client -> $SERVER  ($WORKERS engines, run-dir $RUN). Ctrl-C stops everything."
+say "  engine self-play output also at: $RUN/engine-*.log"
 "$PY" "${CLIENT_ARGS[@]}" 2>&1 | tee "$RUN/fleet_client.log"
 cleanup

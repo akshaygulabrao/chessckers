@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Leena HTTP-fleet launcher (lc0-style, client-owns-engine). Starts ONE process: the
-# fleet_client, which OWNS the self-play workers. It pulls the net + the canonical
-# self-play params, spawns selfplay_workers_only once weights land, restarts them if they
-# die, uploads finished games, contributes keep-best GATE games, self-updates on a new
-# server code version, and reports worker liveness to the server. Shared shape (arch,
+# fleet_client, which OWNS the native cc_selfplay engines. It pulls the net + the canonical
+# self-play params, spawns N cc_selfplay --jobs-local procs once weights land, restarts them
+# if they die, uploads finished games, contributes keep-best GATE games, self-updates on a new
+# server code version, and reports engine liveness to the server. Shared shape (arch,
 # max-plies, seed mix, sims fallback) comes from scripts/fleet.env so leena CANNOT drift
 # from local; only box-specific bits (LAN server, client-id, worker-id-base 300, caffeinate,
 # self-update) live here. This is the SAME client path as launch_local.sh (loopback).
@@ -103,27 +103,28 @@ pkill -x caffeinate 2>/dev/null || true
 nohup caffeinate -ims >/dev/null 2>&1 </dev/null &
 CAFF_PID=$!; disown
 
-# Never double-launch. The client owns the workers, so killing it is enough, but also reap
-# any stray workers left by an older (separate-launch) script.
+# Never double-launch. The client owns the engines, so killing it is enough, but also reap any
+# stray engines (and any worker left by an older Python-engine launch) before starting.
 pkill -f "chessckers_engine.fleet_client" 2>/dev/null || true
+pkill -f "cc_selfplay .*--jobs-local" 2>/dev/null || true
 pkill -f "chessckers_engine.selfplay_workers_only" 2>/dev/null || true
 sleep 1
 
-# Native C++ engine. ALWAYS rebuild after a code pull: a stale but importable .so silently
-# mismatches the Python call surface and crashes the workers at runtime, not import. cmake
-# is a uv-pip wheel in the venv bin, so put it on PATH (the venv is never activated here).
-# Only pass --native if the rebuild SUCCEEDED — else fall back to the (slower but correct)
-# Python engine rather than running a stale ext.
-NATIVE=""; BUILD_OK=0
+# Native C++ engine (lc0-split cutover, Phase 3B-3): leena (Apple silicon) runs the
+# cc_selfplay binary as the engine — ALWAYS rebuild after a code pull (cpp/build.sh builds
+# both the .so and cc_selfplay). cmake is a uv-pip wheel in the venv bin, so put it on PATH
+# (the venv is never activated here). There is no Python self-play fallback anymore — if the
+# build fails, the box can't self-play (the prior code commit's binary stays in place).
+CC_SELFPLAY="$ENG/cpp/build/cc_selfplay"
 if [ -x cpp/build.sh ]; then
-  echo "leena: rebuilding chessckers_cpp (cpp/build.sh)…"
-  if PATH="$ENG/.venv/bin:$PATH" cpp/build.sh > "$RUN/cpp_build.log" 2>&1; then BUILD_OK=1
-  else echo "leena: native build FAILED (see run-local/cpp_build.log)"; fi
+  echo "leena: rebuilding chessckers_cpp + cc_selfplay (cpp/build.sh)…"
+  PATH="$ENG/.venv/bin:$PATH" cpp/build.sh > "$RUN/cpp_build.log" 2>&1 \
+    || echo "leena: native build FAILED (see run-local/cpp_build.log) — using prior cc_selfplay"
 fi
-if [ "$BUILD_OK" = 1 ] && "$PY" -c "import chessckers_cpp" 2>/dev/null; then
-  NATIVE="--native"; echo "leena: native C++ engine (v1+v2) -> --native"
+if [ -x "$CC_SELFPLAY" ]; then
+  echo "leena: native C++ engine -> cc_selfplay --jobs-local ($FLEET_WORKERS procs)"
 else
-  echo "leena: Python engine (no --native) — build failed or ext unavailable"
+  echo "leena: ERROR — cc_selfplay not built at $CC_SELFPLAY; cannot self-play"; exit 1
 fi
 
 # Self-update command: when the server advertises a newer code sha than this client booted
@@ -132,22 +133,20 @@ fi
 # if the pull/build fails the box stays on old code and is visibly stale in /status.
 UPDATE_CMD="cd '$REPO_ROOT' && git pull --ff-only && cd '$ENG' && PATH='$ENG/.venv/bin':\$PATH cpp/build.sh"
 
-# fleet_client owns the workers: pull net + params, spawn + supervise selfplay_workers_only,
-# upload games, contribute gate games, self-update on a new server version. worker-id-base
-# 300 -> games attribute to [leena]. --sims is only a FALLBACK for the first-game window
-# before the server's selfplay.json is mirrored in; run-local/selfplay.json then governs.
+# fleet_client owns the engine pool: pull net (weights.bin) + params, spawn + supervise N
+# cc_selfplay --jobs-local procs, upload games, contribute gate games, self-update (+ native
+# rebuild) on a new server version. worker-id-base 300 -> games attribute to [leena]. The engine
+# loads the .bin + reads sims/max-plies/start-fen from the job + env (selfplay.json governs once
+# mirrored in), so the arch/device/sims knobs aren't passed here.
 CLIENT_ARGS=(
   -m chessckers_engine.fleet_client
   --server "$SERVER" --run-dir "$RUN" --client-id leena --poll-seconds "$FLEET_POLL_S"
   --bind-interface en0
   --update-cmd "$UPDATE_CMD"
-  --queue-depth "$FLEET_WORKERS" --spawn-workers --
-  --workers "$FLEET_WORKERS" --worker-id-base 300 --seed 4000
-  --device "$FLEET_DEVICE" --d-hidden "$FLEET_DH" --c-filters "$FLEET_CF" --n-blocks "$FLEET_NB"
-  --arch-version "$FLEET_ARCH_VERSION" --tf-blocks "$FLEET_TF_BLOCKS" --tf-heads "$FLEET_TF_HEADS" --tf-ff-mult "$FLEET_TF_FF"
-  --max-plies "$FLEET_MAX_PLIES" --sims "$FLEET_SIMS_FALLBACK" --weights-poll-seconds "$FLEET_WEIGHTS_POLL_S"
+  --queue-depth "$FLEET_WORKERS" --spawn-engines
+  --engine-binary "$CC_SELFPLAY"
+  --engine-workers "$FLEET_WORKERS" --engine-worker-id-base 300 --engine-seed 4000
 )
-[ -n "$NATIVE" ] && CLIENT_ARGS+=("$NATIVE")
 
 # FOREGROUND=1 -> run the client ATTACHED to this (interactive ssh) session instead of
 # detaching it. This is the macOS Local-Network fix: a launchd-orphaned daemon (the default
@@ -158,9 +157,9 @@ CLIENT_ARGS=(
 if [ -n "${FOREGROUND:-}" ]; then
   rm -f "$RUN/client.pid" 2>/dev/null || true
   cleanup() {
-    echo; echo "leena: foreground teardown — stopping workers + caffeinate…"
+    echo; echo "leena: foreground teardown — stopping engines + caffeinate…"
     touch "$RUN/STOP" 2>/dev/null || true
-    pkill -f "chessckers_engine.selfplay_workers_only" 2>/dev/null || true
+    pkill -f "cc_selfplay .*--jobs-local" 2>/dev/null || true
     [ -n "${CAFF_PID:-}" ] && kill "$CAFF_PID" 2>/dev/null || true
   }
   trap 'cleanup; exit 0' INT TERM
@@ -175,5 +174,5 @@ fi
 nohup "$PY" "${CLIENT_ARGS[@]}" > "$RUN/fleet_client.log" 2>&1 &
 echo $! > "$RUN/client.pid"; disown
 echo "leena fleet_client launched (pid $(cat "$RUN/client.pid")) -> $SERVER"
-echo "leena up: client owns $FLEET_WORKERS workers (spawned once weights land)."
-echo "logs: $RUN/fleet_client.log (client) + $RUN/workers.log (workers)"
+echo "leena up: client owns $FLEET_WORKERS cc_selfplay engines (spawned once weights land)."
+echo "logs: $RUN/fleet_client.log (client) + $RUN/engine-*.log (engines)"

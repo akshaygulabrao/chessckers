@@ -2,8 +2,9 @@
 # GCP self-play CLIENT launcher (Linux). The on-box ExecStart for the chessckers-sp systemd
 # unit that scripts/gcp/startup.sh installs. Linux sibling of launch_fleet_leena.sh, stripped
 # for a headless GCE box: no caffeinate (servers don't sleep), no en0 bind (the route to the
-# trainer's 100.x is over Tailscale's utun), no C++/Accelerate build (Apple-only -> the client
-# runs the pure-Python PyVariant move-gen; the Rust accelerator was retired). Reaches the trainer over the tailnet; SERVER is
+# trainer's 100.x is over Tailscale's utun). Runs the SAME native cc_selfplay engine as the
+# Apple boxes — the NN forward is portable cblas_sgemm, built against OpenBLAS here (startup.sh
+# installs libopenblas-dev + runs cpp/build.sh). Reaches the trainer over the tailnet; SERVER is
 # injected by the unit. Same client path + shared scripts/fleet.env shape as local/leena, so
 # this box CANNOT drift from the rest of the fleet.
 set -uo pipefail
@@ -29,21 +30,21 @@ export CHESSCKERS_START_FEN="$(fleet_seed_fens "$SEED_MIX")"
 mkdir -p "$RUN/buffer"
 rm -f "$RUN/STOP" 2>/dev/null || true
 
-# Self-update when the server advertises a newer code sha: pull the public origin, then the client
-# re-execs onto fresh code (keeps the box wire-aligned with the trainer). No native rebuild — the
-# Rust accelerator was retired and the C++ engine is Accelerate-only (Apple), so this Linux box
-# runs the pure-Python PyVariant move-gen (no build step needed).
-UPDATE_CMD="cd '$REPO_ROOT' && git pull --ff-only"
+# Self-update when the server advertises a newer code sha: pull the public origin, rebuild the
+# native engine (chessckers_cpp + cc_selfplay against OpenBLAS), then the client re-execs onto
+# fresh code (keeps the box wire-aligned with the trainer + its cc_selfplay binary current).
+UPDATE_CMD="cd '$REPO_ROOT' && git pull --ff-only && cd '$ENG' && PATH='$ENG/.venv/bin':\$PATH cpp/build.sh"
 
-# fleet_client owns the workers: pull net + params, spawn + supervise selfplay_workers_only,
-# upload games, contribute gate games, self-update on a new server version. worker-id-base 400
-# -> games attribute to [gcp]. --sims is only a FALLBACK for the first-game window before the
-# server's selfplay.json mirrors in; run-gcp/selfplay.json then governs.
+# fleet_client owns the engine pool: pull net (weights.bin) + params, spawn + supervise N
+# cc_selfplay --jobs-local procs, upload games, contribute gate games, self-update (+ native
+# rebuild) on a new server version. worker-id-base 400 -> games attribute to [gcp]. The engine
+# loads the .bin (self-describing) + reads sims/max-plies/start-fen from the job + env, so the
+# arch/device/sims knobs aren't passed here. WORKER_ID_BASE per-node keeps RNG streams distinct.
+CC_SELFPLAY="$ENG/cpp/build/cc_selfplay"
+[ -x "$CC_SELFPLAY" ] || { echo "cc_selfplay not built at $CC_SELFPLAY (startup.sh runs cpp/build.sh)"; exit 1; }
 exec "$PY" -m chessckers_engine.fleet_client \
   --server "$SERVER" --run-dir "$RUN" --client-id "gcp-$(hostname)" --poll-seconds "$FLEET_POLL_S" \
   --update-cmd "$UPDATE_CMD" \
-  --queue-depth "$WORKERS" --spawn-workers -- \
-  --workers "$WORKERS" --worker-id-base "$WORKER_ID_BASE" --seed 4000 \
-  --device "$FLEET_DEVICE" --d-hidden "$FLEET_DH" --c-filters "$FLEET_CF" --n-blocks "$FLEET_NB" \
-  --arch-version "$FLEET_ARCH_VERSION" --tf-blocks "$FLEET_TF_BLOCKS" --tf-heads "$FLEET_TF_HEADS" --tf-ff-mult "$FLEET_TF_FF" \
-  --max-plies "$FLEET_MAX_PLIES" --sims "$FLEET_SIMS_FALLBACK" --weights-poll-seconds "$FLEET_WEIGHTS_POLL_S"
+  --queue-depth "$WORKERS" --spawn-engines \
+  --engine-binary "$CC_SELFPLAY" \
+  --engine-workers "$WORKERS" --engine-worker-id-base "$WORKER_ID_BASE" --engine-seed 4000

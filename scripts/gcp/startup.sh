@@ -15,7 +15,7 @@ echo "=== chessckers-sp startup $(date -u) ==="
 # Base tools FIRST (curl/python3 are used immediately below; not guaranteed on a bare image).
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y curl ca-certificates python3 git build-essential cmake pkg-config
+apt-get install -y curl ca-certificates python3 git build-essential cmake pkg-config libopenblas-dev
 
 md(){ curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/$1"; }
 TRAINER_IP="$(md instance/attributes/trainer-ip)"
@@ -32,11 +32,11 @@ AUTHKEY="$(curl -s -H "Authorization: Bearer $TOKEN" \
 tailscale up --authkey="$AUTHKEY" --hostname="$(hostname)" --accept-dns=true
 echo "tailnet IP: $(tailscale ip -4 2>/dev/null | head -1)  ->  trainer $SERVER"
 
-# --- app user: code + venv (CPU torch) ---
-# No native accelerator on this Linux box: the C++ engine is Accelerate-only (Apple), and the
-# Rust move-gen accelerator was retired in the lc0-split migration. Self-play here runs on the
-# pure-Python PyVariant move-gen (slower). Restoring acceleration on GCP needs a Linux-portable
-# C++ NN/move-gen backend (deferred Phase 6 of the C++ port).
+# --- app user: code + venv (CPU torch) + native engine ---
+# Native C++ engine on Linux (lc0-split): the NN forward is portable cblas_sgemm, so this box
+# builds the SAME cc_selfplay engine as the Apple boxes — against OpenBLAS (libopenblas-dev
+# above) instead of Accelerate. No Python self-play fallback. cpp/build.sh builds chessckers_cpp
+# + cc_selfplay; the systemd client (launch_gcp.sh) runs cc_selfplay --jobs-local.
 id -u sp >/dev/null 2>&1 || useradd -m -s /bin/bash sp
 runuser -u sp -- bash <<'USR'
 set -uxo pipefail
@@ -47,6 +47,7 @@ export PATH="$HOME/.local/bin:$PATH"
 [ -d chessckers ] || git clone --depth=1 https://github.com/akshaygulabrao/chessckers.git chessckers
 cd chessckers/engine
 UV_TORCH_BACKEND=cpu uv sync          # force the CPU torch wheel (Linux default is the ~3GB CUDA build)
+PATH="$HOME/chessckers/engine/.venv/bin:$PATH" cpp/build.sh   # native engine (chessckers_cpp + cc_selfplay, OpenBLAS)
 USR
 
 # --- run the client as a systemd service (survives startup-script exit; restarts on crash) ---
