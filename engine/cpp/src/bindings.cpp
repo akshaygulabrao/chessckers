@@ -886,7 +886,23 @@ PYBIND11_MODULE(chessckers_cpp, m) {
             },
             py::arg("position"), py::arg("moves"),
             "(value, priors): position is the flat 14*8*8 encoded planes; moves is a list of "
-            "240-dim move features. Mirrors model.policy_and_value (WDL->Q + softmax priors).");
+            "240-dim move features. Mirrors model.policy_and_value (WDL->Q + softmax priors).")
+        .def(
+            "eval_batch",
+            [](const cc::ChesskersNet& net, const std::vector<std::vector<float>>& positions,
+               const std::vector<std::vector<std::vector<float>>>& moves_per) {
+                std::vector<std::pair<float, std::vector<float>>> r;
+                {
+                    py::gil_scoped_release rel;
+                    r = net.eval_batch(positions, moves_per);
+                }
+                py::list out;
+                for (auto& p : r) out.append(py::make_tuple(p.first, p.second));
+                return out;
+            },
+            py::arg("positions"), py::arg("moves_per"),
+            "Batched eval over K leaves (batched conv trunk). Byte-equivalent to K eval() calls; "
+            "V2 only batches, V1 falls back to a serial loop.");
 
     m.def(
         "run_mcts",

@@ -119,6 +119,43 @@ inline std::vector<float> conv3x3(const std::vector<float>& in, int Cin,
     return out;
 }
 
+// Batched conv k3p1 over K boards, ONE GEMM. ins[k] = [Cin,H,W] -> outs[k] = [Cout,H,W].
+// im2col columns of all K boards are concatenated ([Cin*9, K*HW], board k at column k*HW)
+// so a single W[Cout,Cin*9] @ col GEMM does all K — the BLAS-efficiency win (per the
+// microbench: ~1.74x/board at K=8 for the 96-filter residual conv). Output is scattered
+// back to per-board channel-major buffers (cheap copy). Byte-equivalent to K conv3x3 calls.
+inline std::vector<std::vector<float>> conv3x3_batch(const std::vector<std::vector<float>>& ins,
+                                                     int Cin, const std::vector<float>& w, int Cout,
+                                                     int H = 8, int W = 8) {
+    const int HW = H * W, K = (int)ins.size(), COLS = HW * K;
+    std::vector<float> col((size_t)Cin * 9 * COLS, 0.0f);
+    for (int k = 0; k < K; ++k)
+        for (int ci = 0; ci < Cin; ++ci)
+            for (int ky = 0; ky < 3; ++ky)
+                for (int kx = 0; kx < 3; ++kx) {
+                    float* cp = &col[(size_t)(ci * 9 + ky * 3 + kx) * COLS + (size_t)k * HW];
+                    const float* ip = &ins[k][(size_t)ci * HW];
+                    for (int y = 0; y < H; ++y) {
+                        const int iy = y + ky - 1;
+                        for (int x = 0; x < W; ++x) {
+                            const int ix = x + kx - 1;
+                            cp[y * W + x] =
+                                (iy >= 0 && iy < H && ix >= 0 && ix < W) ? ip[iy * W + ix] : 0.0f;
+                        }
+                    }
+                }
+    std::vector<float> out((size_t)Cout * COLS);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, Cout, COLS, Cin * 9, 1.0f, w.data(),
+                Cin * 9, col.data(), COLS, 0.0f, out.data(), COLS);
+    std::vector<std::vector<float>> outs(K, std::vector<float>((size_t)Cout * HW));
+    for (int k = 0; k < K; ++k)
+        for (int c = 0; c < Cout; ++c) {
+            const float* src = &out[(size_t)c * COLS + (size_t)k * HW];
+            std::copy(src, src + HW, &outs[k][(size_t)c * HW]);
+        }
+    return outs;
+}
+
 inline void groupnorm_(std::vector<float>& x, int C, int G, const std::vector<float>& w,
                        const std::vector<float>& b, float eps = 1e-5f, int HW = 64) {
     const int cg = C / G;
@@ -313,6 +350,72 @@ struct ChesskersNet {
             for (int s = 0; s < T; ++s) x[(size_t)c * T + s] = t[(size_t)s * C + c];
     }
 
+    // Batched transformer block over K boards. Byte-equivalent to K transformer_block_ calls:
+    // the linears (qkv/out_proj/ff0/ff2) run as ONE K*T-row GEMM each (the Accelerate-batching
+    // win); LayerNorm is per-row (identical); attention stays per-board (block-diagonal, fuses
+    // nothing). xs[k] = channel-major [C*100], updated in place.
+    void transformer_block_batch_(std::vector<std::vector<float>>& xs, const std::string& p) const {
+        const int T = 100, C = c_filters, Hn = n_heads, hd = C / Hn, K = (int)xs.size(), R = T * K;
+        std::vector<float> t((size_t)R * C);                  // stacked token-major [K*T, C]
+        for (int k = 0; k < K; ++k)
+            for (int c = 0; c < C; ++c)
+                for (int s = 0; s < T; ++s) t[(size_t)(k * T + s) * C + c] = xs[k][(size_t)c * T + s];
+
+        std::vector<float> n = t;
+        layernorm_(n, R, C, w.at(p + "norm1.weight"), w.at(p + "norm1.bias"));
+        const auto qkv = linear_batch(n, R, w.at(p + "attn.in_proj_weight"),
+                                      w.at(p + "attn.in_proj_bias"), 3 * C, C);
+        const float scale = 1.0f / std::sqrt((float)hd);
+        std::vector<float> attn_out((size_t)R * C);
+        std::vector<float> Qh((size_t)T * hd), Kh((size_t)T * hd), Vh((size_t)T * hd),
+            scores((size_t)T * T), Oh((size_t)T * hd);
+        for (int k = 0; k < K; ++k) {
+            const size_t base = (size_t)k * T;                // first row of board k
+            for (int h = 0; h < Hn; ++h) {
+                const int off = h * hd;
+                for (int s = 0; s < T; ++s) {
+                    const float* row = &qkv[(base + s) * 3 * C];
+                    for (int d = 0; d < hd; ++d) {
+                        Qh[(size_t)s * hd + d] = row[off + d];
+                        Kh[(size_t)s * hd + d] = row[C + off + d];
+                        Vh[(size_t)s * hd + d] = row[2 * C + off + d];
+                    }
+                }
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, T, hd, scale, Qh.data(), hd,
+                            Kh.data(), hd, 0.0f, scores.data(), T);
+                for (int i = 0; i < T; ++i) {
+                    float* sr = &scores[(size_t)i * T];
+                    float mx = sr[0];
+                    for (int j = 1; j < T; ++j) mx = std::max(mx, sr[j]);
+                    double sum = 0.0;
+                    for (int j = 0; j < T; ++j) { sr[j] = (float)std::exp((double)sr[j] - mx); sum += sr[j]; }
+                    const float inv = (float)(1.0 / sum);
+                    for (int j = 0; j < T; ++j) sr[j] *= inv;
+                }
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, T, hd, T, 1.0f, scores.data(), T,
+                            Vh.data(), hd, 0.0f, Oh.data(), hd);
+                for (int s = 0; s < T; ++s)
+                    for (int d = 0; d < hd; ++d)
+                        attn_out[(base + s) * C + off + d] = Oh[(size_t)s * hd + d];
+            }
+        }
+        const auto proj = linear_batch(attn_out, R, w.at(p + "attn.out_proj.weight"),
+                                       w.at(p + "attn.out_proj.bias"), C, C);
+        for (size_t i = 0; i < t.size(); ++i) t[i] += proj[i];
+
+        std::vector<float> n2 = t;
+        layernorm_(n2, R, C, w.at(p + "norm2.weight"), w.at(p + "norm2.bias"));
+        const int ff_dim = (int)w.at(p + "ff.0.bias").size();
+        auto h1 = linear_batch(n2, R, w.at(p + "ff.0.weight"), w.at(p + "ff.0.bias"), ff_dim, C);
+        gelu_(h1);
+        const auto h2 = linear_batch(h1, R, w.at(p + "ff.2.weight"), w.at(p + "ff.2.bias"), C, ff_dim);
+        for (size_t i = 0; i < t.size(); ++i) t[i] += h2[i];
+
+        for (int k = 0; k < K; ++k)
+            for (int c = 0; c < C; ++c)
+                for (int s = 0; s < T; ++s) xs[k][(size_t)c * T + s] = t[(size_t)(k * T + s) * C + c];
+    }
+
     // Spatial trunk: stem conv + (pos-emb, residual/transformer blocks). Returns the
     // (c_filters,10,10) feature map flat [c_filters*100] — NO pool/flatten (the gather
     // head needs it spatial). Blocks are walked by index and dispatched on which keys
@@ -344,6 +447,48 @@ struct ChesskersNet {
             }
         }
         return x;
+    }
+
+    // Batched V2 spatial trunk over K boards. Mirrors trunk_v2 op-for-op but routes the
+    // conv GEMMs through conv3x3_batch (one GEMM for all K — the dominant FLOPs and the
+    // batching win); the cheap per-board ops (groupnorm/relu/posemb/transformer/attention)
+    // stay looped. Byte-equivalent to K trunk_v2 calls. Returns K feature maps [c_filters*100].
+    std::vector<std::vector<float>> trunk_v2_batch(
+        const std::vector<std::vector<float>>& positions) const {
+        const int HW = 100, K = (int)positions.size();
+        auto xs = conv3x3_batch(positions, c_in, w.at("position_trunk.0.weight"), c_filters, 10, 10);
+        for (auto& x : xs) {
+            groupnorm_(x, c_filters, 8, w.at("position_trunk.1.weight"),
+                       w.at("position_trunk.1.bias"), 1e-5f, HW);
+            relu_(x);
+        }
+        for (int k = 3;; ++k) {
+            const std::string p = "position_trunk." + std::to_string(k) + ".";
+            if (w.tensors.count(p + "pos")) {
+                const auto& pe = w.at(p + "pos");
+                for (auto& x : xs)
+                    for (size_t i = 0; i < x.size(); ++i) x[i] += pe[i];
+            } else if (w.tensors.count(p + "conv1.weight")) {
+                auto c1s = conv3x3_batch(xs, c_filters, w.at(p + "conv1.weight"), c_filters, 10, 10);
+                for (auto& c1 : c1s) {
+                    groupnorm_(c1, c_filters, 8, w.at(p + "bn1.weight"), w.at(p + "bn1.bias"), 1e-5f, HW);
+                    relu_(c1);
+                }
+                auto c2s = conv3x3_batch(c1s, c_filters, w.at(p + "conv2.weight"), c_filters, 10, 10);
+                for (int k2 = 0; k2 < K; ++k2) {
+                    auto& c2 = c2s[k2];
+                    groupnorm_(c2, c_filters, 8, w.at(p + "bn2.weight"), w.at(p + "bn2.bias"), 1e-5f, HW);
+                    for (size_t i = 0; i < c2.size(); ++i) c2[i] += xs[k2][i];
+                    relu_(c2);
+                }
+                xs = std::move(c2s);
+            } else if (w.tensors.count(p + "attn.in_proj_weight")) {
+                transformer_block_batch_(xs, p);
+            } else {
+                break;
+            }
+        }
+        return xs;
     }
 
     // WDL value off the spatial map: global-mean-pool -> value_trunk -> value_head.
@@ -451,6 +596,34 @@ struct ChesskersNet {
         for (float l : logits) s += std::exp(l - mx);
         for (int i = 0; i < N; ++i) priors[i] = static_cast<float>(std::exp(logits[i] - mx) / s);
         return {v, priors};
+    }
+
+    // Batched eval over K leaves: one batched trunk pass (the conv stack is fused into single
+    // GEMMs), then per-board value + policy. Byte-equivalent to K eval() calls. V2 only — V1
+    // falls back to a serial loop (production is V2; not worth the extra batched-trunk path).
+    std::vector<std::pair<float, std::vector<float>>> eval_batch(
+        const std::vector<std::vector<float>>& positions,
+        const std::vector<std::vector<std::vector<float>>>& moves_per) const {
+        const int K = (int)positions.size();
+        std::vector<std::pair<float, std::vector<float>>> out(K);
+        if (!is_v2) {
+            for (int k = 0; k < K; ++k) out[k] = eval(positions[k], moves_per[k]);
+            return out;
+        }
+        const auto Fs = trunk_v2_batch(positions);
+        for (int k = 0; k < K; ++k) {
+            const float v = value_v2(Fs[k]);
+            const int N = (int)moves_per[k].size();
+            std::vector<float> priors(N);
+            if (N == 0) { out[k] = {v, priors}; continue; }
+            const auto logits = policy_logits_v2(Fs[k], moves_per[k]);
+            const float mx = *std::max_element(logits.begin(), logits.end());
+            double s = 0.0;
+            for (float l : logits) s += std::exp(l - mx);
+            for (int i = 0; i < N; ++i) priors[i] = (float)(std::exp(logits[i] - mx) / s);
+            out[k] = {v, priors};
+        }
+        return out;
     }
 };
 
