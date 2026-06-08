@@ -480,12 +480,20 @@ inline std::vector<PureGame> play_games_batched_pure(
     const Board& start, const ChesskersNet& net, int num_games, int batch_size, int n_sims,
     double c_puct, double temperature, int temp_cutoff_plies, int max_plies, double dirichlet_alpha,
     double dirichlet_eps, uint64_t base_seed, double resign_threshold, double resign_no_resign_frac,
-    int resign_consecutive, int resign_min_ply, double gamma, TrunkForwardFn trunk_forward) {
+    int resign_consecutive, int resign_min_ply, double gamma, TrunkForwardFn trunk_forward,
+    int concurrency = 0) {
     std::vector<PureGame> games(std::max(0, num_games));
     if (num_games <= 0) return games;
-    const int nworkers = std::max(1, std::min(batch_size, num_games));
+    // concurrency = number of game threads; batch_size = the GPU batch WIDTH (gatherer cap).
+    // concurrency>batch_size oversubscribes (lc0 pipelining): while a batch is on the GPU the
+    // extra threads compute their next leaves, so the GPU never waits on leaf production. The
+    // gatherer fires at `pending>=cap`, so a full batch is always ready. concurrency<=0 => no
+    // oversubscription (threads==cap). Game results are unchanged — pure inference transport.
+    const int cap = std::max(1, std::min(batch_size, num_games));
+    const int want = concurrency > 0 ? concurrency : cap;
+    const int nworkers = std::max(1, std::min(want, num_games));
 
-    BatchEvaluator bev(net, std::move(trunk_forward), nworkers, nworkers);
+    BatchEvaluator bev(net, std::move(trunk_forward), cap, nworkers);
     std::atomic<int> next{0};
     auto worker = [&]() {
         for (;;) {

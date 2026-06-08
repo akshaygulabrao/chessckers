@@ -69,6 +69,30 @@ def test_batched_engine_chunks_match_serial(tmp_path):
         assert batched_chunks[name] == serial_chunks[name], f"chunk {name} bytes diverged"
 
 
+def test_oversubscribed_engine_chunks_match_serial(tmp_path):
+    """concurrency > batch_size (GPU pipelining): the engine claims up to `concurrency`
+    train jobs and plays them as that many concurrent games over a width-`batch_size`
+    batch. Game seeds are by train index (not thread), so the chunks stay BYTE-IDENTICAL
+    to the serial engine — the +24% throughput is pure inference transport."""
+    N = 12
+    weights = _weights_bin(tmp_path)
+
+    serial = _make_run(tmp_path / "serial", weights, N)
+    cpp.run_jobs_local(str(serial), SEED_FEN, worker_id=300, base_seed=7,
+                       max_jobs=N, batch_size=1, use_gpu=False)
+    serial_chunks = _buffer_chunks(serial)
+
+    over = _make_run(tmp_path / "over", weights, N)
+    cpp.run_jobs_local(str(over), SEED_FEN, worker_id=300, base_seed=7,
+                       max_jobs=N, batch_size=4, use_gpu=False, concurrency=N)  # 3x oversub
+    over_chunks = _buffer_chunks(over)
+
+    assert len(serial_chunks) == N, f"serial wrote {len(serial_chunks)} chunks, want {N}"
+    assert over_chunks.keys() == serial_chunks.keys(), "filenames diverged"
+    for name in serial_chunks:
+        assert over_chunks[name] == serial_chunks[name], f"chunk {name} bytes diverged"
+
+
 def test_batched_engine_runs_on_gpu_if_present(tmp_path):
     """use_gpu=True (Metal): the engine still produces N valid chunks (float-close, not
     byte-identical to serial). Falls back to CPU when no Metal device, so this just

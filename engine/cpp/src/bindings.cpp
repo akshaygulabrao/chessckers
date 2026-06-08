@@ -641,7 +641,7 @@ static py::object play_games_batched_native(cc::Board board, const cc::Chesskers
                                             double dirichlet_eps, uint64_t base_seed,
                                             double resign_threshold, double resign_no_resign_frac,
                                             int resign_consecutive, int resign_min_ply,
-                                            bool use_gpu) {
+                                            bool use_gpu, int concurrency) {
     const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
     const double gamma = g ? std::atof(g) : 1.0;
 
@@ -675,7 +675,7 @@ static py::object play_games_batched_native(cc::Board board, const cc::Chesskers
                                             dirichlet_alpha, dirichlet_eps, base_seed,
                                             resign_threshold, resign_no_resign_frac,
                                             resign_consecutive, resign_min_ply, gamma,
-                                            std::move(trunk_forward));
+                                            std::move(trunk_forward), concurrency);
     }
     return pure_games_to_py(games);
 }
@@ -1165,7 +1165,7 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         py::arg("max_plies") = 400, py::arg("dirichlet_alpha") = 0.0, py::arg("dirichlet_eps") = 0.25,
         py::arg("base_seed") = 0, py::arg("resign_threshold") = 0.0,
         py::arg("resign_no_resign_frac") = 0.1, py::arg("resign_consecutive") = 2,
-        py::arg("resign_min_ply") = 8, py::arg("use_gpu") = false,
+        py::arg("resign_min_ply") = 8, py::arg("use_gpu") = false, py::arg("concurrency") = 0,
         "Phase 6d: GPU leaf batching. Plays num_games games across batch_size concurrent threads "
         "sharing ONE batched forward per round (net.eval_batch, or MetalTrunkV2 when use_gpu and a "
         "Metal device exist). Game i is byte-identical to play_game_native(seed=base_seed+i) under "
@@ -1310,23 +1310,25 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         "run_jobs_local",
         [](const std::string& run_dir, const std::string& start_fen, int worker_id,
            const std::string& machine, uint64_t base_seed, int max_jobs, long seq_start,
-           int batch_size, bool use_gpu) {
+           int batch_size, bool use_gpu, int concurrency) {
             int n;
             {
                 py::gil_scoped_release release;
                 n = cc::run_jobs_local(run_dir, start_fen, worker_id, machine, base_seed, max_jobs,
-                                       seq_start, batch_size, use_gpu);
+                                       seq_start, batch_size, use_gpu, concurrency);
             }
             return n;
         },
         py::arg("run_dir"), py::arg("start_fen"), py::arg("worker_id") = 400,
         py::arg("machine") = "cpp-client", py::arg("base_seed") = 0, py::arg("max_jobs") = 0,
         py::arg("seq_start") = 1, py::arg("batch_size") = 1, py::arg("use_gpu") = false,
+        py::arg("concurrency") = 0,
         "Run the local-job ENGINE loop (NO HTTP): claim jobs from run_dir/jobs/ (atomic), play "
         "the native engine, write train chunks to run_dir/buffer/ + gate outcomes to "
         "run_dir/match_out/. The train net is run_dir/weights.bin (mtime hot-reload); match nets "
         "are the job's local cand_bin/opp_bin paths. max_jobs<=0 runs until run_dir/STOP. "
         "batch_size>1 (Phase 6f) claims that many train jobs and plays them concurrently through "
         "one shared batched trunk (use_gpu => Metal); chunks stay byte-identical to batch_size=1 "
-        "under the CPU trunk. Returns the count handled.");
+        "under the CPU trunk. concurrency>batch_size oversubscribes game threads vs the GPU batch "
+        "width (lc0 pipelining, +24% plies/s) — still byte-identical. Returns the count handled.");
 }

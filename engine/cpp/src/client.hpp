@@ -344,10 +344,17 @@ inline TrunkForwardFn make_engine_trunk_forward(const ChesskersNet& net, bool us
 // BYTE-IDENTICAL to the serial (batch_size=1) engine whenever the trunk forward is (CPU is;
 // Metal is ~1e-4-close). The batch shares the seed job's params (uniform within a run). Run
 // ONE such process on a GPU box in place of N CPU engines. batch_size=1 = the original path.
+//
+// GPU pipelining (lc0 --threads > --minibatch-size): `concurrency` > batch_size runs MORE
+// game threads than the GPU batch width, so per-leaf CPU glue (encode/apply/tree) on the
+// extra games overlaps the GPU forward — measured +24% plies/s at 2x (diminishing past it).
+// The engine then claims up to `concurrency` jobs and plays them as `concurrency` concurrent
+// games sharing a width-`batch_size` batched trunk. Byte-identical to serial regardless (the
+// game seeds are by index, not thread); concurrency=0 => no oversubscription (threads=width).
 inline int run_jobs_local(const std::string& run_dir, const std::string& start_fen,
                           int worker_id, const std::string& machine, uint64_t base_seed,
                           int max_jobs = 0, long seq_start = 1, int batch_size = 1,
-                          bool use_gpu = false) {
+                          bool use_gpu = false, int concurrency = 0) {
     const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
     const double gamma = g ? std::atof(g) : 1.0;
     const std::string jobs_dir = run_dir + "/jobs";
@@ -453,13 +460,16 @@ inline int run_jobs_local(const std::string& run_dir, const std::string& start_f
             if (ok) ++handled;
             continue;
         }
-        // Batched train: this job seeds a batch; greedily claim up to batch_size-1 more train
+        // Batched train: this job seeds a batch; greedily claim up to claim_target-1 more train
         // jobs (handling any match jobs inline), then play them all through one shared batched
         // trunk. game i seeded base_seed+train_count+i — the same seeds, in the same order, the
         // serial path would assign — so the chunks are byte-identical under a CPU trunk forward.
+        // claim_target = concurrency (oversubscribed) else batch_size; the batch WIDTH stays
+        // batch_size, so concurrency>batch_size runs >width concurrent games over a width batch.
+        const int claim_target = concurrency > 0 ? concurrency : batch_size;
         std::vector<std::string> claimed_paths{claimed};
         const ClientPlayParams p = job.params;  // batch shares the seed job's params
-        while ((int)claimed_paths.size() < batch_size) {
+        while ((int)claimed_paths.size() < claim_target) {
             std::string js2, cl2, body2;
             if (!claim_job_local(jobs_dir, worker_id, js2, cl2, body2)) break;  // queue drained
             Job j2 = parse_job(body2);
@@ -474,10 +484,10 @@ inline int run_jobs_local(const std::string& run_dir, const std::string& start_f
         }
         const int K = (int)claimed_paths.size();
         std::vector<PureGame> games = play_games_batched_pure(
-            start, *train_net, K, K, p.n_sims, p.c_puct, p.temperature, p.temp_cutoff_plies,
+            start, *train_net, K, batch_size, p.n_sims, p.c_puct, p.temperature, p.temp_cutoff_plies,
             p.max_plies, p.dirichlet_alpha, p.dirichlet_eps, base_seed + (uint64_t)train_count,
             p.resign_threshold, p.resign_no_resign_frac, p.resign_consecutive, p.resign_min_ply,
-            gamma, train_forward);
+            gamma, train_forward, concurrency);
         for (int i = 0; i < K; ++i) {
             bool ok = write_train(games[i]);
             ++train_count;

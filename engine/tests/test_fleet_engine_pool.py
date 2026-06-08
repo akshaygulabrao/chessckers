@@ -104,12 +104,15 @@ def test_spawn_engines_end_to_end(server, tmp_path):
 
 @pytest.mark.slow
 def test_spawn_engines_gpu_batched_end_to_end(server, tmp_path):
-    """Phase 6f capstone: the kept orchestrator drives a GPU-BATCHED engine end-to-end
-    (--engine-gpu --engine-batch-size). A V2 net so the Metal trunk path is exercised on
-    Apple (falls back to the CPU batched trunk where there's no Metal device — either way
-    the full orchestrator -> batched engine -> upload -> ingest chain must work)."""
+    """Phase 6f capstone: the kept orchestrator drives a GPU-BATCHED, OVERSUBSCRIBED engine
+    end-to-end (--engine-gpu --engine-batch-size --engine-concurrency). A V2 net so the
+    Metal trunk path is exercised on Apple (falls back to the CPU batched trunk where there's
+    no Metal device). --engine-concurrency 8 > --engine-batch-size 4 = 2x GPU pipelining, so
+    this also proves the concurrency knob reaches cc_selfplay through the full orchestrator ->
+    batched engine -> upload -> ingest chain (queue-depth 8 feeds the oversubscription)."""
     if not CC_SELFPLAY.exists():
         pytest.skip("cc_selfplay not built (run cpp/build.sh)")
     net = ChesskersScorerV2(n_blocks=2, n_tf_blocks=1, n_heads=4, tf_ff_mult=2)
-    _run_engine_e2e(server, tmp_path, net, ["--engine-gpu", "--engine-batch-size", "4"],
+    _run_engine_e2e(server, tmp_path, net,
+                    ["--engine-gpu", "--engine-batch-size", "4", "--engine-concurrency", "8"],
                     "gpubox", queue_depth=8)

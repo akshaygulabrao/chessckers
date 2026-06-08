@@ -57,11 +57,14 @@ int main(int argc, char** argv) {
         }
         int batch_size = std::atoi(arg_val(argc, argv, "--batch-size", "1").c_str());
         bool use_gpu = has_flag(argc, argv, "--gpu");
+        int concurrency = std::atoi(arg_val(argc, argv, "--concurrency", "0").c_str());
         std::cout << "cc_selfplay: jobs-local run-dir=" << run_dir << " worker=" << worker_id
                   << " machine=" << machine << " batch-size=" << batch_size
-                  << " gpu=" << (use_gpu ? "on" : "off") << std::endl;
+                  << " gpu=" << (use_gpu ? "on" : "off") << " concurrency=" << concurrency
+                  << std::endl;
         int handled = cc::run_jobs_local(run_dir, start_fen, worker_id, machine, base_seed,
-                                         /*max_jobs*/ 0, /*seq_start*/ 1, batch_size, use_gpu);
+                                         /*max_jobs*/ 0, /*seq_start*/ 1, batch_size, use_gpu,
+                                         concurrency);
         std::cout << "cc_selfplay: handled " << handled << " jobs" << std::endl;
         return 0;
     }

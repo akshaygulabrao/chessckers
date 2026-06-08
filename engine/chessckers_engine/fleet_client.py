@@ -318,7 +318,8 @@ class _EnginePool:
     engine the client owns, swapped Python->C++."""
 
     def __init__(self, binary: str, run_dir: Path, n: int, worker_id_base: int, seed: int,
-                 machine: str, log_dir: Path, batch_size: int = 1, use_gpu: bool = False) -> None:
+                 machine: str, log_dir: Path, batch_size: int = 1, use_gpu: bool = False,
+                 concurrency: int = 0) -> None:
         self.binary = binary
         self.run_dir = run_dir
         self.n = max(1, n)
@@ -328,6 +329,7 @@ class _EnginePool:
         self.log_dir = log_dir
         self.batch_size = max(1, batch_size)  # >1 => each engine GPU/CPU-batches its self-play
         self.use_gpu = use_gpu
+        self.concurrency = max(0, concurrency)  # >batch_size => oversubscribe threads vs GPU width
         self.procs: list = [None] * self.n
         self.logs: list = [None] * self.n
 
@@ -339,6 +341,8 @@ class _EnginePool:
             cmd += ["--batch-size", str(self.batch_size)]
         if self.use_gpu:
             cmd.append("--gpu")
+        if self.concurrency > 0:
+            cmd += ["--concurrency", str(self.concurrency)]
         f = open(self.log_dir / f"engine-{wid}.log", "a")
         # cc_selfplay reads CHESSCKERS_START_FEN from the inherited env (the launcher exports it).
         self.procs[i] = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
@@ -746,6 +750,11 @@ def main() -> int:
                    help="--spawn-engines: engines batch self-play on the GPU (Metal on Apple). Only "
                         "meaningful with --engine-batch-size >1; falls back to the CPU batched trunk "
                         "if no GPU. ~2x self-play vs the CPU path on this Mac (more on a CUDA box).")
+    p.add_argument("--engine-concurrency", type=int, default=0,
+                   help="--spawn-engines: run this many concurrent self-play games per engine over a "
+                        "width-(--engine-batch-size) batch (lc0 --threads > --minibatch-size). "
+                        ">batch-size oversubscribes so per-leaf CPU glue overlaps the GPU forward "
+                        "(+24%% plies/s at 2x; diminishing past). 0 = threads==batch width.")
     p.add_argument("--update-cmd", default="",
                    help="Shell command that pulls + rebuilds this box's code when the server "
                         "advertises a newer version (e.g. 'cd ~/chessckers && git pull --ff-only "
@@ -790,11 +799,12 @@ def main() -> int:
             binary=binary, run_dir=run_dir, n=args.engine_workers,
             worker_id_base=args.engine_worker_id_base, seed=args.engine_seed,
             machine=os.environ.get("MACHINE", "unknown"), log_dir=run_dir,
-            batch_size=args.engine_batch_size, use_gpu=args.engine_gpu)
+            batch_size=args.engine_batch_size, use_gpu=args.engine_gpu,
+            concurrency=args.engine_concurrency)
         log.info("owning engines (lc0 client-drives, job-driven): %d x cc_selfplay --jobs-local "
-                 "(%s) | worker-id-base=%d queue-depth=%d batch-size=%d gpu=%s", args.engine_workers,
-                 binary, args.engine_worker_id_base, args.queue_depth, args.engine_batch_size,
-                 args.engine_gpu)
+                 "(%s) | worker-id-base=%d queue-depth=%d batch-size=%d gpu=%s concurrency=%d",
+                 args.engine_workers, binary, args.engine_worker_id_base, args.queue_depth,
+                 args.engine_batch_size, args.engine_gpu, args.engine_concurrency)
     # A box plays gate games iff it owns the engine pool (cc_selfplay plays match jobs
     # natively); a pure orchestrator declines match jobs.
     can_match = args.spawn_engines

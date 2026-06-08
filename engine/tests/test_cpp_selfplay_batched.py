@@ -119,6 +119,26 @@ def test_more_games_than_batch_slots(net_v2):
         _assert_game_tuple_eq(single, batch[i])
 
 
+@pytest.mark.parametrize("concurrency", [8, 12])
+def test_oversubscribed_concurrency_matches_single(net_v2, concurrency):
+    """GPU pipelining (lc0 --threads > --minibatch-size): run MORE game threads than the
+    GPU batch width so per-leaf CPU glue overlaps GPU compute. concurrency (= nworkers) >
+    cap (= batch_size) means the gatherer forms width-`cap` batches across `concurrency`
+    concurrent games, and in the tail (games finishing) fires on the smaller `active`
+    count. Byte-parity must survive that varying batch composition — each game stays
+    byte-identical to the serial reference (the +24% throughput is pure inference
+    transport, NOT a search-semantics change, so the parity gate is preserved)."""
+    G, B, S = concurrency, 4, 100  # nworkers=concurrency > cap=4 => oversubscribed
+    p = _params()
+    batch = cpp.play_games_batched_native(cpp.parse_fen(SEED_FEN), net_v2, num_games=G,
+                                          batch_size=B, base_seed=S, use_gpu=False,
+                                          concurrency=concurrency, **p)
+    assert len(batch) == G
+    for i in range(G):
+        single = cpp.play_game_native(cpp.parse_fen(SEED_FEN), net_v2, seed=S + i, **p)
+        _assert_game_tuple_eq(single, batch[i])
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="Metal GPU backend is Apple-only")
 def test_gpu_batched_runs_and_is_close(net_v2):
     """use_gpu=True (Metal): float-close, not byte-identical. Smoke + soft visit check."""
