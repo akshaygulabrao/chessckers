@@ -33,6 +33,13 @@ class MetalTrunkV2 {
     // positions: K boards, each a flat NCHW [c_in*100]; returns K feature maps [c_filters*100].
     std::vector<std::vector<float>> run(const std::vector<std::vector<float>>& positions) const;
 
+    // 6c: end-to-end batched eval — GPU trunk (cached graph) + the parity-locked CPU value/gather
+    // heads per board. Byte-equivalent to ChesskersNet::eval_batch up to GPU-trunk float error.
+    // Returns K (value, priors) pairs. Hold this object to keep the graph cached across calls.
+    std::vector<std::pair<float, std::vector<float>>> eval_batch(
+        const std::vector<std::vector<float>>& positions,
+        const std::vector<std::vector<std::vector<float>>>& moves_per) const;
+
   private:
     struct Impl;
     std::unique_ptr<Impl> p_;

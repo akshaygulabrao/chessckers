@@ -225,7 +225,7 @@ MPSGraphTensor* transformerBlock(MPSGraph* g, MPSGraphTensor* x, int C, int Hn, 
 struct MetalTrunkV2::Impl {
     int c_in = 16, c_filters = 96;
     bool ok = false;
-    bool unsupported = false;  // a transformer block was present (6b-2)
+    const ChesskersNet* net = nullptr;  // for the CPU value/gather heads (6c)
     id<MTLDevice> dev = nil;
     id<MTLCommandQueue> q = nil;
     MPSGraph* g = nil;
@@ -237,6 +237,7 @@ MetalTrunkV2::MetalTrunkV2(const ChesskersNet& net) : p_(std::make_unique<Impl>(
     @autoreleasepool {
         p_->c_in = net.c_in;
         p_->c_filters = net.c_filters;
+        p_->net = &net;
         p_->dev = MTLCreateSystemDefaultDevice();
         if (!p_->dev) return;  // no GPU
         p_->q = [p_->dev newCommandQueue];
@@ -308,6 +309,29 @@ std::vector<std::vector<float>> MetalTrunkV2::run(
             result[k].assign(&outf[(size_t)k * C * HW], &outf[(size_t)(k + 1) * C * HW]);
     }
     return result;
+}
+
+std::vector<std::pair<float, std::vector<float>>> MetalTrunkV2::eval_batch(
+    const std::vector<std::vector<float>>& positions,
+    const std::vector<std::vector<std::vector<float>>>& moves_per) const {
+    const int K = (int)positions.size();
+    std::vector<std::pair<float, std::vector<float>>> out(K);
+    if (!p_->ok || !p_->net) return out;
+    const auto Fs = run(positions);  // GPU trunk (cached graph)
+    const ChesskersNet& net = *p_->net;
+    for (int k = 0; k < K; ++k) {
+        const float v = net.value_v2(Fs[k]);
+        const int N = (int)moves_per[k].size();
+        std::vector<float> priors(N);
+        if (N == 0) { out[k] = {v, priors}; continue; }
+        const auto logits = net.policy_logits_v2(Fs[k], moves_per[k]);
+        const float mx = *std::max_element(logits.begin(), logits.end());
+        double s = 0.0;
+        for (float l : logits) s += std::exp(l - mx);
+        for (int i = 0; i < N; ++i) priors[i] = (float)(std::exp(logits[i] - mx) / s);
+        out[k] = {v, priors};
+    }
+    return out;
 }
 
 }  // namespace cc

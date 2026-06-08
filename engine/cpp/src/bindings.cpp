@@ -916,6 +916,30 @@ PYBIND11_MODULE(chessckers_cpp, m) {
         py::arg("net"), py::arg("positions"),
         "Phase 6b: V2 spatial trunk on the Metal GPU (batched). (ok, feature maps).");
 
+#ifdef CC_HAVE_METAL
+    // Phase 6c: persistent GPU trunk — builds the MPSGraph ONCE, caches it across eval_batch
+    // calls (that's where the ~10x is; rebuilding per call is what makes metal_trunk_v2 slow).
+    // keep_alive<1,2>: the net must outlive this object (the CPU heads read its weights).
+    py::class_<cc::MetalTrunkV2>(m, "MetalTrunkV2")
+        .def(py::init<const cc::ChesskersNet&>(), py::arg("net"), py::keep_alive<1, 2>())
+        .def("ok", &cc::MetalTrunkV2::ok)
+        .def(
+            "eval_batch",
+            [](const cc::MetalTrunkV2& t, const std::vector<std::vector<float>>& positions,
+               const std::vector<std::vector<std::vector<float>>>& moves_per) {
+                std::vector<std::pair<float, std::vector<float>>> r;
+                {
+                    py::gil_scoped_release rel;
+                    r = t.eval_batch(positions, moves_per);
+                }
+                py::list out;
+                for (auto& p : r) out.append(py::make_tuple(p.first, p.second));
+                return out;
+            },
+            py::arg("positions"), py::arg("moves_per"),
+            "GPU trunk (cached) + CPU value/gather heads; K (value, priors). ~eval_batch on GPU.");
+#endif
+
     py::class_<cc::ChesskersNet>(m, "ChesskersNet")
         .def(py::init<const std::string&>(), py::arg("weights_path"),
              "Slice 6: native NN forward, loaded from native_net.export_state_dict.")
