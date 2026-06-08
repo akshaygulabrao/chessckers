@@ -1,0 +1,15 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic",
+  "exclude": [
+    "**/__pycache__",
+    ".venv",
+    "cpp/build",
+    "games",
+    "runs",
+    "wandb",
+    "bench"
+  ]
+}
