@@ -61,6 +61,12 @@ if(APPLE)
 endif()
 
 # Phase 3B-2b: standalone self-play client executable — NO Python (lc0-shaped, a
-# volunteer box runs just this binary). Shares the header-only core TUs.
-add_executable(cc_selfplay src/client_main.cpp)
+# volunteer box runs just this binary). Shares the header-only core TUs. Phase 6f: on
+# Apple it also links the Metal trunk so `cc_selfplay --jobs-local --gpu` can GPU-batch
+# self-play (run_jobs_local). The .mm is the same TU the pybind module compiles.
+add_executable(cc_selfplay src/client_main.cpp ${CC_METAL_SRC})
 cc_configure_target(cc_selfplay)
+if(APPLE)
+  target_link_libraries(cc_selfplay PRIVATE ${CC_METAL_LIBS})
+  target_compile_definitions(cc_selfplay PRIVATE CC_HAVE_METAL)
+endif()

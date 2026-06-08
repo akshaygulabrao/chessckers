@@ -27,6 +27,9 @@
 #include "json_parse.hpp"
 #include "nn.hpp"
 #include "selfplay.hpp"
+#ifdef CC_HAVE_METAL
+#include "nn_metal.h"  // Phase 6f: GPU-batched engine (Apple). Absent on the CPU build.
+#endif
 
 namespace cc {
 
@@ -309,6 +312,24 @@ inline bool claim_job_local(const std::string& jobs_dir, int worker_id, std::str
     return false;
 }
 
+// Build the batched TRUNK forward for `net` (Phase 6f). On Apple with use_gpu and a Metal
+// device, that's MetalTrunkV2::run (the cached MPSGraph trunk, ~2x self-play); otherwise
+// the BLAS batched trunk net.trunk_v2_batch. The MetalTrunkV2 is owned by the returned
+// closure (shared_ptr); `net` must outlive it (the caller holds train_net while it's used).
+inline TrunkForwardFn make_engine_trunk_forward(const ChesskersNet& net, bool use_gpu) {
+#ifdef CC_HAVE_METAL
+    if (use_gpu) {
+        auto trunk = std::make_shared<MetalTrunkV2>(net);
+        if (trunk->ok())
+            return [trunk](const std::vector<std::vector<float>>& P) { return trunk->run(P); };
+    }
+#else
+    (void)use_gpu;
+#endif
+    const ChesskersNet* np = &net;
+    return [np](const std::vector<std::vector<float>>& P) { return np->trunk_v2_batch(P); };
+}
+
 // Run the local-job engine loop in run_dir. Claims jobs until `max_jobs` are handled
 // (>0) or — for the live fleet (max_jobs<=0) — until run_dir/STOP appears. Train games
 // are seeded base_seed + (train index) so a given job is reproducible regardless of
@@ -316,9 +337,17 @@ inline bool claim_job_local(const std::string& jobs_dir, int worker_id, std::str
 // The train net is run_dir/weights.bin (hot-reloaded on mtime, exactly like the Python
 // worker's weights.pt poll); match nets are the job's local cand_bin/opp_bin paths
 // (the orchestrator pre-fetched them). Returns the count handled.
+//
+// Phase 6f — GPU leaf batching: with batch_size>1 the engine claims up to batch_size TRAIN
+// jobs at once and plays them CONCURRENTLY through one shared batched trunk (use_gpu => the
+// Metal GPU). Game i is still seeded base_seed+(train index)+i, so the buffer chunks are
+// BYTE-IDENTICAL to the serial (batch_size=1) engine whenever the trunk forward is (CPU is;
+// Metal is ~1e-4-close). The batch shares the seed job's params (uniform within a run). Run
+// ONE such process on a GPU box in place of N CPU engines. batch_size=1 = the original path.
 inline int run_jobs_local(const std::string& run_dir, const std::string& start_fen,
                           int worker_id, const std::string& machine, uint64_t base_seed,
-                          int max_jobs = 0, long seq_start = 1) {
+                          int max_jobs = 0, long seq_start = 1, int batch_size = 1,
+                          bool use_gpu = false) {
     const char* g = std::getenv("CHESSCKERS_VALUE_DISCOUNT");
     const double gamma = g ? std::atof(g) : 1.0;
     const std::string jobs_dir = run_dir + "/jobs";
@@ -333,10 +362,51 @@ inline int run_jobs_local(const std::string& run_dir, const std::string& start_f
     Board start = parse_fen(start_fen);
     std::map<std::string, std::shared_ptr<ChesskersNet>> match_nets;  // path -> loaded net
     std::shared_ptr<ChesskersNet> train_net;
+    TrunkForwardFn train_forward;  // batched trunk for *train_net (rebuilt on net reload)
     fsx::file_time_type last_wt{};
     bool have_wt = false;
     int handled = 0, train_count = 0, match_count = 0;
     long seq = seq_start;
+    const bool batched = batch_size > 1;
+
+    // Play one gate (match) job: load its two local .bin nets, play, write the outcome.
+    auto play_match = [&](const std::string& body, const std::string& jseq) -> bool {
+        Job job = parse_job(body);
+        const MatchSpec& mm = job.match;
+        JsonValue v = parse_json(body);
+        const std::string cand_bin = v.get_str("cand_bin");
+        const std::string opp_bin = v.get_str("opp_bin");
+        auto load = [&](const std::string& path) -> std::shared_ptr<ChesskersNet> {
+            if (path.empty()) return nullptr;
+            auto it = match_nets.find(path);
+            if (it != match_nets.end()) return it->second;
+            std::shared_ptr<ChesskersNet> n;
+            try { n = std::make_shared<ChesskersNet>(path); } catch (...) { return nullptr; }
+            match_nets[path] = n;
+            return n;
+        };
+        auto cand = load(cand_bin), opp = load(opp_bin);
+        if (!cand || !opp) return false;
+        const ChesskersNet& white = mm.cand_white ? *cand : *opp;
+        const ChesskersNet& black = mm.cand_white ? *opp : *cand;
+        const uint64_t dseed = base_seed + (uint64_t)(match_count) * (uint64_t)(mm.max_plies + 1);
+        MatchGame mg = play_match_game(white, black, mm.seed_fen, mm.sims, mm.c_puct, mm.dir_alpha,
+                                       mm.dir_eps, mm.max_plies, dseed, gamma);
+        bool ok =
+            write_file_atomic(match_out + "/" + jseq + ".json", match_result_json(mm, mg.outcome));
+        ++match_count;
+        return ok;
+    };
+
+    // Write one finished train game to the buffer (chunk + best-effort .meta). seq advances.
+    auto write_train = [&](const PureGame& game) -> bool {
+        const std::string seed_fen = game.records.empty() ? start_fen : game.records.front().fen;
+        const std::string fn = client_filename(worker_id, seq++);
+        bool ok = write_file_atomic(buffer_dir + "/" + fn, encode_chunk(game));
+        write_file_atomic(buffer_dir + "/" + fn + ".meta",
+                          client_meta(worker_id, machine, game, seed_fen));
+        return ok;
+    };
 
     while (max_jobs <= 0 || handled < max_jobs) {
         if (fsx::exists(stop_path)) break;
@@ -349,6 +419,7 @@ inline int run_jobs_local(const std::string& run_dir, const std::string& start_f
                     train_net = std::make_shared<ChesskersNet>(weights_bin);
                     last_wt = wt;
                     have_wt = true;
+                    if (batched) train_forward = make_engine_trunk_forward(*train_net, use_gpu);
                 } catch (...) { /* mid-write — retry */ }
             }
         }
@@ -359,50 +430,60 @@ inline int run_jobs_local(const std::string& run_dir, const std::string& start_f
             continue;
         }
         Job job = parse_job(body);
-        bool ok = false;
         if (job.type == "match") {
-            const MatchSpec& mm = job.match;
-            JsonValue v = parse_json(body);
-            const std::string cand_bin = v.get_str("cand_bin");
-            const std::string opp_bin = v.get_str("opp_bin");
-            auto load = [&](const std::string& path) -> std::shared_ptr<ChesskersNet> {
-                if (path.empty()) return nullptr;
-                auto it = match_nets.find(path);
-                if (it != match_nets.end()) return it->second;
-                std::shared_ptr<ChesskersNet> n;
-                try { n = std::make_shared<ChesskersNet>(path); } catch (...) { return nullptr; }
-                match_nets[path] = n;
-                return n;
-            };
-            auto cand = load(cand_bin), opp = load(opp_bin);
-            if (cand && opp) {
-                const ChesskersNet& white = mm.cand_white ? *cand : *opp;
-                const ChesskersNet& black = mm.cand_white ? *opp : *cand;
-                const uint64_t dseed =
-                    base_seed + (uint64_t)(match_count) * (uint64_t)(mm.max_plies + 1);
-                MatchGame mg = play_match_game(white, black, mm.seed_fen, mm.sims, mm.c_puct,
-                                               mm.dir_alpha, mm.dir_eps, mm.max_plies, dseed, gamma);
-                ok = write_file_atomic(match_out + "/" + jseq + ".json",
-                                       match_result_json(mm, mg.outcome));
-                ++match_count;
-            }
-        } else if (job.type == "train" && train_net) {
+            bool ok = play_match(body, jseq);
+            fsx::remove(claimed, ec);
+            if (ok) ++handled;
+            continue;
+        }
+        if (job.type != "train" || !train_net) {
+            fsx::remove(claimed, ec);  // unknown type, or net not synced yet
+            continue;
+        }
+        if (!batched || !train_forward) {  // serial path (batch_size=1) — unchanged
             const ClientPlayParams& p = job.params;
             PureGame game = play_game_pure(
                 start, *train_net, p.n_sims, p.c_puct, p.temperature, p.temp_cutoff_plies,
                 p.max_plies, p.dirichlet_alpha, p.dirichlet_eps, base_seed + (uint64_t)train_count,
                 p.resign_threshold, p.resign_no_resign_frac, p.resign_consecutive, p.resign_min_ply,
                 gamma);
-            const std::string seed_fen = game.records.empty() ? start_fen : game.records.front().fen;
-            const std::string fn = client_filename(worker_id, seq++);
-            ok = write_file_atomic(buffer_dir + "/" + fn, encode_chunk(game));
-            // .meta best-effort (the chunk is the training payload; meta is dashboards).
-            write_file_atomic(buffer_dir + "/" + fn + ".meta",
-                              client_meta(worker_id, machine, game, seed_fen));
+            bool ok = write_train(game);
             ++train_count;
+            fsx::remove(claimed, ec);
+            if (ok) ++handled;
+            continue;
         }
-        fsx::remove(claimed, ec);  // release the slot (job done, skipped, or net not ready)
-        if (ok) ++handled;
+        // Batched train: this job seeds a batch; greedily claim up to batch_size-1 more train
+        // jobs (handling any match jobs inline), then play them all through one shared batched
+        // trunk. game i seeded base_seed+train_count+i — the same seeds, in the same order, the
+        // serial path would assign — so the chunks are byte-identical under a CPU trunk forward.
+        std::vector<std::string> claimed_paths{claimed};
+        const ClientPlayParams p = job.params;  // batch shares the seed job's params
+        while ((int)claimed_paths.size() < batch_size) {
+            std::string js2, cl2, body2;
+            if (!claim_job_local(jobs_dir, worker_id, js2, cl2, body2)) break;  // queue drained
+            Job j2 = parse_job(body2);
+            if (j2.type == "match") {
+                bool ok = play_match(body2, js2);
+                fsx::remove(cl2, ec);
+                if (ok) ++handled;
+                continue;
+            }
+            if (j2.type != "train") { fsx::remove(cl2, ec); continue; }
+            claimed_paths.push_back(cl2);
+        }
+        const int K = (int)claimed_paths.size();
+        std::vector<PureGame> games = play_games_batched_pure(
+            start, *train_net, K, K, p.n_sims, p.c_puct, p.temperature, p.temp_cutoff_plies,
+            p.max_plies, p.dirichlet_alpha, p.dirichlet_eps, base_seed + (uint64_t)train_count,
+            p.resign_threshold, p.resign_no_resign_frac, p.resign_consecutive, p.resign_min_ply,
+            gamma, train_forward);
+        for (int i = 0; i < K; ++i) {
+            bool ok = write_train(games[i]);
+            ++train_count;
+            fsx::remove(claimed_paths[i], ec);
+            if (ok) ++handled;
+        }
     }
     return handled;
 }

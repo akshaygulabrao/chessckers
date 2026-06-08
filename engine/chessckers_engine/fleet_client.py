@@ -318,7 +318,7 @@ class _EnginePool:
     engine the client owns, swapped Python->C++."""
 
     def __init__(self, binary: str, run_dir: Path, n: int, worker_id_base: int, seed: int,
-                 machine: str, log_dir: Path) -> None:
+                 machine: str, log_dir: Path, batch_size: int = 1, use_gpu: bool = False) -> None:
         self.binary = binary
         self.run_dir = run_dir
         self.n = max(1, n)
@@ -326,6 +326,8 @@ class _EnginePool:
         self.seed = seed
         self.machine = machine
         self.log_dir = log_dir
+        self.batch_size = max(1, batch_size)  # >1 => each engine GPU/CPU-batches its self-play
+        self.use_gpu = use_gpu
         self.procs: list = [None] * self.n
         self.logs: list = [None] * self.n
 
@@ -333,6 +335,10 @@ class _EnginePool:
         wid = self.worker_id_base + i
         cmd = [self.binary, "--jobs-local", "--run-dir", str(self.run_dir),
                "--worker-id", str(wid), "--seed", str(self.seed + i), "--machine", self.machine]
+        if self.batch_size > 1:
+            cmd += ["--batch-size", str(self.batch_size)]
+        if self.use_gpu:
+            cmd.append("--gpu")
         f = open(self.log_dir / f"engine-{wid}.log", "a")
         # cc_selfplay reads CHESSCKERS_START_FEN from the inherited env (the launcher exports it).
         self.procs[i] = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
@@ -732,6 +738,14 @@ def main() -> int:
                         "worker-id-base; engine i gets base+i).")
     p.add_argument("--engine-seed", type=int, default=0,
                    help="--spawn-engines: base RNG seed (engine i gets seed+i).")
+    p.add_argument("--engine-batch-size", type=int, default=1,
+                   help="--spawn-engines: each engine claims this many train jobs and plays them "
+                        "concurrently through one shared batched trunk (Phase 6f). 1 = serial (the "
+                        "default). On a GPU box pair this with --engine-gpu and --engine-workers 1.")
+    p.add_argument("--engine-gpu", action="store_true",
+                   help="--spawn-engines: engines batch self-play on the GPU (Metal on Apple). Only "
+                        "meaningful with --engine-batch-size >1; falls back to the CPU batched trunk "
+                        "if no GPU. ~2x self-play vs the CPU path on this Mac (more on a CUDA box).")
     p.add_argument("--update-cmd", default="",
                    help="Shell command that pulls + rebuilds this box's code when the server "
                         "advertises a newer version (e.g. 'cd ~/chessckers && git pull --ff-only "
@@ -775,10 +789,12 @@ def main() -> int:
         engine_pool = _EnginePool(
             binary=binary, run_dir=run_dir, n=args.engine_workers,
             worker_id_base=args.engine_worker_id_base, seed=args.engine_seed,
-            machine=os.environ.get("MACHINE", "unknown"), log_dir=run_dir)
+            machine=os.environ.get("MACHINE", "unknown"), log_dir=run_dir,
+            batch_size=args.engine_batch_size, use_gpu=args.engine_gpu)
         log.info("owning engines (lc0 client-drives, job-driven): %d x cc_selfplay --jobs-local "
-                 "(%s) | worker-id-base=%d queue-depth=%d", args.engine_workers, binary,
-                 args.engine_worker_id_base, args.queue_depth)
+                 "(%s) | worker-id-base=%d queue-depth=%d batch-size=%d gpu=%s", args.engine_workers,
+                 binary, args.engine_worker_id_base, args.queue_depth, args.engine_batch_size,
+                 args.engine_gpu)
     # A box plays gate games iff it owns the engine pool (cc_selfplay plays match jobs
     # natively); a pure orchestrator declines match jobs.
     can_match = args.spawn_engines

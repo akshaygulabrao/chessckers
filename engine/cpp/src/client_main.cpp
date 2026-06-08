@@ -55,10 +55,13 @@ int main(int argc, char** argv) {
             std::cerr << "cc_selfplay --jobs-local: --run-dir is required" << std::endl;
             return 2;
         }
+        int batch_size = std::atoi(arg_val(argc, argv, "--batch-size", "1").c_str());
+        bool use_gpu = has_flag(argc, argv, "--gpu");
         std::cout << "cc_selfplay: jobs-local run-dir=" << run_dir << " worker=" << worker_id
-                  << " machine=" << machine << std::endl;
+                  << " machine=" << machine << " batch-size=" << batch_size
+                  << " gpu=" << (use_gpu ? "on" : "off") << std::endl;
         int handled = cc::run_jobs_local(run_dir, start_fen, worker_id, machine, base_seed,
-                                         /*max_jobs*/ 0, /*seq_start*/ 1);
+                                         /*max_jobs*/ 0, /*seq_start*/ 1, batch_size, use_gpu);
         std::cout << "cc_selfplay: handled " << handled << " jobs" << std::endl;
         return 0;
     }
