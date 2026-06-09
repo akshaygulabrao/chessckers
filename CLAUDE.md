@@ -4,13 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Chessckers is a chess-vs-checkers hybrid game. The repository is now a single authoritative engine plus its training/operations tooling:
+Chessckers is a chess-vs-checkers hybrid game. The repository centers on one `engine/` tree (Python + C++) — now serving as the project's trainer, rules authority, and analysis tooling (production play + the fleet have moved to the lc0-ecosystem forks; see *Current role* below):
 
-- **engine** (`engine/`) — Python (managed by `uv`) + a native C++ extension (`chessckers_cpp`, built with `cmake`). This is the whole stack: the game logic (move generation, validation, FEN/UCI parsing), an AlphaZero-style neural engine (PUCT MCTS, self-play, training), and a terminal board renderer for debugging.
+- **engine** (`engine/`) — Python (managed by `uv`) + a native C++ extension (`chessckers_cpp`, built with `cmake`). It holds the game logic (move generation, validation, FEN/UCI parsing), an AlphaZero-style neural stack (model, encoders, PUCT MCTS, training), and a terminal board renderer.
 
-The game logic lives in **PyVariant** (`engine/chessckers_engine/variant_py/`), a pure-Python reimplementation of the Chessckers rules — the authoritative reference and the parity oracle for the C++ engine. PyVariant is the sole Python move-gen path (it has no native accelerator; the C++ extension owns the production hot path).
+**Current role (post lc0-split):** this repo is now the **trainer + rules authority + analysis tooling**, not the production player. The live, load-bearing piece is the continuous AlphaZero trainer `chessckers_engine.train_continuous`, which the lc0 fleet drives to produce nets (see *Run / train*). Production **self-play and fleet coordination moved out** to the lc0-ecosystem forks: `akshay-chessckers-0` (the lc0 engine fork) plays the games, `lczero-client` runs them, `lczero-server` coordinates. The in-repo C++ self-play client (`cc_selfplay`) and the old HTTP fleet (`scripts/launch_*.sh`, `fleet_client`/`fleet_server`) are **superseded** by that ecosystem and kept only as a parity reference / legacy. `scripts/watch_game.py` (analysis) and `chessckers.md` (rules spec) remain first-class here. See the `chessckers-lczero-fleet` and `chessckers-lc0-fork` memories.
 
-> History: the game logic used to live in three Scala/JS forks (`scalachess`, `server`, `chessground`) — all removed once PyVariant became the authority. A Rust move-gen accelerator (`chessckers_movegen`) then served as PyVariant's hot path and one of the C++ port's parity oracles; it was **retired** once the C++ engine became the sole production engine (lc0-split migration), leaving PyVariant as the single oracle. A 2GB backup of the forks exists at `~/chessckers-backups/forks-20260528.tar.gz`. The `git mv`'d formal spec (`chessckers.md`) and the engine are all that remain.
+The game logic lives in **PyVariant** (`engine/chessckers_engine/variant_py/`), a pure-Python reimplementation of the Chessckers rules — the authoritative reference and the parity oracle for the C++ port. Its main live consumer today is `scripts/watch_game.py`; it remains the rules authority of record, but the lc0 fork carries its own rules port and does not call back into this repo at runtime.
+
+> History: the game logic used to live in three Scala/JS forks (`scalachess`, `server`, `chessground`) — all removed once PyVariant became the authority. A Rust move-gen accelerator (`chessckers_movegen`) then served as PyVariant's hot path and one of the C++ port's parity oracles; it was **retired** once the C++ engine became the production engine (lc0-split migration), leaving PyVariant as the single oracle; production play has since moved once more, out to the `akshay-chessckers-0` lc0 fork. A 2GB backup of the forks exists at `~/chessckers-backups/forks-20260528.tar.gz`. The `git mv`'d formal spec (`chessckers.md`) and the engine are all that remain.
 
 ## Build & Run
 
@@ -23,7 +25,7 @@ uv sync                  # install Python deps into .venv
 
 ### C++ engine (lc0-style)
 
-The production engine is a native C++ self-play/search/inference build under `engine/cpp/` (pybind11 module `chessckers_cpp` + standalone `cc_selfplay` client), following lc0 as the reference architecture; **training stays in Python**. The C++ rules are held byte-equivalent to PyVariant (the sole oracle) via the parity tests in `tests/test_cpp_*.py`. After editing anything under `cpp/src/`, rebuild + reinstall into the venv:
+`engine/cpp/` is a native C++ self-play/search/inference build (pybind11 module `chessckers_cpp` + standalone `cc_selfplay` client), following lc0 as the reference architecture; **training stays in Python**. **It is no longer the production player** — the `akshay-chessckers-0` lc0 fork plays the fleet's games (it carries its own, byte-identical copy of `nn.hpp`/`nn_metal`). `engine/cpp/` is retained as the in-process engine for tooling and as the parity reference: its C++ rules are held byte-equivalent to PyVariant (the oracle) via the parity tests in `tests/test_cpp_*.py`. After editing anything under `cpp/src/`, rebuild + reinstall into the venv:
 
 ```
 cd engine
@@ -44,10 +46,18 @@ The `slow` marker tags end-to-end tests that spawn subprocess workers (self-play
 
 ### Run / train
 
-- `python -m chessckers_engine.selfplay_az_loop [...]` — AlphaZero self-play + training loop.
-- Operational scripts live in `scripts/`. The fleet is lc0-style (server-side trainer + self-play clients over HTTP) and now runs as **three FOREGROUND tabs**, each owning its terminal (logs stream in-tab; Ctrl-C stops that piece): `launch_server.sh` (trainer + arena + `fleet_server`), `launch_local.sh` (loopback self-play client), `launch_leena.sh` (local `ssh -t` wrapper → leena client over the LAN). Foreground is the macOS Local-Network-TCC fix for leena (an ssh-orphaned daemon is denied LAN access; a session-attached process is not). `deploy_fresh.sh` = destructive wipe + leena push, then prints the 3 tab commands; `stop_local.sh` = fleet-wide graceful STOP / kill-all safety net. Shared client shape in `fleet.env`. The on-leena script is still `launch_fleet_leena.sh` (invoked via ssh by `launch_leena.sh`; `FOREGROUND=1` attaches it). See the `project-fleet-lc0-contract` and `leena-fleet-blocked-by-localnetwork-tcc` memories.
+**Training is this repo's live job.** `chessckers_engine.train_continuous` is the continuous AlphaZero trainer: it ingests ccz1 game chunks into a rolling replay buffer, does non-stop SGD, and publishes `weights.pt` + a C++-loadable `weights.bin` on a timer. In the current fleet it is **driven by the lc0 ecosystem**, not launched here directly — `lczero-server/scripts/launch_trainer.sh` runs a bridge (`lczero-server/trainer/trainer_bridge.py`) that spawns `train_continuous`, feeds it the games the server collected, and uploads each fresh `weights.bin` back for promotion.
 
-The legacy HTTP layer is gone: there is no Scala server, no `ServerClient`, and no `python -m chessckers_engine` HTTP server. All game logic runs in-process via `PyVariantClient`. Some launch scripts still pass `--use-pyvariant`/`--use-server`; those flags are accepted as no-ops.
+**The current fleet lives in the lc0-ecosystem forks** (`~/AAworkspace/{lczero-server,lczero-client,akshay-chessckers-0}`), run as foreground tabs:
+- `lczero-server/scripts/launch_server.sh` — the lc0 server: collects ccz1 games, distributes nets, runs promotion matches (port 9830).
+- `lczero-server/scripts/launch_trainer.sh` — the trainer bridge → `chessckers_engine.train_continuous` (this repo).
+- `lczero-client/scripts/launch_client.sh` (+ `launch_leena.sh`) — self-play clients running the `akshay-chessckers-0` engine, uploading games to the server.
+
+See the `chessckers-lczero-fleet` and `chessckers-lc0-fork` memories.
+
+**Analysis:** `scripts/watch_game.py "<FEN>" [--device mps --sims N --explore 0]` — watch the trained net play both sides from any FEN, with the 10×10 board + WDL eval + top lines rendered each ply. It loads the net via its `.arch.json` sidecar, so V1/V2/V3 (incl. transformer trunks) all load correctly.
+
+**Superseded / legacy in this repo** (present but off the live path): `selfplay_az_loop` (synchronous self-play+train loop), the in-repo HTTP fleet (`scripts/launch_{server,local,leena}.sh`, `fleet_client`/`fleet_server`), and `cc_selfplay` as a player. The pre-lc0 Scala layer is fully gone — no Scala server, no `ServerClient`, no `python -m chessckers_engine` HTTP server; leftover `--use-pyvariant`/`--use-server` flags are accepted as no-ops.
 
 ## Architecture
 
@@ -59,7 +69,7 @@ A position is a `State` (`variant_py/state.py`): a python-chess `Board` (bitboar
 
 Key invariant: for every Black square, `stacks[sq]`'s top piece matches the bitboard top piece (King = `Black-King`, Stone = `Black-Pawn`). Bitboards are truth for the top piece; the overlay is truth for everything below.
 
-**Native acceleration:** the production hot path (Black move-gen + check predicate `black_can_capture_white_king`, plus White gen, apply, status, search, NN inference) lives in the C++ extension `engine/cpp/` and MUST stay equivalent to PyVariant — when you change a move-gen rule, change both PyVariant and the C++ source, rebuild with `cpp/build.sh`, and verify the `tests/test_cpp_*.py` parity tests stay green.
+**Native acceleration:** the C++ extension `engine/cpp/` reimplements the move-gen + check predicate (`black_can_capture_white_king`), White gen, apply, status, search, and NN inference, and MUST stay equivalent to PyVariant. A move-gen rule change now has **three** landing sites to keep in sync: PyVariant, `engine/cpp/` (rebuild with `cpp/build.sh`, verify `tests/test_cpp_*.py`), and the `akshay-chessckers-0` fork's own copy under `src/chessckers/` (the actual production player).
 
 **One Move per chain:** a full diagonal capture chain is computed inside the generator and emitted as a single move with the complete bitboard + overlay delta applied; `waypoints`/`chainHops` carry the path for disambiguation/display.
 
@@ -73,7 +83,7 @@ Key invariant: for every Black square, `stacks[sq]`'s top piece matches the bitb
 
 ### AlphaZero engine
 
-`model.py` (`ChesskersScorer`: policy + value heads), `encoding.py` (board/move tensors), `mcts_puct.py` (PUCT MCTS), `selfplay_az.py` (`play_az_game` — the reference self-play loop + parity oracle, used by `train_az`/`replay_buffer`/`native_search`) / `selfplay_az_loop.py` (synchronous collect-then-train loop), `inference_server.py` + `cross_inference.py` (batched GPU eval), `replay_buffer.py`, `train_az.py`, `trainer_loop.py`. **Production self-play no longer runs in Python**: the lc0-split cutover retired the Python self-play engine (`selfplay_worker_async`/`selfplay_workers_only`/`selfplay_az_async`); every fleet game is played by the native `cc_selfplay` engine (`cpp/`), which `fleet_client` owns. Self-play correctness depends on the move-gen + check detection above; `n_sims` should be ≥ 50 (lower yields degenerate visit distributions).
+`model.py` (`ChesskersScorer`: policy + value heads), `encoding.py` (board/move tensors), `mcts_puct.py` (PUCT MCTS), `selfplay_az.py` (`play_az_game` — the reference self-play loop + parity oracle, used by `train_az`/`replay_buffer`/`native_search`) / `selfplay_az_loop.py` (synchronous collect-then-train loop), `inference_server.py` + `cross_inference.py` (batched GPU eval), `replay_buffer.py`, `train_az.py`, `trainer_loop.py`. **Production self-play runs outside this repo**: the lc0-split cutover retired the Python self-play engine (`selfplay_worker_async`/`selfplay_workers_only`/`selfplay_az_async`); every fleet game is now played by the `akshay-chessckers-0` lc0 fork (run by `lczero-client`), which uploads ccz1 games to `lczero-server` for `train_continuous` to consume. (The intermediate `cc_selfplay`-owned-by-`fleet_client` setup is itself now superseded.) Self-play correctness depends on the move-gen + check detection above; `n_sims` should be ≥ 50 (lower yields degenerate visit distributions).
 
 ### FEN Extension
 
