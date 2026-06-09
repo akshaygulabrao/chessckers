@@ -120,7 +120,7 @@ def _print_analysis(turn: str, result, n_sims: int, top_n: int = TOP_N) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Watch a greedy (argmax) self-play game from a FEN.")
     ap.add_argument("fen", help="Chessckers start FEN, e.g. '8/8/8/8/3kk3/8/8/4K3[d4:kk,e4:kk] b - - 0 1'")
-    ap.add_argument("--weights", default="", help="checkpoint .pt (default: latest weights/run/iter-az-*.pt)")
+    ap.add_argument("--weights", default="", help="checkpoint .pt (default: latest weights/run/{weights.pt,iter-async-*.pt}, then base_wdl_v*.pt)")
     ap.add_argument("--sims", type=int, default=400)
     ap.add_argument("--explore", type=float, default=0.30,
                     help="root Dirichlet exploration-noise fraction (default 0.30 = 30 pct); the "

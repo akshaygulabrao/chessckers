@@ -353,8 +353,7 @@ class ChesskersScorer(nn.Module):
 
 
 class ChesskersScorerV2(nn.Module):
-    """Square-grounded successor to ChesskersScorer (research-backed; see the
-    `project-policy-head-redesign` memory).
+    """Square-grounded successor to ChesskersScorer (research-backed).
 
     The defect in V1 is that it pools the board trunk to a single global vector
     BEFORE scoring any move, so a move can't see the board features at the
