@@ -84,11 +84,15 @@ def _print_net_eval(model, fen: str, turn: str, device: str) -> None:
     network's un-searched read, distinct from the MCTS-backed `ev` per move."""
     import torch
 
-    from chessckers_engine.encoding import encode_position
+    from chessckers_engine.encoding import encoders_for
 
-    pos = encode_position(fen).unsqueeze(0).to(device)
+    enc_pos, _, _ = encoders_for(getattr(model, "VERSION", "v1"))
+    pos = enc_pos(fen).unsqueeze(0).to(device)
     with torch.no_grad():
-        emb = model._position_embedding(pos)
+        # V1 pools the trunk to a vector internally; V2/V3 keep the trunk spatial, so pool it
+        # here (mean over the 10x10) before the shared value/moves-left heads.
+        emb = (model._pooled(model._spatial(pos)) if getattr(model, "VERSION", "v1") == "v2"
+               else model._position_embedding(pos))
         wdl = torch.softmax(model.value_head(emb), dim=-1).reshape(-1)
         mlh = float(model.moves_left_head(emb).reshape(()).item())
     w, d, lose = (100.0 * wdl[0].item(), 100.0 * wdl[1].item(), 100.0 * wdl[2].item())
@@ -129,25 +133,28 @@ def main() -> int:
     args = ap.parse_args()
 
     import torch
-    from chessckers_engine.checkpoints import load_checkpoint
+    from chessckers_engine.checkpoints import load_scorer
     from chessckers_engine.mcts_puct import run_mcts
-    from chessckers_engine.model import ChesskersScorer
     from chessckers_engine.render_board import render_board
     from chessckers_engine.selfplay_az import _outcome_from_state
     from chessckers_engine.variant_py import PyVariantClient
 
-    model = ChesskersScorer(d_hidden=256, c_filters=96, n_blocks=4).to(args.device).eval()
+    model = None
     weights = None
     last_err: Exception | None = None
     for cand in _resolve_weights(args.weights):  # freshest first; weights.pt may be mid-write
         try:
-            load_checkpoint(model, cand)
+            # load_scorer reads the .arch.json sidecar and builds the EXACT arch (V1/V2/V3), so a
+            # tf=7 V3 checkpoint loads into a V3 model instead of silently dropping most weights
+            # into a V1 shell (the strict=False footgun this helper exists to close).
+            model = load_scorer(cand).to(args.device).eval()
             weights = cand
             break
         except Exception as e:  # noqa: BLE001 — try the next durable candidate
             last_err = e
     if weights is None:
         raise SystemExit(f"could not load any candidate checkpoint; last error: {last_err}")
+    assert model is not None  # set iff weights was set; the SystemExit above guards the None case
 
     seed = args.seed if args.seed >= 0 else int.from_bytes(os.urandom(4), "big")
     # run_mcts draws root Dirichlet noise from the GLOBAL torch RNG, so seed it
