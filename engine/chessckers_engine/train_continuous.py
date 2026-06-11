@@ -678,8 +678,7 @@ def main() -> int:
     lwin_steps = 0
     lwin_upd_ratio = 0.0       # last measured ||Δw|| / ||w|| (update-to-weight ratio)
     last_loss_log = time.time()
-    steps_at_loss = 0          # steps/s + games/s baselines for the combined [train] line's window
-    games_at_loss = 0
+    games_at_loss = 0          # games/s baseline for the combined [train] line's window
     sp_window: dict[str, int] = {}      # self-play games per machine; feeds the ~60s stats heartbeat
     last_sp_log = time.time()
     win_desc = ("off" if not args.window_games
@@ -788,17 +787,16 @@ def main() -> int:
         if now - last_loss_log >= args.log_seconds and lwin_steps:
             log_elapsed = max(now - last_loss_log, 1e-9)
             log.info("[train] step %d | policy=%.4f value=%.4f mlh=%.4f | gnorm=%.2f upd/w=%.1e "
-                     "| %.1f steps/s %.3f games/s | lr=%.2e buf=%d games_seen=%d/%s",
+                     "| %.3f games/s | lr=%.2e buf=%d window=%dg games_seen=%d/%s",
                      steps,
                      lwin_p / lwin_steps, lwin_v / lwin_steps, lwin_m / lwin_steps,
                      lwin_gnorm / lwin_steps, lwin_upd_ratio,
-                     (steps - steps_at_loss) / log_elapsed,
                      (games_seen - games_at_loss) / log_elapsed,
-                     _lr_at(steps), len(buf), games_seen, (args.max_games or "inf"))
+                     _lr_at(steps), len(buf), len(game_sizes), games_seen, (args.max_games or "inf"))
             lwin_p = lwin_v = lwin_m = 0.0
             lwin_gnorm = 0.0; lwin_steps = 0
             last_loss_log = now
-            steps_at_loss = steps; games_at_loss = games_seen
+            games_at_loss = games_seen
         if now - last_ckpt >= args.ckpt_seconds:
             ckpt_n += 1
             ckpt = run_dir / f"iter-async-{ckpt_n:04d}.pt"
