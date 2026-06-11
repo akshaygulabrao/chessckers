@@ -334,6 +334,43 @@ def _load_buffer_snapshot(path: Path) -> "dict | None":
         return None
 
 
+_STEP_STATE_VERSION = 1
+
+
+def _save_step_state(path: Path, steps: int, opt_state: "dict | None") -> None:
+    """Persist JUST the training clock (LR-schedule step counter) + SGD momentum,
+    decoupled from the large replay-buffer snapshot so it can be written on the
+    FREQUENT publish cadence (crash-safe) instead of only at clean shutdown. This is
+    what keeps `steps` from resetting to 0 after a SIGKILL / crash / reboot (the
+    buffer snapshot, written shutdown-only, would be stale or absent). Small (~MBs:
+    momentum buffers only). tmp + os.replace so a torn write can't clobber a good one."""
+    try:
+        tmp = path.with_suffix(".pkl.tmp")
+        with open(tmp, "wb") as f:
+            pickle.dump({"version": _STEP_STATE_VERSION, "steps": steps,
+                         "opt_state": opt_state}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except (OSError, pickle.PicklingError) as e:
+        log.warning("[train] step-state write failed (%s): %s", path.name, e)
+
+
+def _load_step_state(path: Path) -> "dict | None":
+    """Restore a sidecar written by _save_step_state, or None if absent/corrupt/stale."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as f:
+            st = pickle.load(f)
+        if not isinstance(st, dict) or st.get("version") != _STEP_STATE_VERSION:
+            return None
+        return st
+    except (OSError, pickle.UnpicklingError, EOFError, ValueError) as e:
+        log.warning("[train] ignoring step-state %s: %s", path.name, e)
+        return None
+
+
 def _publish(model: ChesskersScorer, weights_path: Path) -> None:
     """Atomically publish weights.pt (tmp + os.replace) so the sidecar / workers
     never read a half-written file."""
@@ -579,37 +616,50 @@ def main() -> int:
     # ramp / throttle pick up where they left off; (2) failing that, the archive's
     # most-recent games. Either stays RAM-resident (read once here, not per batch).
     # --no-prime forces a cold start (waits for --min-buffer).
+    step_state_path = run_dir / "train_state.pkl"
     snap = None if args.no_prime else _load_buffer_snapshot(snapshot_path)
+    # The training CLOCK (step counter + SGD momentum) persists via TWO sources: the
+    # buffer snapshot (clean-shutdown only) and the train_state sidecar (written every
+    # publish, so it survives a crash/SIGKILL). Resume from whichever is MORE ADVANCED
+    # — after a clean stop the snapshot wins (it's >= the last publish); after a crash
+    # the sidecar wins (the snapshot is stale/absent). This is what stops `steps` from
+    # resetting to 0 on a non-clean restart; it persists until reset_fleet wipes the run-dir.
+    step_state = None if args.no_prime else _load_step_state(step_state_path)
+    snap_steps = snap.get("steps", -1) if snap else -1
+    side_steps = step_state.get("steps", -1) if step_state else -1
+    if side_steps > snap_steps:
+        resume_steps, resume_opt = step_state["steps"], step_state.get("opt_state")
+    else:
+        resume_steps = snap.get("steps", 0) if snap else 0
+        resume_opt = snap.get("opt_state") if snap else None
     if snap is not None:
         buf = snap["buf"]
         log.info("[train] restored replay buffer snapshot: %d positions, %d games "
                  "(games_seen=%d) — warm resume", len(buf), len(snap["game_sizes"]), snap["games_seen"])
-        # Resume the OPTIMIZATION process too: the SGD momentum buffers (the step
-        # counter that drives the LR schedule is restored below). load_state_dict
-        # overwrites the param-group knobs with the snapshot's, so re-apply the
-        # CURRENT CLI knobs afterward — a restart to TWEAK --lr/--momentum/
-        # --weight-decay must still take effect; only the momentum BUFFERS carry
-        # over. Best-effort: an arch change (param-shape mismatch) falls back to
-        # fresh momentum, and the LR schedule still resumes from the saved step.
-        if snap.get("opt_state") is not None:
-            _HYPER = ("lr", "momentum", "weight_decay", "nesterov", "dampening")
-            fresh_hyper = [{k: g[k] for k in _HYPER if k in g} for g in opt.param_groups]
-            try:
-                opt.load_state_dict(snap["opt_state"])
-                for g, hp in zip(opt.param_groups, fresh_hyper):
-                    g.update(hp)
-                log.info("[train] resumed optimizer state (SGD momentum + LR schedule at step %d)",
-                         snap.get("steps", 0))
-            except (ValueError, KeyError, RuntimeError) as e:
-                log.warning("[train] could not resume optimizer state (%s) — fresh momentum; "
-                            "LR schedule still resumes at step %d", e, snap.get("steps", 0))
     elif archive and archive.enabled and not args.no_prime:
         buf = archive.load_recent(args.buffer_cap)
         if buf:
             log.info("[train] primed replay window from archive: %d positions (cap %d)", len(buf), args.buffer_cap)
     elif args.no_prime:
         log.info("[train] cold start (--no-prime): not priming from snapshot/archive; trainer waits for min_buffer")
-    steps = snap.get("steps", 0) if snap else 0   # resume the LR-schedule clock (warmup/decay)
+    # Resume the OPTIMIZATION process: the SGD momentum buffers. load_state_dict
+    # overwrites the param-group knobs with the saved ones, so re-apply the CURRENT
+    # CLI knobs afterward — a restart to TWEAK --lr/--momentum/--weight-decay must
+    # still take effect; only the momentum BUFFERS carry over. Best-effort: an arch
+    # change (param-shape mismatch) falls back to fresh momentum, and the LR schedule
+    # still resumes from the saved step.
+    if resume_opt is not None:
+        _HYPER = ("lr", "momentum", "weight_decay", "nesterov", "dampening")
+        fresh_hyper = [{k: g[k] for k in _HYPER if k in g} for g in opt.param_groups]
+        try:
+            opt.load_state_dict(resume_opt)
+            for g, hp in zip(opt.param_groups, fresh_hyper):
+                g.update(hp)
+            log.info("[train] resumed optimizer state (SGD momentum + LR schedule at step %d)", resume_steps)
+        except (ValueError, KeyError, RuntimeError) as e:
+            log.warning("[train] could not resume optimizer state (%s) — fresh momentum; "
+                        "LR schedule still resumes at step %d", e, resume_steps)
+    steps = resume_steps   # resume the LR-schedule clock (warmup/decay)
     games_seen = snap["games_seen"] if snap else 0
     positions_ingested = snap["positions_ingested"] if snap else len(buf)  # restores the replay-factor throttle state
     last_publish = last_ckpt = time.time()
@@ -735,6 +785,9 @@ def main() -> int:
                or (args.publish_seconds and now - last_publish >= args.publish_seconds))
         if pub:
             _publish(_pub_source(), weights_path)
+            # Crash-safe clock: persist steps + momentum on the publish cadence so a
+            # non-clean restart keeps the LR-schedule step counter (no reset to 0).
+            _save_step_state(step_state_path, steps, _to_cpu(opt.state_dict()))
             last_publish, last_pub_steps, last_pub_games = now, steps, games_seen
         # Frequent loss/health log (every --log-seconds) — the loss curve + LR-too-high
         # instruments (grad norm, update/weight ratio), without waiting a
