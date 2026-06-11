@@ -1,5 +1,5 @@
 """Export a ChesskersScorer state_dict to a flat binary the native C++ engine
-loads (cpp/src/nn.hpp). Keeps the inference weights portable and dependency-free
+loads (the `akshay-chessckers-0` fork's `nn.hpp`). Keeps the inference weights portable and dependency-free
 — no protobuf/ONNX/safetensors, just length-prefixed float32 tensors.
 
 Format (little-endian):

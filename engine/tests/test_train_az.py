@@ -1,9 +1,17 @@
+import pytest
 import torch
 
 from chessckers_engine.encoding import MOVE_D, POS_C
 from chessckers_engine.model import ChesskersScorer
 from chessckers_engine.selfplay_az import AZExample
-from chessckers_engine.train_az import _batch_loss, _example_loss, save_checkpoint, train_az
+from chessckers_engine.train_az import (
+    _batch_loss,
+    _discounted_wdl,
+    _example_loss,
+    _value_target,
+    save_checkpoint,
+    train_az,
+)
 
 INITIAL_FEN = (
     "pppppppp/kkkkkkkk/pppppppp/8/8/8/PPPPPPPP/RNBQKBNR"
@@ -122,6 +130,25 @@ def test_checkpoint_save_and_load_roundtrip(tmp_path):
 
 
 # ---- Mini-batched loss correctness (policy CE, WDL value CE, moves-left MSE) ----
+
+
+def test_value_target_blends_z_and_q():
+    """q_ratio mixes the search value q into the outcome target z; gamma shapes z
+    only; a None search value or q_ratio<=0 falls back to pure z."""
+    z = [1.0, 0.0, 0.0]          # STM won the game
+    q = [0.5, 0.4, 0.1]          # search is far less certain (mostly win, some draw)
+    # Off by default: pure z.
+    assert _value_target(z, q, 1.0, 1.0, 0.0) == z
+    # No recorded search value -> pure z even with q_ratio>0.
+    assert _value_target(z, None, 1.0, 1.0, 0.5) == z
+    # 50/50 blend (gamma=1 so z is undiscounted), still a valid distribution.
+    blended = _value_target(z, q, 1.0, 1.0, 0.5)
+    assert blended == pytest.approx([0.75, 0.2, 0.05])
+    assert sum(blended) == pytest.approx(1.0)
+    # gamma discounts the z term only; q stays raw.
+    zc = _discounted_wdl(z, 5.0, 0.5)
+    expected = [0.5 * zc[k] + 0.5 * q[k] for k in range(3)]
+    assert _value_target(z, q, 5.0, 0.5, 0.5) == pytest.approx(expected)
 
 
 def test_batch_loss_size_one_matches_example_loss():

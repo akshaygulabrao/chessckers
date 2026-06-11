@@ -70,10 +70,49 @@ def _example_loss(
 MLH_TARGET_SCALE = 40.0
 
 
+def _discounted_wdl(wdl: list[float], moves_left: float, gamma: float) -> list[float]:
+    """Pull a WDL outcome target toward the DRAW vertex by gamma**(plies_to_end-1),
+    so a position N plies from the win keeps only gamma**(N-1) of its decisive mass
+    and the rest moves to draw. This makes a FASTER win a strictly stronger target
+    than a slow one, giving the value head (and hence MCTS + policy) an incentive to
+    convert quickly — which flat ±1 targets cannot express. gamma>=1 => unchanged.
+
+    Generic over any soft WDL target: new = g·wdl + (1-g)·[0,1,0], which always stays
+    a valid distribution (sums to 1). The position one ply from the end (moves_left=1)
+    keeps full strength (g=1)."""
+    if gamma >= 1.0:
+        return wdl
+    g = gamma ** max(moves_left - 1.0, 0.0)
+    w, d, l = wdl
+    return [g * w, g * d + (1.0 - g), g * l]
+
+
+def _value_target(
+    wdl: list[float],
+    search_wdl: list[float] | None,
+    moves_left: float,
+    gamma: float,
+    q_ratio: float,
+) -> list[float]:
+    """Blend the (gamma-discounted) OUTCOME target z with the SEARCH's root value q:
+    ``(1 - q_ratio)·z + q_ratio·search_wdl``. The discount shapes z only (an incentive
+    to win faster); q is the search's position estimate, used raw. q_ratio>0 pulls the
+    value target toward what the search expects under best play, which removes the
+    conservatism that temperature / Dirichlet noise bake into the realized outcome.
+    Falls back to pure z when q_ratio<=0 or this example carries no search value
+    (search_wdl is None), so old / scalar-only chunks are unaffected."""
+    z = _discounted_wdl(wdl, moves_left, gamma)
+    if q_ratio <= 0.0 or search_wdl is None:
+        return z
+    return [(1.0 - q_ratio) * z[k] + q_ratio * search_wdl[k] for k in range(3)]
+
+
 def _batch_loss(
     model: ChesskersScorer,
     batch: list[AZExample],
     value_loss_fn: nn.Module | None = None,
+    gamma: float = 1.0,
+    q_ratio: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Mini-batched loss: trunk batched in one forward; WDL value head (cross-
     entropy vs the one-hot outcome) + moves-left head (MSE on scaled plies-to-
@@ -110,10 +149,12 @@ def _batch_loss(
     # inference priors can't drift apart.
     logits, wdl_logits, ml_pred = model.training_forward(positions, padded, mask)
 
-    # WDL value: cross-entropy against the one-hot Win/Draw/Loss outcome.
+    # WDL value: cross-entropy against the (optionally z↔q blended) Win/Draw/Loss target.
     wdl_targets = torch.tensor(
-        [ex.wdl_target for ex in batch], dtype=torch.float32, device=device,
-    )                                                            # (B, 3)
+        [_value_target(ex.wdl_target, ex.search_wdl, ex.moves_left_target, gamma, q_ratio)
+         for ex in batch],
+        dtype=torch.float32, device=device,
+    )                                                            # (B, 3), soft when gamma<1 or q_ratio>0
     value_loss = -(wdl_targets * torch.log_softmax(wdl_logits, dim=1)).sum(dim=1).mean()
     # Moves-left: MSE on scaled plies-to-end.
     ml_target = torch.tensor(

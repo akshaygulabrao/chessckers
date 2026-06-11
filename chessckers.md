@@ -95,9 +95,79 @@ In both cases all captures made along the way, and any promotion from crossing r
 
 All keys are on the 10×10 grid (files `z, a–h, i` with rim `z`/`i`; ranks `0–9` with rim `0`/`9`) — the notation never names a square off the grid. **Cadence is the discriminator:** a rim landing and an off-grid overshoot can share the same on-grid keys and the same `→<rest>` (e.g. `c2:g3~i1→h2` lands on i1; `c3:g3~i1→h2` overshoots past i1), and the leading `c<N>` is what tells them apart.
 
-*Worked example* (FEN `8/8/8/8/8/6k1/7R/K7[g3:sk] b - - 0 1`). A King-top `sk` tower on g3 ($n = 2$, so $k \in \{2, 3\}$), a White Rook on h2, the White King tucked on a1 (off g3's diagonals, so the Rook is the only target), Black to move. The Rook sits on g3's immediate diagonal, so the capture mandate fires. Hopping down-right, step 1 captures the Rook on h2. The tower offers two **distinct candidate hops**: $k = 2$, landing on the rim square **i1**; and $k = 3$, landing off the grid one step past i1. Both are legal *here* — each captures the Rook — but they are **separate moves, not one**: $k = 2$ has cadence 2 and lands on the rim, while $k = 3$ has cadence 3 and overshoots the grid, ending the turn (it never rests off the grid — it settles back). Neither continues in this position (from i1, no direction has an enemy within cadence 2), so each falls back to **h2**, the last on-board square its path occupied (now empty, the Rook captured). They reach the same square here, but they remain different candidates — and they are not always both legal: in another position one may be available and the other not, or the rim landing ($k = 2$) could continue a chain where the off-grid overshoot ($k = 3$) cannot. In the move notation the two are `c2:g3~i1→h2` and `c3:g3~i1→h2` — identical on-grid keys and rest, told apart by the leading cadence alone.
+*Worked example.* A King-top `sk` tower on g3 ($n = 2$, so $k \in \{2, 3\}$), a White Rook on h2, the White King tucked on a1 (off g3's diagonals, so the Rook is the only target), Black to move:
 
-*Worked example — cadence lock and the off-grid overshoot* (FEN `8/8/8/5k2/8/7R/8/4K2N[f5:sk] b - - 0 1`). The `sk` tower now on f5, the Rook on h3 (distance 2), a White Knight on h1, the White King on e1, Black to move. The Rook is at $d = 2$ with $n = 2$, so the only capturing hop has $k = 3$ — **cadence 3** — landing on the rim square **i2** (capturing the Rook in transit). From i2 the Knight on h1 is one step away, but a continuation must walk *exactly* cadence 3: i2 → h1 (capture Knight) → g0 (rim) → overshoots off the grid. The hop captured the Knight, so it is legal, and since it never rests off the grid it **settles on h1** — the last on-board square it crossed — and the turn ends. Net result: f5 captures Rook + Knight and rests on **h1** — written **`c3:f5~i2~g0→h1`** (g0 is the last on-grid square of the overshooting hop). Remove the Knight and that diagonal has no enemy, so the continuation is a non-move; the chain dead-ends on i2 and falls back to **h3**: **`c3:f5~i2→h3`** (Rook only). Contrast the cadence-2 version (tower on g4, Rook adjacent at $d=1$): there the same Knight is captured by a hop that *lands* on the rim at g0 (a rim dead-end), giving **`c2:g4~i2~g0→h1`**; here cadence 3 overshoots past g0. Both finish on h1, and the leading cadence reads them apart — `c2:…g0→h1` (rim landing) versus `c3:…g0→h1` (overshoot).
+```text
+   z  a  b  c  d  e  f  g  h  i
+ 9 ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
+ 8 ·  .  .  .  .  .  .  .  .  ·
+ 7 ·  .  .  .  .  .  .  .  .  ·
+ 6 ·  .  .  .  .  .  .  .  .  ·
+ 5 ·  .  .  .  .  .  .  .  .  ·
+ 4 ·  .  .  .  .  .  .  .  .  ·
+ 3 ·  .  .  .  .  .  .  sk .  ·
+ 2 ·  .  .  .  .  .  .  .  R  ·
+ 1 ·  K  .  .  .  .  .  .  .  ·
+ 0 ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
+   z  a  b  c  d  e  f  g  h  i
+```
+<sub>FEN `8/8/8/8/8/6k1/7R/K7[g3:sk] b - - 0 1` (render with `python -m chessckers_engine.render_board`). Glyphs: `·` rim, `.` empty board; `sk` reads bottom-to-top, so the King is on top.</sub>
+
+The Rook sits on g3's immediate diagonal, so the capture mandate fires. Hopping down-right, step 1 captures the Rook on h2. The tower offers two **distinct candidate hops**: $k = 2$, landing on the rim square **i1**; and $k = 3$, landing off the grid one step past i1. Both are legal *here* — each captures the Rook — but they are **separate moves, not one**: $k = 2$ has cadence 2 and lands on the rim, while $k = 3$ has cadence 3 and overshoots the grid, ending the turn (it never rests off the grid — it settles back). Neither continues in this position (from i1, no direction has an enemy within cadence 2), so each falls back to **h2**, the last on-board square its path occupied (now empty, the Rook captured). They reach the same square here, but they remain different candidates — and they are not always both legal: in another position one may be available and the other not, or the rim landing ($k = 2$) could continue a chain where the off-grid overshoot ($k = 3$) cannot. In the move notation the two are `c2:g3~i1→h2` and `c3:g3~i1→h2` — identical on-grid keys and rest, told apart by the leading cadence alone.
+
+Both candidates share the same walk — **g3 (1) → h2 (2, Rook captured) → i1 (3, rim)** — then fall back to the now-empty h2 to rest:
+
+```text
+   z  a  b  c  d  e  f  g  h  i
+ 9 ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
+ 8 ·  .  .  .  .  .  .  .  .  ·
+ 7 ·  .  .  .  .  .  .  .  .  ·
+ 6 ·  .  .  .  .  .  .  .  .  ·
+ 5 ·  .  .  .  .  .  .  .  .  ·
+ 4 ·  .  .  .  .  .  .  .  .  ·
+ 3 ·  .  .  .  .  .  .  1  .  ·
+ 2 ·  .  .  .  .  .  .  .  2  ·
+ 1 ·  K  .  .  .  .  .  .  .  3
+ 0 ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
+   z  a  b  c  d  e  f  g  h  i
+```
+
+*Worked example — cadence lock and the off-grid overshoot.* The `sk` tower now on f5, the Rook on h3 (distance 2), a White Knight on h1, the White King on e1, Black to move:
+
+```text
+   z  a  b  c  d  e  f  g  h  i
+ 9 ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
+ 8 ·  .  .  .  .  .  .  .  .  ·
+ 7 ·  .  .  .  .  .  .  .  .  ·
+ 6 ·  .  .  .  .  .  .  .  .  ·
+ 5 ·  .  .  .  .  .  sk .  .  ·
+ 4 ·  .  .  .  .  .  .  .  .  ·
+ 3 ·  .  .  .  .  .  .  .  R  ·
+ 2 ·  .  .  .  .  .  .  .  .  ·
+ 1 ·  .  .  .  .  K  .  .  N  ·
+ 0 ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
+   z  a  b  c  d  e  f  g  h  i
+```
+<sub>FEN `8/8/8/5k2/8/7R/8/4K2N[f5:sk] b - - 0 1` (render with `python -m chessckers_engine.render_board`).</sub>
+
+The Rook is at $d = 2$ with $n = 2$, so the only capturing hop has $k = 3$ — **cadence 3** — landing on the rim square **i2** (capturing the Rook in transit). From i2 the Knight on h1 is one step away, but a continuation must walk *exactly* cadence 3: i2 → h1 (capture Knight) → g0 (rim) → overshoots off the grid. The hop captured the Knight, so it is legal, and since it never rests off the grid it **settles on h1** — the last on-board square it crossed — and the turn ends. Net result: f5 captures Rook + Knight and rests on **h1** — written **`c3:f5~i2~g0→h1`** (g0 is the last on-grid square of the overshooting hop). Remove the Knight and that diagonal has no enemy, so the continuation is a non-move; the chain dead-ends on i2 and falls back to **h3**: **`c3:f5~i2→h3`** (Rook only). Contrast the cadence-2 version (tower on g4, Rook adjacent at $d=1$): there the same Knight is captured by a hop that *lands* on the rim at g0 (a rim dead-end), giving **`c2:g4~i2~g0→h1`**; here cadence 3 overshoots past g0. Both finish on h1, and the leading cadence reads them apart — `c2:…g0→h1` (rim landing) versus `c3:…g0→h1` (overshoot).
+
+The cadence-3 line walks **f5 (1) → g4 (2) → h3 (3, Rook) → i2 (4, rim landing) → h1 (5, Knight) → g0 (6, rim, overshoots)**, then settles back on h1 — the last board square it crossed:
+
+```text
+   z  a  b  c  d  e  f  g  h  i
+ 9 ·  ·  ·  ·  ·  ·  ·  ·  ·  ·
+ 8 ·  .  .  .  .  .  .  .  .  ·
+ 7 ·  .  .  .  .  .  .  .  .  ·
+ 6 ·  .  .  .  .  .  .  .  .  ·
+ 5 ·  .  .  .  .  .  1  .  .  ·
+ 4 ·  .  .  .  .  .  .  2  .  ·
+ 3 ·  .  .  .  .  .  .  .  3  ·
+ 2 ·  .  .  .  .  .  .  .  .  4
+ 1 ·  .  .  .  .  K  .  .  5  ·
+ 0 ·  ·  ·  ·  ·  ·  ·  6  ·  ·
+   z  a  b  c  d  e  f  g  h  i
+```
 
 **Promotion.** If any hop's path touches rank 1 — by landing there or by stepping through it on the way to a rim square — every Stone in the tower is promoted to a King *before* the next hop is considered. See §5 for the full statement.
 

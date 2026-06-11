@@ -1029,10 +1029,16 @@ def apply_black_move_known(state: State, move: dict[str, Any]) -> State:
 
     if move.get("deployCount") is not None:
         _apply_deploy(new_state, move)
+    elif move.get("chainHops") is not None:
+        # A diagonal capture chain is identified by chainHops and MUST dispatch
+        # here even when its net origin->landing displacement is orthogonal (a
+        # chain can start and end on the same rank/file, e.g. c3~e1~g3). Checking
+        # _is_orthogonal_move first would misroute it to _apply_charge, which
+        # walks the straight origin->dest line and captures whatever sits on it
+        # (e.g. a king two files away that the chain never touched).
+        _apply_chain_move(new_state, move)
     elif _is_orthogonal_move(move):
         _apply_charge(new_state, move)
-    elif move.get("chainHops") is not None:
-        _apply_chain_move(new_state, move)
     elif move.get("capture") is not None:
         _apply_diagonal_capture(new_state, move)
     else:

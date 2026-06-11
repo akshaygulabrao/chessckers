@@ -97,6 +97,7 @@ class AZExample:
     visit_distribution: list[float]  # probabilities, sum to ~1
     wdl_target: list[float]          # [P(win), P(draw), P(loss)] from STM POV — one-hot of the game outcome
     moves_left_target: float         # plies remaining from this position to game end
+    search_wdl: list[float] | None = None  # search root value [w,d,l], STM POV (Lever 3); None = not recorded
 
 
 def _outcome_from_state(state: dict[str, Any]) -> str:
@@ -319,9 +320,12 @@ def az_game_to_examples(game: AZGame, gamma: float | None = None) -> list[AZExam
     the policy — an incentive to win *faster*: a mate-in-1 line scores higher
     than a mate-in-3, which flat ±1 targets cannot distinguish. (Symmetric:
     the losing side's target also decays, so it learns to delay the loss.)"""
-    # WDL one-hot from the side-to-move's POV; win-SPEED is carried by the
-    # moves-left target (plies-to-end), so the old gamma value-discount is gone.
-    # `gamma` is accepted but ignored, for call-site compatibility.
+    # WDL one-hot from the side-to-move's POV. Stored RAW (undiscounted): the
+    # per-ply value discount now lives at TRAIN time (`_batch_loss(..., gamma=)`,
+    # driven by --value-discount / CHESSCKERS_VALUE_DISCOUNT), computed from the
+    # moves_left target. Keeping stored targets raw makes gamma a tunable
+    # hyperparameter (changeable without regenerating data) and applies it
+    # uniformly to lc0-fork chunks too. `gamma` here is accepted but ignored.
     if game.outcome == "draw":
         wdl_white, wdl_black = [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]
     elif game.outcome == "white":

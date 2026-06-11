@@ -65,6 +65,33 @@ class ResidualBlock(nn.Module):
         return torch.relu(out + x)
 
 
+class SEResidualBlock(nn.Module):
+    """V4 block: ResidualBlock + Squeeze-Excitation (lc0's SE-ResNet recalibration).
+    Conv→GN→ReLU→Conv→GN → SE(gate) → (+x) → ReLU. SE = global-avg-pool over the
+    10×10 map -> FC(c→c/r) → ReLU → FC(c/r→c) → sigmoid -> per-channel scale, giving
+    every block whole-board content-dependent context for ~2·c²/r params (cheap vs
+    attention). Classic scale-only SE (no bias term) to keep the C++/CUDA/Metal port
+    a pool + 2 GEMMs + sigmoid. GroupNorm is kept so batch-1 MCTS eval is unaffected."""
+
+    def __init__(self, c: int, se_ratio: int = 8):
+        super().__init__()
+        self.conv1 = nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.GroupNorm(num_groups=8, num_channels=c)
+        self.conv2 = nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.GroupNorm(num_groups=8, num_channels=c)
+        cr = max(1, c // se_ratio)
+        self.se_fc1 = nn.Linear(c, cr)
+        self.se_fc2 = nn.Linear(cr, c)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        s = out.mean(dim=(2, 3))                       # squeeze: (B, C)
+        s = torch.sigmoid(self.se_fc2(torch.relu(self.se_fc1(s))))  # excite: (B, C)
+        out = out * s.unsqueeze(-1).unsqueeze(-1)      # scale each channel
+        return torch.relu(out + x)
+
+
 class TransformerBlock2d(nn.Module):
     """Pre-norm Transformer encoder block over a (B, C, H, W) feature map: the
     H×W grid is read as a sequence of H·W tokens (each a C-dim square embedding)
@@ -119,7 +146,8 @@ class _AddSpatialPosEmb(nn.Module):
 
 
 def _residual_first_trunk(
-    c_filters: int, n_res: int, n_tf: int, n_heads: int, ff_mult: int
+    c_filters: int, n_res: int, n_tf: int, n_heads: int, ff_mult: int,
+    res_factory=None,
 ) -> list[nn.Module]:
     """Interleave `n_res` ResidualBlocks with `n_tf` TransformerBlock2ds,
     residual-FIRST and evenly spread. ResTNet (IJCAI'25) found a conv block
@@ -127,10 +155,11 @@ def _residual_first_trunk(
     ordering); this emits a ResidualBlock every step and drops in transformers so
     their running count tracks the fraction of conv blocks placed so far — so the
     body always opens with a conv and never stacks a transformer before one."""
+    mk_res = res_factory or ResidualBlock
     blocks: list[nn.Module] = []
     placed = 0
     for i in range(n_res):
-        blocks.append(ResidualBlock(c_filters))
+        blocks.append(mk_res(c_filters))
         due = round(n_tf * (i + 1) / n_res)
         while placed < due:
             blocks.append(TransformerBlock2d(c_filters, n_heads, ff_mult))
@@ -391,6 +420,7 @@ class ChesskersScorerV2(nn.Module):
         n_tf_blocks: int = 0,
         n_heads: int = 4,
         tf_ff_mult: int = 4,
+        se_ratio: int = 0,
     ):
         super().__init__()
         if d_move != MOVE_D_V2:
@@ -401,12 +431,18 @@ class ChesskersScorerV2(nn.Module):
                 "transformer trunk"
             )
         self.c_filters = c_filters
+        self.se_ratio = se_ratio
         # Full reconstruction recipe (see ChesskersScorer.arch). n_tf_blocks=0 →
         # pure ResNet trunk; >0 interleaves Transformer blocks (residual-first).
+        # se_ratio>0 makes every residual block an SEResidualBlock -> this is V4
+        # (the SE-ResNet generation); the version string reflects it so the
+        # .arch.json sidecar rebuilds the exact net (incl. SE) on load.
         self.arch = {
-            "version": "v2", "d_hidden": d_hidden, "c_filters": c_filters,
+            "version": "v4" if se_ratio > 0 else "v2",
+            "d_hidden": d_hidden, "c_filters": c_filters,
             "n_blocks": n_blocks, "n_tf_blocks": n_tf_blocks,
             "n_heads": n_heads, "tf_ff_mult": tf_ff_mult,
+            "se_ratio": se_ratio,
         }
         # Spatial trunk: initial conv + (residual tower, optionally interleaved
         # with Transformer blocks), NO flatten/pool. Output stays
@@ -420,13 +456,15 @@ class ChesskersScorerV2(nn.Module):
             nn.GroupNorm(num_groups=8, num_channels=c_filters),
             nn.ReLU(inplace=True),
         ]
+        def _res(c: int) -> nn.Module:  # V4 -> SE block, else plain residual
+            return SEResidualBlock(c, se_ratio) if se_ratio > 0 else ResidualBlock(c)
         if n_tf_blocks > 0:
             body: list[nn.Module] = [
                 _AddSpatialPosEmb(c_filters),
-                *_residual_first_trunk(c_filters, n_blocks, n_tf_blocks, n_heads, tf_ff_mult),
+                *_residual_first_trunk(c_filters, n_blocks, n_tf_blocks, n_heads, tf_ff_mult, _res),
             ]
         else:
-            body = [ResidualBlock(c_filters) for _ in range(n_blocks)]
+            body = [_res(c_filters) for _ in range(n_blocks)]
         self.position_trunk = nn.Sequential(*stem, *body)
         # Value/moves-left path: global-pool the spatial map, then a bottleneck.
         self.value_trunk = nn.Sequential(
@@ -594,6 +632,7 @@ def build_model(version: str = "v1", **arch):
     d_hidden/c_filters/n_blocks (and optionally c_in/d_move); a `version` key is
     consumed HERE so the same dict can be splatted at every construction site
     (build_model(**model_arch)). Default 'v1' keeps every existing caller — the
-    whole fleet — byte-identical until a run opts into 'v2'."""
-    cls = ChesskersScorerV2 if version == "v2" else ChesskersScorer
+    whole fleet — byte-identical until a run opts into 'v2'. 'v4' is the SE-ResNet
+    generation: same gather-head class as v2, with se_ratio>0 selecting SE blocks."""
+    cls = ChesskersScorerV2 if version in ("v2", "v4") else ChesskersScorer
     return cls(**arch)

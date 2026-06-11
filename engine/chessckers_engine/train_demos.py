@@ -3,9 +3,9 @@
 Loads human-played games from a JSONL file, extracts the (fen, move, target)
 triples for the specified color's moves, and runs supervised training (using
 the existing `train.train`) to imitate them. The trained checkpoint is
-intended to be used as `--base` for `selfplay_az_loop`, giving AZ self-play a
-non-random starting policy that already encodes whatever strategic patterns
-the human demonstrated.
+intended to be used as `--base` for the trainer (`train_continuous` / `train_az`),
+giving AZ self-play a non-random starting policy that already encodes whatever
+strategic patterns the human demonstrated.
 
 CLI:
     uv run python -m chessckers_engine.train_demos \

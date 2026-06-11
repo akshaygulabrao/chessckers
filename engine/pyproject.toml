@@ -28,8 +28,3 @@ testpaths = ["tests"]
 markers = [
     "slow: end-to-end tests that spawn subprocesses; opt in with -m slow",
 ]
-
-[dependency-groups]
-dev = [
-    "pybind11>=3",
-]

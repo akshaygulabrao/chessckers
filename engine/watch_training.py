@@ -1,5 +1,5 @@
 """Live training monitor — progress, ETA, and a liveness heartbeat for a
-selfplay_az_loop run, by tailing its log file (no changes to the trainer).
+training run (e.g. train_continuous), by tailing its log file (no changes to the trainer).
 
 Answers the three things a raw log doesn't: how far along, when it will
 finish, and whether it's still actually advancing (or hung/crashed).

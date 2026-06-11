@@ -6,7 +6,6 @@
   "exclude": [
     "**/__pycache__",
     ".venv",
-    "cpp/build",
     "games",
     "runs",
     "wandb",

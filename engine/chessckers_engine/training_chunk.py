@@ -16,6 +16,7 @@ Schema (the gunzipped bytes are UTF-8 JSON):
                    "legal_moves": [ <PyVariantClient move dict>, ... ],
                    "visit_distribution": [float, ...],   # aligned with legal_moves
                    "wdl_target": [float, float, float],
+                   "search_wdl": [float, float, float] or null,  # search root value (Lever 3); optional
                    "moves_left_target": float}, ...]}
 
 one entry per AZExample, faithfully. ``legal_moves`` are the move dicts verbatim
@@ -55,6 +56,7 @@ def encode_chunk(examples: list[AZExample]) -> bytes:
                 "legal_moves": e.legal_moves,
                 "visit_distribution": e.visit_distribution,
                 "wdl_target": e.wdl_target,
+                "search_wdl": e.search_wdl,
                 "moves_left_target": e.moves_left_target,
             }
             for e in examples
@@ -85,6 +87,7 @@ def decode_chunk(data: bytes) -> list[AZExample]:
                 visit_distribution=x["visit_distribution"],
                 wdl_target=x["wdl_target"],
                 moves_left_target=x["moves_left_target"],
+                search_wdl=x.get("search_wdl"),  # optional: absent in pre-Lever-3 / scalar-only chunks
             )
             for x in payload["examples"]
         ]

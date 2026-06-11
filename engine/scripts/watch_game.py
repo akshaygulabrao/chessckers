@@ -29,6 +29,28 @@ _ENG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../engine
 TOP_N = 3       # candidate moves ("lines") to show per position
 PV_MAX = 8      # plies of principal-variation continuation to show per line
 
+# The simplified training start (White's 8 pawns + king vs three 2-King towers on
+# d6/e6/f6) — the default replay/watch position; mirrors the engine's kStartposFen.
+DEFAULT_START_FEN = "8/8/3kkk2/8/8/8/PPPPPPPP/4K3[d6:kk,e6:kk,f6:kk] w - - 0 1"
+
+_RESULT_TOKENS = {"1-0", "0-1", "1/2-1/2", "*"}
+
+
+def _parse_movelist(s: str) -> list[str]:
+    """Tokens from a movelist / raw selfplay PGN line. Drops a leading 'PGN:', and
+    stops at the game result ('1-0' etc.) or any trailing '{...}' comment (e.g.
+    '{OL: 0}'). Inline move annotations like 'f6g6{1}' / 'd6c5[1]' are kept — they
+    are part of the Chessckers UCI and match PyVariant's emitted uci exactly."""
+    s = s.strip()
+    if s.startswith("PGN:"):
+        s = s[len("PGN:"):]
+    out: list[str] = []
+    for tok in s.split():
+        if tok in _RESULT_TOKENS or tok.startswith("{"):
+            break
+        out.append(tok)
+    return out
+
 
 def _resolve_weights(arg: str) -> list[str]:
     """Ordered checkpoint candidates, freshest first. The async/continuous
@@ -117,9 +139,55 @@ def _print_analysis(turn: str, result, n_sims: int, top_n: int = TOP_N) -> None:
         print(f"    {i}. {uci:<14} {pct:5.1f}%  ev {ev:+.2f}  n={c.visits:<4} {cont}")
 
 
+def _replay(args, client, state, model, show_board, outcome_from_state) -> int:
+    """Replay --moves token-by-token from `state`, rendering each ply (and the net's
+    WDL eval unless --no-eval). Each token is fed straight to make_move: PyVariant's
+    emitted uci matches the selfplay PGN tokens exactly (cadence/deploy/sub-move)."""
+    toks = _parse_movelist(args.moves)
+    if not toks:
+        raise SystemExit("--moves had no playable tokens")
+    print(f"replaying {len(toks)} plies"
+          + ("" if args.no_eval else f"  (net WDL each ply; weights loaded)") + "\n")
+    for ply, tok in enumerate(toks, 1):
+        if model is not None:
+            _print_net_eval(model, state["fen"], state["turn"], args.device)  # mover-POV WDL
+        try:
+            state = client.make_move(state["fen"], tok)
+        except Exception as e:  # noqa: BLE001 — surface the bad token + legal set to debug
+            print(f"\n!! ply {ply}: could not apply token {tok!r}: {e}")
+            legal = [m["uci"] for m in (state.get("legalMoves") or [])]
+            print(f"   {len(legal)} legal here: {legal[:40]}")
+            return 1
+        show_board(ply, tok, state["fen"])
+        if args.delay:
+            time.sleep(args.delay)
+        if state.get("status"):
+            break
+    status = state.get("status")
+    plies = ply
+    if status:
+        outcome = outcome_from_state(state)
+        print(f"\n######## {outcome.upper()} WINS ({status}) in {plies} plies ########"
+              if outcome != "draw" else f"\n######## DRAW ({status}) in {plies} plies ########")
+    else:
+        print(f"\n######## replay ended at {plies} plies — game not terminal here ########")
+    return 0
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Watch a greedy (argmax) self-play game from a FEN.")
-    ap.add_argument("fen", help="Chessckers start FEN, e.g. '8/8/8/8/3kk3/8/8/4K3[d4:kk,e4:kk] b - - 0 1'")
+    ap = argparse.ArgumentParser(
+        description="Watch a greedy (argmax) self-play game from a FEN, OR replay a "
+                    "given movelist (--moves) — e.g. paste a selfplay PGN line.")
+    ap.add_argument("fen", nargs="?", default=DEFAULT_START_FEN,
+                    help=f"Chessckers start FEN (default: the simplified training start "
+                         f"{DEFAULT_START_FEN!r})")
+    ap.add_argument("--moves", default="",
+                    help="replay this movelist instead of having the net play. Accepts a raw "
+                         "selfplay PGN line (a leading 'PGN:' and a trailing result/'{OL...}' "
+                         "comment are ignored). Each token is a Chessckers UCI, e.g. "
+                         "'a2a4 e6f7 c3:h5~e2->e2 d6c5[1] ...'.")
+    ap.add_argument("--no-eval", action="store_true",
+                    help="replay only: skip loading the net / printing per-ply WDL eval (faster).")
     ap.add_argument("--weights", default="", help="checkpoint .pt (default: latest weights/run/{weights.pt,iter-async-*.pt}, then base_wdl_v*.pt)")
     ap.add_argument("--sims", type=int, default=400)
     ap.add_argument("--explore", type=float, default=0.30,
@@ -139,22 +207,26 @@ def main() -> int:
     from chessckers_engine.selfplay_az import _outcome_from_state
     from chessckers_engine.variant_py import PyVariantClient
 
+    replay = bool(args.moves)
+    need_model = not (replay and args.no_eval)  # replay --no-eval needs no net at all
+
     model = None
     weights = None
-    last_err: Exception | None = None
-    for cand in _resolve_weights(args.weights):  # freshest first; weights.pt may be mid-write
-        try:
-            # load_scorer reads the .arch.json sidecar and builds the EXACT arch (V1/V2/V3), so a
-            # tf=7 V3 checkpoint loads into a V3 model instead of silently dropping most weights
-            # into a V1 shell (the strict=False footgun this helper exists to close).
-            model = load_scorer(cand).to(args.device).eval()
-            weights = cand
-            break
-        except Exception as e:  # noqa: BLE001 — try the next durable candidate
-            last_err = e
-    if weights is None:
-        raise SystemExit(f"could not load any candidate checkpoint; last error: {last_err}")
-    assert model is not None  # set iff weights was set; the SystemExit above guards the None case
+    if need_model:
+        last_err: Exception | None = None
+        for cand in _resolve_weights(args.weights):  # freshest first; weights.pt may be mid-write
+            try:
+                # load_scorer reads the .arch.json sidecar and builds the EXACT arch (V1/V2/V3), so a
+                # tf=7 V3 checkpoint loads into a V3 model instead of silently dropping most weights
+                # into a V1 shell (the strict=False footgun this helper exists to close).
+                model = load_scorer(cand).to(args.device).eval()
+                weights = cand
+                break
+            except Exception as e:  # noqa: BLE001 — try the next durable candidate
+                last_err = e
+        if weights is None:
+            raise SystemExit(f"could not load any candidate checkpoint; last error: {last_err}")
+        assert model is not None  # set iff weights was set; the SystemExit above guards the None case
 
     seed = args.seed if args.seed >= 0 else int.from_bytes(os.urandom(4), "big")
     # run_mcts draws root Dirichlet noise from the GLOBAL torch RNG, so seed it
@@ -174,6 +246,11 @@ def main() -> int:
         print(render_board(fen))
 
     show_board(0, None, state["fen"])
+
+    if replay:
+        return _replay(args, client, state, model, show_board, _outcome_from_state)
+
+    assert model is not None  # non-replay path always loads the net (need_model)
     ply = 0
     while not state.get("status") and ply < args.max_plies:
         if not (state.get("legalMoves") or []):

@@ -43,6 +43,7 @@ def _game() -> list[AZExample]:
             ],
             visit_distribution=[0.7, 0.3],
             wdl_target=[1.0, 0.0, 0.0],
+            search_wdl=[0.8, 0.15, 0.05],   # Lever 3: search value present on this example
             moves_left_target=12.0,
         ),
         AZExample(
@@ -70,6 +71,7 @@ def test_roundtrip_preserves_every_field():
         assert b.legal_moves == a.legal_moves   # move dicts verbatim (incl. None values)
         assert b.visit_distribution == a.visit_distribution
         assert b.wdl_target == a.wdl_target
+        assert b.search_wdl == a.search_wdl     # incl. None on the example with no search value
         assert b.moves_left_target == pytest.approx(a.moves_left_target)
 
 
