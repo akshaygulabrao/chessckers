@@ -454,7 +454,8 @@ def main() -> int:
     p.add_argument("--publish-seconds", type=float, default=45.0, help="how often to publish weights.pt to self-play")
     p.add_argument("--ckpt-seconds", type=float, default=300.0, help="how often to save an iter ckpt + log stats")
     p.add_argument("--log-seconds", type=float, default=30.0,
-                   help="how often to log a [loss] line (policy/value/mlh + grad-norm, clip-fraction, "
+                   help="how often to log the combined [train] line (policy/value/mlh + grad-norm, "
+                        "update/weight ratio + steps/s, games/s, lr, buf) — the single periodic line; "
                         "update/weight ratio) — decoupled from --ckpt-seconds so you see the loss curve "
                         "without waiting a whole checkpoint interval")
     p.add_argument("--device", default="auto", help="train device (auto -> mps if available)")
@@ -670,15 +671,16 @@ def main() -> int:
     last_buf_snap = time.time()           # periodic replay-buffer snapshot timer (--buffer-snapshot-seconds)
     win_cap = _window_cap(games_seen, args.window_games_min, args.window_games, args.window_ramp_alpha)  # live window cap (ramps)
     ckpt_n = 0
-    win_p = win_v = win_m = 0.0
-    win_steps = 0
-    # Frequent [loss] window (reset every --log-seconds, independent of the ckpt window).
+    win_steps = 0   # steps in the ckpt window (feeds the fleet_status heartbeat rate)
+    # Frequent combined [train] window (reset every --log-seconds).
     lwin_p = lwin_v = lwin_m = 0.0
     lwin_gnorm = 0.0            # sum of pre-clip grad L2 norms
     lwin_steps = 0
     lwin_upd_ratio = 0.0       # last measured ||Δw|| / ||w|| (update-to-weight ratio)
     last_loss_log = time.time()
-    sp_window: dict[str, int] = {}      # self-play games per machine since the last [selfplay] rollup
+    steps_at_loss = 0          # steps/s + games/s baselines for the combined [train] line's window
+    games_at_loss = 0
+    sp_window: dict[str, int] = {}      # self-play games per machine; feeds the ~60s stats heartbeat
     last_sp_log = time.time()
     win_desc = ("off" if not args.window_games
                 else f"{args.window_games_min}->{args.window_games}g ramp@a{args.window_ramp_alpha:g}"
@@ -697,7 +699,7 @@ def main() -> int:
             buf.extend(new_ex)
             games_seen += len(metas)
             positions_ingested += len(new_ex)
-            for m in metas:  # tally per-machine self-play for the ~60s [selfplay] rollup
+            for m in metas:  # tally per-machine self-play for the ~60s stats heartbeat
                 mach = m.get("machine", "?")
                 sp_window[mach] = sp_window.get(mach, 0) + 1
                 game_sizes.append(int(m.get("kept", 0)))  # per-game size for the window
@@ -726,15 +728,6 @@ def main() -> int:
         if sp_now - last_sp_log >= 60.0:
             elapsed = sp_now - last_sp_log
             _write_stats((steps - steps_at_splog) / elapsed, sum(sp_window.values()) / elapsed)
-            if sp_window:
-                backlog = sum(1 for _ in buffer_dir.glob("*.pkl"))
-                split = " ".join(f"{k}:{v}" for k, v in sorted(sp_window.items()))
-                win_now = (_window_cap(games_seen, args.window_games_min, args.window_games,
-                                       args.window_ramp_alpha) if args.window_games else 0)
-                log.info("[selfplay] +%d games/%ds across workers | %s | buffer backlog=%d%s | %.1f steps/s",
-                         sum(sp_window.values()), int(elapsed), split, backlog,
-                         (f" | window={win_now}/{args.window_games}g" if win_now else ""),
-                         (steps - steps_at_splog) / elapsed)
             sp_window = {}
             last_sp_log = sp_now
             steps_at_splog = steps
@@ -773,7 +766,7 @@ def main() -> int:
             lwin_upd_ratio = float((w_after - w_before).norm() / (w_before.norm() + 1e-12))
         steps += 1
         _update_ema()                        # Phase 2: track the published EMA (no-op if off)
-        win_p += float(p_loss.item()); win_v += float(v_loss.item()); win_m += float(ml_loss.item()); win_steps += 1
+        win_steps += 1
         lwin_p += float(p_loss.item()); lwin_v += float(v_loss.item()); lwin_m += float(ml_loss.item()); lwin_steps += 1
         lwin_gnorm += gnorm
 
@@ -793,14 +786,19 @@ def main() -> int:
         # instruments (grad norm, update/weight ratio), without waiting a
         # whole --ckpt-seconds interval. Saves nothing to disk; pure stdout.
         if now - last_loss_log >= args.log_seconds and lwin_steps:
-            log.info("[loss] step %d | policy=%.4f value=%.4f mlh=%.4f | gnorm=%.2f "
-                     "upd/w=%.1e | lr=%.2e",
+            log_elapsed = max(now - last_loss_log, 1e-9)
+            log.info("[train] step %d | policy=%.4f value=%.4f mlh=%.4f | gnorm=%.2f upd/w=%.1e "
+                     "| %.1f steps/s %.3f games/s | lr=%.2e buf=%d games_seen=%d/%s",
                      steps,
                      lwin_p / lwin_steps, lwin_v / lwin_steps, lwin_m / lwin_steps,
-                     lwin_gnorm / lwin_steps, lwin_upd_ratio, _lr_at(steps))
+                     lwin_gnorm / lwin_steps, lwin_upd_ratio,
+                     (steps - steps_at_loss) / log_elapsed,
+                     (games_seen - games_at_loss) / log_elapsed,
+                     _lr_at(steps), len(buf), games_seen, (args.max_games or "inf"))
             lwin_p = lwin_v = lwin_m = 0.0
             lwin_gnorm = 0.0; lwin_steps = 0
             last_loss_log = now
+            steps_at_loss = steps; games_at_loss = games_seen
         if now - last_ckpt >= args.ckpt_seconds:
             ckpt_n += 1
             ckpt = run_dir / f"iter-async-{ckpt_n:04d}.pt"
@@ -811,15 +809,9 @@ def main() -> int:
             elapsed = max(now - last_ckpt, 1e-9)
             steps_per_s = win_steps / elapsed
             games_per_s = (games_seen - games_at_ckpt) / elapsed
-            log.info("[train] step %d | policy=%.4f value=%.4f mlh=%.4f | %.1f steps/s %.3f games/s "
-                     "| lr=%.2e buf=%d games_seen=%d/%s",
-                     steps,
-                     win_p / max(win_steps, 1), win_v / max(win_steps, 1), win_m / max(win_steps, 1),
-                     steps_per_s, games_per_s, _lr_at(steps),
-                     len(buf), games_seen, (args.max_games or "inf"))
             log.info("[ckpt] saved %s | step %d |%s", ckpt.name, steps, arch_stat)
-            _write_stats(steps_per_s, games_per_s)
-            win_p = win_v = win_m = 0.0; win_steps = 0; last_ckpt = now; games_at_ckpt = games_seen
+            _write_stats(steps_per_s, games_per_s)  # JSON heartbeat for fleet_status.py
+            win_steps = 0; last_ckpt = now; games_at_ckpt = games_seen
         if args.buffer_snapshot_seconds and now - last_buf_snap >= args.buffer_snapshot_seconds:
             _save_buffer_snapshot(snapshot_path, buf, game_sizes, games_seen, positions_ingested,
                                   steps, _to_cpu(opt.state_dict()))
