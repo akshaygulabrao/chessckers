@@ -11,8 +11,16 @@ renders the 10x10 board live, then the net's raw WDL eval + moves-left estimate
 MCTS policy probability (visits), value (mover's POV), and the principal
 variation. Defaults to the latest ckpt.
 
+This is THE tool for inspecting a self-play game — whether watching the net play
+live, replaying a PGN movelist, or replaying a RECORDED game (a ccz1 chunk from
+the server / DB). Reach for --chunk instead of hand-decoding chunks: the move a
+game actually played is SAMPLED from the visit counts, so it is NOT the visit-
+argmax, and only this path (FEN-matched reconstruction) renders the real game.
+
   cd engine
-  .venv/bin/python scripts/watch_game.py "8/8/8/8/3kk3/8/8/4K3[d4:kk,e4:kk] b - - 0 1"
+  .venv/bin/python scripts/watch_game.py "8/8/8/8/3kk3/8/8/4K3[d4:kk,e4:kk] b - - 0 1"   # net plays
+  .venv/bin/python scripts/watch_game.py --moves "<selfplay PGN line>" --no-eval         # replay a movelist
+  .venv/bin/python scripts/watch_game.py --chunk ../lczero-server/games/run1/training.1079.gz  # replay a DB game
   # options: --weights X.pt  --sims 400  --max-plies 200  --device cpu|mps  --delay 0.5
 """
 from __future__ import annotations
@@ -31,7 +39,28 @@ PV_MAX = 8      # plies of principal-variation continuation to show per line
 
 # The simplified training start (White's 8 pawns + king vs three 2-King towers on
 # d6/e6/f6) — the default replay/watch position; mirrors the engine's kStartposFen.
-DEFAULT_START_FEN = "8/8/3kkk2/8/8/8/PPPPPPPP/4K3[d6:kk,e6:kk,f6:kk] w - - 0 1"
+# Fallback only — keep loosely in sync with the fork's kStartposFen.
+_FALLBACK_START_FEN = "3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] b - - 0 1"
+
+
+def _engine_start_fen() -> str:
+    """The start position the fleet actually trains from = the fork's kStartposFen
+    (akshay-chessckers-0/src/chess/board.cc). Read it from source so this default can
+    never drift from the engine (it concatenates adjacent C++ string literals); fall
+    back to the constant if the file is unreadable."""
+    board = os.path.join(_ENG, "..", "akshay-chessckers-0", "src", "chess", "board.cc")
+    try:
+        m = re.search(r"kStartposFen\s*=\s*(.+?);", open(board).read(), re.S)
+        if m:
+            fen = "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))).strip()
+            if fen:
+                return fen
+    except OSError:
+        pass
+    return _FALLBACK_START_FEN
+
+
+DEFAULT_START_FEN = _engine_start_fen()
 
 _RESULT_TOKENS = {"1-0", "0-1", "1/2-1/2", "*"}
 
@@ -52,7 +81,7 @@ def _parse_movelist(s: str) -> list[str]:
     return out
 
 
-def _resolve_weights(arg: str) -> list[str]:
+def _resolve_weights(arg: str, latest: bool = False) -> list[str]:
     """Ordered checkpoint candidates, freshest first. The async/continuous
     trainer (train_continuous.py) writes weights/run/{weights.pt, iter-async-
     NNNN.pt}; weights.pt is the live rolling publish (newest but may be mid-
@@ -74,6 +103,11 @@ def _resolve_weights(arg: str) -> list[str]:
         os.path.join(_ENG, "weights/base_wdl_v2.pt"),
         os.path.join(_ENG, "weights/base_wdl_v1.pt"),
     ]
+    if latest:
+        # The live published net the fleet is training right now: the trainer's
+        # rolling weights.pt in the server run-dir. Leads so --latest picks it first.
+        cands.insert(0, os.path.join(_ENG, "..", "lczero-server",
+                                     "trainer", "run1", "weights.pt"))
     found = [p for p in cands if os.path.exists(p)]
     if not found:
         raise SystemExit("no WDL weights found (weights/run/weights.pt, iter-async-*.pt, "
@@ -174,6 +208,40 @@ def _replay(args, client, state, model, show_board, outcome_from_state) -> int:
     return 0
 
 
+def _moves_from_chunk(path: str) -> tuple[str, list[str]]:
+    """Recover (start FEN, actual move line) from a recorded ccz1 self-play chunk
+    (e.g. lczero-server/games/run1/training.N.gz). The chunk stores one position
+    per ply but NOT the move played — and the played move was SAMPLED from the
+    visit counts, so it is NOT the visit-argmax. We recover each move by finding
+    the legal move whose result matches the NEXT ply's FEN; the final ply (-> the
+    terminal/mate, which has no next FEN) falls back to the visit-argmax. This is
+    why --chunk exists: hand-rolling decode + argmax silently mislabels the game."""
+    from chessckers_engine.training_chunk import decode_chunk
+    from chessckers_engine.variant_py import PyVariantClient
+
+    exs = decode_chunk(open(path, "rb").read())
+    if not exs:
+        raise SystemExit(f"--chunk {path}: empty or undecodable chunk")
+    client = PyVariantClient()
+
+    def applied_fen(fen: str, uci: str) -> str | None:
+        try:
+            return client.make_move(fen, uci)["fen"]
+        except Exception:  # noqa: BLE001 — illegal/garbled token, just skip it
+            return None
+
+    moves: list[str] = []
+    for i in range(len(exs) - 1):
+        nxt = exs[i + 1].fen
+        played = next((m["uci"] for m in exs[i].legal_moves
+                       if applied_fen(exs[i].fen, m["uci"]) == nxt), "?")
+        moves.append(played)
+    vd = exs[-1].visit_distribution
+    j = max(range(len(vd)), key=lambda k: vd[k])
+    moves.append(exs[-1].legal_moves[j]["uci"])
+    return exs[0].fen, moves
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Watch a greedy (argmax) self-play game from a FEN, OR replay a "
@@ -186,9 +254,18 @@ def main() -> int:
                          "selfplay PGN line (a leading 'PGN:' and a trailing result/'{OL...}' "
                          "comment are ignored). Each token is a Chessckers UCI, e.g. "
                          "'a2a4 e6f7 c3:h5~e2->e2 d6c5[1] ...'.")
+    ap.add_argument("--chunk", default="",
+                    help="replay a RECORDED ccz1 self-play game (e.g. "
+                         "../lczero-server/games/run1/training.N.gz). Recovers the start FEN and the "
+                         "ACTUAL played moves from the chunk (not the visit-argmax) and renders it. "
+                         "Overrides the positional FEN and --moves.")
     ap.add_argument("--no-eval", action="store_true",
                     help="replay only: skip loading the net / printing per-ply WDL eval (faster).")
     ap.add_argument("--weights", default="", help="checkpoint .pt (default: latest weights/run/{weights.pt,iter-async-*.pt}, then base_wdl_v*.pt)")
+    ap.add_argument("--latest", action="store_true",
+                    help="use the live published fleet net (lczero-server/trainer/run1/weights.pt), "
+                         "freshest first. Combine with no FEN to watch the latest net from the "
+                         "engine's current start position: `watch_game.py --latest --device mps`.")
     ap.add_argument("--sims", type=int, default=400)
     ap.add_argument("--explore", type=float, default=0.30,
                     help="root Dirichlet exploration-noise fraction (default 0.30 = 30 pct); the "
@@ -207,6 +284,11 @@ def main() -> int:
     from chessckers_engine.selfplay_az import _outcome_from_state
     from chessckers_engine.variant_py import PyVariantClient
 
+    if args.chunk:  # recorded game: derive start FEN + real move line, then take the --moves path
+        args.fen, _chunk_moves = _moves_from_chunk(args.chunk)
+        args.moves = " ".join(_chunk_moves)
+        print(f"chunk: {args.chunk}  ({len(_chunk_moves)} plies)")
+
     replay = bool(args.moves)
     need_model = not (replay and args.no_eval)  # replay --no-eval needs no net at all
 
@@ -214,7 +296,7 @@ def main() -> int:
     weights = None
     if need_model:
         last_err: Exception | None = None
-        for cand in _resolve_weights(args.weights):  # freshest first; weights.pt may be mid-write
+        for cand in _resolve_weights(args.weights, args.latest):  # freshest first; weights.pt may be mid-write
             try:
                 # load_scorer reads the .arch.json sidecar and builds the EXACT arch (V1/V2/V3), so a
                 # tf=7 V3 checkpoint loads into a V3 model instead of silently dropping most weights
