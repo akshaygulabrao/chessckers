@@ -3,14 +3,17 @@ from typing import Any
 import torch
 
 from chessckers_engine.mcts_puct import (
+    CERTAIN_LOSS_VALUE,
     TERMINAL_DRAW_VALUE,
     TERMINAL_LOSS_VALUE,
     PuctNode,
     _backup,
+    _best_child,
     _eval_and_priors,
     _expand_with_priors,
     _puct_score,
     _terminal_value,
+    _value_to_mover,
     pick_puct,
     run_mcts,
 )
@@ -364,3 +367,70 @@ def test_vloss_batch_falls_back_to_sequential_without_server():
     result = run_mcts(state, Client(), model, n_sims=8, vloss_batch=4)
     assert result.chosen is not None
     assert set(result.visit_distribution.keys()) == {"A", "B"}
+
+
+# ---- final move selection avoids proven losses ----
+
+
+def _child(uci: str, visits: int, q: float, mover: str = "w") -> PuctNode:
+    """A child (White to move by default) with q == total_value / visits."""
+    fen = FEN_W if mover == "w" else FEN_B
+    return PuctNode(fen=fen, move_to_here=_move(uci), visits=visits, total_value=q * visits)
+
+
+def test_value_to_mover_negates_across_opposite_mover_edge():
+    root = PuctNode(fen=FEN_B, move_to_here=None)           # Black to move
+    child = _child("a1a2", visits=10, q=0.8)                # White to move, White +0.8
+    assert _value_to_mover(root, child) == -0.8             # -> -0.8 for Black
+
+
+def test_value_to_mover_keeps_sign_across_same_mover_edge():
+    root = PuctNode(fen=FEN_W, move_to_here=None)           # White (opening double-move)
+    child = _child("a1a2", visits=10, q=0.8)                # still White to move
+    assert _value_to_mover(root, child) == 0.8
+
+
+def test_value_to_mover_unvisited_is_zero():
+    root = PuctNode(fen=FEN_B, move_to_here=None)
+    child = PuctNode(fen=FEN_W, move_to_here=_move("a1a2"), visits=0)
+    assert _value_to_mover(root, child) == 0.0
+
+
+def test_best_child_avoids_proven_loss_with_most_visits():
+    """Reproduces the watch_game ply-58 bug: a1b1 is a proven loss (-1.00) yet
+    carries the most visits (high policy prior); a1a2/a1b2 are merely bad
+    (-0.81). Plain argmax-visits played a1b1 — _best_child must not."""
+    root = PuctNode(fen=FEN_B, move_to_here=None)           # Black to move
+    root.children = {
+        "a1b1": _child("a1b1", visits=70, q=1.00),          # White winning -> -1.00 for Black
+        "a1a2": _child("a1a2", visits=68, q=0.81),          # -0.81
+        "a1b2": _child("a1b2", visits=61, q=0.81),          # -0.81
+    }
+    # Plain max-visits would pick the proven loss...
+    assert max(root.children.values(), key=lambda c: c.visits).move_to_here["uci"] == "a1b1"
+    # ...the loss-aware pick takes the best non-losing move instead.
+    assert _best_child(root).move_to_here["uci"] == "a1a2"
+
+
+def test_best_child_falls_back_to_visits_when_all_moves_lose():
+    """When every move is a (near-)certain loss there is nothing better to do,
+    so selection falls back to plain max-visits."""
+    root = PuctNode(fen=FEN_B, move_to_here=None)
+    root.children = {
+        "m1": _child("m1", visits=40, q=1.0),               # both proven losses for Black
+        "m2": _child("m2", visits=90, q=1.0),
+    }
+    assert _best_child(root).move_to_here["uci"] == "m2"
+
+
+def test_best_child_keeps_max_visits_when_nothing_is_a_loss():
+    """No certain losses -> identical to plain AlphaZero argmax-visits (so the
+    visit distribution / training target semantics are unchanged)."""
+    root = PuctNode(fen=FEN_B, move_to_here=None)
+    root.children = {
+        "x": _child("x", visits=30, q=-0.5),                # +0.5 for Black
+        "y": _child("y", visits=55, q=0.10),                # -0.10 for Black, most visits
+        "z": _child("z", visits=20, q=-0.9),                # +0.9 for Black
+    }
+    assert CERTAIN_LOSS_VALUE < -0.10  # sanity: none of these count as a loss
+    assert _best_child(root).move_to_here["uci"] == "y"

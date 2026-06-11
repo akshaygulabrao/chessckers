@@ -45,6 +45,14 @@ LegalMove = dict[str, Any]
 TERMINAL_LOSS_VALUE = -1.0
 TERMINAL_DRAW_VALUE = 0.0
 
+# Final-move-selection guard: a move whose searched value (root-mover POV) sits
+# at or below this is treated as a (near-)certain loss and avoided when ANY
+# non-losing move exists — so the engine never *plays* a move it has already
+# proven loses (e.g. walking into a forced mate / its own stalemate) just because
+# raw visit count happened to favor it. Only the played move is affected; the
+# returned visit distribution (the training policy target) is left untouched.
+CERTAIN_LOSS_VALUE = -0.99
+
 
 class _Mover(Protocol):
     def new_game(self, fen: str | None = None) -> GameState: ...
@@ -105,6 +113,27 @@ def _node_mover(node: PuctNode) -> bool:
         if tok == "b":
             return False
     return True
+
+
+def _value_to_mover(root: PuctNode, child: PuctNode) -> float:
+    """Searched value of playing the move to `child`, from the root mover's POV
+    ([-1, 1]). Negamax across the edge, except a same-mover edge (the opening
+    double-move) keeps the perspective. Unvisited children have no value yet."""
+    if child.visits == 0:
+        return 0.0
+    return child.q if _node_mover(child) == _node_mover(root) else -child.q
+
+
+def _best_child(root: PuctNode) -> PuctNode:
+    """Final move pick: most visits, but never a move we've (near-)proven loses
+    while a non-losing one exists. Ranking on (not-a-certain-loss, visits) keeps
+    the AlphaZero argmax-visits behavior everywhere except the degenerate case
+    where a proven loss out-visits a better sibling (low sims + a high policy
+    prior on the losing move); falls back to pure max-visits when all moves lose."""
+    return max(
+        root.children.values(),
+        key=lambda c: (_value_to_mover(root, c) > CERTAIN_LOSS_VALUE, c.visits),
+    )
 
 
 # Lc0-style PUCT refinements:
@@ -552,7 +581,7 @@ def run_mcts(
         return MctsResult(chosen=legal[0], visit_distribution={legal[0]["uci"]: 0}, root=root)
 
     visit_dist = {uci: c.visits for uci, c in root.children.items()}
-    best = max(root.children.values(), key=lambda c: c.visits)
+    best = _best_child(root)
     return MctsResult(chosen=best.move_to_here, visit_distribution=visit_dist, root=root)
 
 
@@ -581,6 +610,14 @@ def pick_puct(
         children = result.root.children
         ucis = list(children.keys())
         visits = torch.tensor([children[u].visits for u in ucis], dtype=torch.float32)
+        # Same guard as run_mcts: drop (near-)certain losses from the sampling
+        # pool unless every move loses, so temperature can't roll into a known loss.
+        safe = torch.tensor(
+            [_value_to_mover(result.root, children[u]) > CERTAIN_LOSS_VALUE for u in ucis],
+            dtype=torch.float32,
+        )
+        if float(safe.sum()) > 0.0:
+            visits = visits * safe
         if float(visits.sum()) > 0.0:
             probs = visits.pow(1.0 / temperature)
             idx = int(torch.multinomial(probs / probs.sum(), 1).item())
