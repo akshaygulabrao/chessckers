@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Watch a self-play game from any Chessckers FEN.
 
-The trained net plays BOTH sides at --sims (default 400) MCTS sims/move. The
+The trained net plays BOTH sides at --sims (default 200, matching self-play) MCTS sims/move. The
 MOVE played is always the argmax of the visit counts (the "calculation");
 exploration is injected only as root Dirichlet noise (--explore, default
 0.30 = 30%), so different runs (or --seed) give varied games while each move
@@ -21,7 +21,7 @@ argmax, and only this path (FEN-matched reconstruction) renders the real game.
   .venv/bin/python scripts/watch_game.py "8/8/8/8/3kk3/8/8/4K3[d4:kk,e4:kk] b - - 0 1"   # net plays
   .venv/bin/python scripts/watch_game.py --moves "<selfplay PGN line>" --no-eval         # replay a movelist
   .venv/bin/python scripts/watch_game.py --chunk ../lczero-server/games/run1/training.1079.gz  # replay a DB game
-  # options: --weights X.pt  --sims 400  --max-plies 200  --device cpu|mps  --delay 0.5
+  # options: --weights X.pt  --sims 200  --max-plies 200  --device cpu|mps  --delay 0.5
 """
 from __future__ import annotations
 
@@ -183,6 +183,8 @@ def _replay(args, client, state, model, show_board, outcome_from_state) -> int:
     print(f"replaying {len(toks)} plies"
           + ("" if args.no_eval else f"  (net WDL each ply; weights loaded)") + "\n")
     for ply, tok in enumerate(toks, 1):
+        if args.clear:
+            _clear_screen()
         if model is not None:
             _print_net_eval(model, state["fen"], state["turn"], args.device)  # mover-POV WDL
         try:
@@ -193,9 +195,9 @@ def _replay(args, client, state, model, show_board, outcome_from_state) -> int:
             print(f"   {len(legal)} legal here: {legal[:40]}")
             return 1
         show_board(ply, tok, state["fen"])
-        if args.delay:
-            time.sleep(args.delay)
         if state.get("status"):
+            break
+        if not _advance(args):
             break
     status = state.get("status")
     plies = ply
@@ -206,6 +208,38 @@ def _replay(args, client, state, model, show_board, outcome_from_state) -> int:
     else:
         print(f"\n######## replay ended at {plies} plies — game not terminal here ########")
     return 0
+
+
+def _clear_screen() -> None:
+    """Home the cursor and clear, so each ply renders in place instead of scrolling."""
+    print("\033[H\033[2J", end="", flush=True)
+
+
+def _read_key() -> str:
+    """Block for ONE keypress (raw mode) and return it. Falls back to a line read
+    (Enter) when stdin isn't a TTY (e.g. piped), so non-interactive runs don't hang."""
+    if not sys.stdin.isatty():
+        sys.stdin.readline()
+        return "\n"
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        return sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _advance(args) -> bool:
+    """Pause between plies. --step waits for a key (space/Enter advance; q or Ctrl-C/D
+    quits); otherwise --delay sleeps. Returns False if the user asked to quit."""
+    if args.step:
+        return _read_key() not in ("q", "Q", "\x03", "\x04")
+    if args.delay:
+        time.sleep(args.delay)
+    return True
 
 
 def _moves_from_chunk(path: str) -> tuple[str, list[str]]:
@@ -266,7 +300,7 @@ def main() -> int:
                     help="use the live published fleet net (lczero-server/trainer/run1/weights.pt), "
                          "freshest first. Combine with no FEN to watch the latest net from the "
                          "engine's current start position: `watch_game.py --latest --device mps`.")
-    ap.add_argument("--sims", type=int, default=400)
+    ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--explore", type=float, default=0.30,
                     help="root Dirichlet exploration-noise fraction (default 0.30 = 30 pct); the "
                          "played move stays argmax of visits. 0 = pure greedy/deterministic.")
@@ -275,7 +309,15 @@ def main() -> int:
     ap.add_argument("--max-plies", type=int, default=200)
     ap.add_argument("--device", default="cpu", help="cpu|mps|cuda (default cpu)")
     ap.add_argument("--delay", type=float, default=0.0, help="extra pause between plies, seconds")
+    ap.add_argument("--step", action="store_true",
+                    help="step through plies interactively: pause after each and wait for a key "
+                         "(space/Enter = next, q = quit). Implies --clear.")
+    ap.add_argument("--clear", action="store_true",
+                    help="clear the screen before each ply so the game renders in place instead "
+                         "of scrolling.")
     args = ap.parse_args()
+    if args.step:
+        args.clear = True  # stepping in place is the point; clear unless replaying to a pipe
 
     import torch
     from chessckers_engine.checkpoints import load_scorer
@@ -327,7 +369,11 @@ def main() -> int:
         print(f"\n=== {head} ===")
         print(render_board(fen))
 
+    if args.clear:
+        _clear_screen()
     show_board(0, None, state["fen"])
+    if not _advance(args):
+        return 0
 
     if replay:
         return _replay(args, client, state, model, show_board, _outcome_from_state)
@@ -337,6 +383,8 @@ def main() -> int:
     while not state.get("status") and ply < args.max_plies:
         if not (state.get("legalMoves") or []):
             break
+        if args.clear:
+            _clear_screen()
         result = run_mcts(
             state, client, model,
             n_sims=args.sims, c_puct=1.5,
@@ -351,8 +399,8 @@ def main() -> int:
         state = client.make_move(state["fen"], chosen["uci"])
         ply += 1
         show_board(ply, chosen["uci"], state["fen"])
-        if args.delay:
-            time.sleep(args.delay)
+        if not _advance(args):
+            break
 
     status = state.get("status")
     if status:
