@@ -113,12 +113,20 @@ def _batch_loss(
     value_loss_fn: nn.Module | None = None,
     gamma: float = 1.0,
     q_ratio: float = 0.0,
+    diag: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Mini-batched loss: trunk batched in one forward; WDL value head (cross-
     entropy vs the one-hot outcome) + moves-left head (MSE on scaled plies-to-
     end) batched; policy head per-position (ragged move counts). Returns
     (policy_loss, value_loss, mlh_loss), each a mean over the batch.
-    `value_loss_fn` is accepted for backward-compat but unused (WDL uses CE)."""
+    `value_loss_fn` is accepted for backward-compat but unused (WDL uses CE).
+
+    If `diag` is a dict, it is filled (under no_grad, from the SAME outputs/targets
+    — the returned losses are bit-identical whether or not diag is passed) with two
+    cheap anchored progress signals, robust under value-target shift:
+      value_sign_agree  — fraction where sign(pred win−loss) == sign(target win−loss)
+      policy_top1_agree — fraction where argmax(policy logits) == argmax(policy target)
+    The continuous trainer passes diag only on log-due steps, so this is ~free."""
     device = next(model.parameters()).device
     # Encoders follow the model's arch VERSION (V1 8×8 / 240-d moves, V2 10×10 /
     # 114-d gather-indexed moves); everything else is version-uniform via
@@ -165,6 +173,24 @@ def _batch_loss(
     # have target=0 and log_probs=-inf (0·-inf=NaN), so zero them before summing.
     log_probs = torch.log_softmax(logits, dim=1)
     policy_loss = (-(target * log_probs)).masked_fill(~mask, 0.0).sum(dim=1).mean()
+
+    if diag is not None:
+        with torch.no_grad():
+            # Value sign: scalar expected value = P(win) − P(loss) for both the
+            # predicted WDL and the (possibly soft/blended) target. Comparing only
+            # the SIGN is stable under target-shift — magnitude/calibration can
+            # drift while "who's winning" stays anchored.
+            pred_wdl = torch.softmax(wdl_logits, dim=1)
+            pred_v = pred_wdl[:, 0] - pred_wdl[:, 2]
+            tgt_v = wdl_targets[:, 0] - wdl_targets[:, 2]
+            diag["value_sign_agree"] = float(
+                (torch.sign(pred_v) == torch.sign(tgt_v)).float().mean())
+            # Policy top-1: argmax over VALID moves only (padded slots forced to
+            # -inf for the logits; target is already 0 on padding so its argmax
+            # lands on a real move).
+            masked_logits = logits.masked_fill(~mask, float("-inf"))
+            diag["policy_top1_agree"] = float(
+                (masked_logits.argmax(dim=1) == target.argmax(dim=1)).float().mean())
 
     return policy_loss, value_loss, mlh_loss
 

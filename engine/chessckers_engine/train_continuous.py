@@ -584,16 +584,27 @@ def main() -> int:
 
     def _write_stats(steps_per_s: float, games_per_s: float) -> None:
         """Phase 0: a small JSON heartbeat fleet_status.py reads — the two rates
-        you can't tune windows/cadence without."""
+        you can't tune windows/cadence without. Also APPENDS the same record (one
+        line per call) to train_metrics.jsonl so the loss/agreement curves are a
+        time series, not just a last-value snapshot."""
+        rec = {
+            "steps": steps, "games_seen": games_seen,
+            "positions_ingested": positions_ingested, "buf": len(buf),
+            "steps_per_s": round(steps_per_s, 2), "games_per_s": round(games_per_s, 4),
+            "lr": round(_lr_at(steps), 8),
+            # anchored progress signals (last log-due measurement; 0.0 until first log)
+            "value_sign_agree": round(lwin_vsign, 4), "policy_top1_agree": round(lwin_ptop1, 4),
+            "updated": time.time(),
+        }
         try:
             tmp = run_dir / "train_stats.json.tmp"
-            tmp.write_text(json.dumps({
-                "steps": steps, "games_seen": games_seen,
-                "positions_ingested": positions_ingested, "buf": len(buf),
-                "steps_per_s": round(steps_per_s, 2), "games_per_s": round(games_per_s, 4),
-                "lr": round(_lr_at(steps), 8), "updated": time.time(),
-            }))
+            tmp.write_text(json.dumps(rec))
             os.replace(tmp, run_dir / "train_stats.json")
+        except OSError:
+            pass
+        try:
+            with open(run_dir / "train_metrics.jsonl", "a") as f:
+                f.write(json.dumps(rec) + "\n")
         except OSError:
             pass
 
@@ -677,6 +688,9 @@ def main() -> int:
     lwin_gnorm = 0.0            # sum of pre-clip grad L2 norms
     lwin_steps = 0
     lwin_upd_ratio = 0.0       # last measured ||Δw|| / ||w|| (update-to-weight ratio)
+    # Last measured anchored progress signals (computed on log-due steps only).
+    lwin_vsign = 0.0           # value-sign agreement (sign(pred) == sign(target))
+    lwin_ptop1 = 0.0           # policy top-1 agreement (argmax logits == argmax target)
     last_loss_log = time.time()
     games_at_loss = 0          # games/s baseline for the combined [train] line's window
     sp_window: dict[str, int] = {}      # self-play games per machine; feeds the ~60s stats heartbeat
@@ -744,8 +758,13 @@ def main() -> int:
         bs = min(args.batch_size, len(buf))
         batch = rng.sample(buf, bs)
         opt.zero_grad()
+        # Only compute the cheap anchored signals (value-sign / policy-top1 agreement)
+        # on log-due steps — they read the same outputs/targets the loss already has,
+        # so the returned losses are unaffected.
+        log_due = (time.time() - last_loss_log) >= args.log_seconds
+        diag: dict | None = {} if log_due else None
         p_loss, v_loss, ml_loss = _batch_loss(
-            model, batch, gamma=args.value_discount, q_ratio=args.value_q_ratio)
+            model, batch, gamma=args.value_discount, q_ratio=args.value_q_ratio, diag=diag)
         (p_loss + args.value_loss_weight * v_loss + args.mlh_loss_weight * ml_loss).backward()
         # Always measure the pre-clip grad norm (max_norm=inf computes it WITHOUT scaling
         # when clipping is disabled), so "is the LR too high?" is a logged number.
@@ -755,7 +774,10 @@ def main() -> int:
         ))
         # On a log-due step, snapshot weights before/after to measure ||Δw||/||w|| (the
         # scale-free "update-to-weight ratio"; healthy SGD ~1e-3, >1e-2 => steps too big).
-        measure_upd = (time.time() - last_loss_log) >= args.log_seconds
+        measure_upd = log_due
+        if diag:
+            lwin_vsign = diag["value_sign_agree"]
+            lwin_ptop1 = diag["policy_top1_agree"]
         if measure_upd:
             from torch.nn.utils import parameters_to_vector
             w_before = parameters_to_vector(model.parameters()).detach().clone()
@@ -786,10 +808,11 @@ def main() -> int:
         # whole --ckpt-seconds interval. Saves nothing to disk; pure stdout.
         if now - last_loss_log >= args.log_seconds and lwin_steps:
             log_elapsed = max(now - last_loss_log, 1e-9)
-            log.info("[train] step %d | policy=%.4f value=%.4f mlh=%.4f | gnorm=%.2f upd/w=%.1e "
-                     "| %.3f games/s | lr=%.2e buf=%d window=%dg games_seen=%d/%s",
+            log.info("[train] step %d | policy=%.4f value=%.4f mlh=%.4f | vsign=%.2f ptop1=%.2f "
+                     "| gnorm=%.2f upd/w=%.1e | %.3f games/s | lr=%.2e buf=%d window=%dg games_seen=%d/%s",
                      steps,
                      lwin_p / lwin_steps, lwin_v / lwin_steps, lwin_m / lwin_steps,
+                     lwin_vsign, lwin_ptop1,
                      lwin_gnorm / lwin_steps, lwin_upd_ratio,
                      (games_seen - games_at_loss) / log_elapsed,
                      _lr_at(steps), len(buf), len(game_sizes), games_seen, (args.max_games or "inf"))

@@ -8,6 +8,10 @@ dependencies = [
     "torch>=2.2",
     "chess>=1.10",
     "wandb>=0.17",
+    # native_net.export_state_dict calls Tensor.numpy() when publishing weights.bin;
+    # torch's resolved closure here doesn't pull numpy, so declare it explicitly or
+    # a fresh `uv sync` omits it and the trainer crashes on first net publish.
+    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
