@@ -35,8 +35,10 @@ def _instances():
         if i.get("actual_status") != "running":
             continue
         p = (i.get("ports") or {}).get("10100/tcp")
+        d = (i.get("ports") or {}).get("22/tcp")   # DIRECT ssh; vast's proxy (sshN.vast.ai) is unreliable/dead
         res.append({"id": i["id"], "ssh_host": i.get("ssh_host"), "ssh_port": i.get("ssh_port"),
                     "ip": i.get("public_ipaddr"), "server_port": p[0]["HostPort"] if p else None,
+                    "ssh_port_direct": d[0]["HostPort"] if d else i.get("ssh_port"),
                     "gpu": i.get("gpu_name")})
     return res
 
@@ -76,8 +78,12 @@ def resolve(refresh=False):
 
 
 def _ssh(box):
+    # DIRECT endpoint (public ip + container port-22 host mapping): vast's proxy
+    # ssh (sshN.vast.ai:NNNNN) is unreliable/dead, so prefer the direct mapping.
+    host = box.get("ip") or box["ssh_host"]
+    port = box.get("ssh_port_direct") or box["ssh_port"]
     return ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20",
-            "-p", str(box["ssh_port"]), f"root@{box['ssh_host']}"]
+            "-p", str(port), f"root@{host}"]
 
 
 def _q(s):
@@ -97,7 +103,7 @@ def main():
     if cmd == "box":
         b = resolve("--refresh" in args)
         print(f"id={b['id']}  gpu={b['gpu']}")
-        print(f"ssh:    ssh -p {b['ssh_port']} root@{b['ssh_host']}")
+        print(f"ssh:    ssh -p {b.get('ssh_port_direct') or b['ssh_port']} root@{b.get('ip') or b['ssh_host']}  (direct; proxy sshN.vast.ai is dead)")
         print(f"server: {b['server_url']}")
         print(f"engine (on box): {ENGINE_DIR}")
     elif cmd == "ssh":

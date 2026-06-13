@@ -134,6 +134,14 @@ flags tune its weights. It auto-mates the e8/d8 start in ~6 moves.
 
 - **Endpoint changes on instance recreate** — always go through `cc` (or
   `vastai show instances`), never a hardcoded `ssh5.vast.ai:NNNNN`.
+- **vast proxy SSH (`sshN.vast.ai:NNNNN`) is unreliable/dead** — use the DIRECT
+  endpoint: `vastai ssh-url <id>` (public ip + the container-port-22 host
+  mapping). `cc` resolves this automatically now; for the provision/launch
+  scripts set `VAST_HOST`/`VAST_PORT` from `ssh-url`, never the proxy.
+- **Trust the API's effective CPU count, not the box's `nproc`** — vast shows the
+  *host's* full core count via `nproc` (e.g. 64) but only allocates a fraction
+  (`cpu_cores_effective`, e.g. 16). Self-play is CPU-MCTS-bound, so choose the
+  self-play box by the **API** count (`vastai show instances`), not `nproc`.
 - **Self-play can't discover a deep, high-branching mate from scratch** — the
   e8/d8 run sat at ~1% Black for ~38k games (cold-start trap) before flipping to
   99%. It was *undertrained*, not stuck. Watch the `cc doctor` verdict and the
