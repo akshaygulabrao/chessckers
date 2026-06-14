@@ -42,7 +42,6 @@ import torch
 from chessckers_engine.checkpoints import load_checkpoint
 from chessckers_engine.device import pick_device
 from chessckers_engine.model import ChesskersScorer, build_model
-from chessckers_engine.runtime import setup_logging
 from chessckers_engine.train_az import _batch_loss, save_checkpoint
 from chessckers_engine.training_chunk import ChunkDecodeError, decode_chunk
 
@@ -394,7 +393,7 @@ def _publish(model: ChesskersScorer, weights_path: Path) -> None:
 
 
 def main() -> int:
-    setup_logging()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     p = argparse.ArgumentParser(description="Async/continuous AlphaZero trainer (decoupled self-play).")
     p.add_argument("--run-dir", required=True, type=Path)
     p.add_argument("--base", default="", help="warm-start checkpoint (else random init)")

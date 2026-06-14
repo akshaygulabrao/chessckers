@@ -9,15 +9,15 @@ Records each game's UCI move line (replayable via scripts/watch_game.py
 from __future__ import annotations
 
 import argparse
+import logging
 import random
 
 import torch
 
 from chessckers_engine.checkpoints import load_scorer
-from chessckers_engine.evaluate import _state_to_outcome
 from chessckers_engine.mcts_puct import pick_puct
 from chessckers_engine.render_board import render_board
-from chessckers_engine.runtime import setup_logging
+from chessckers_engine.selfplay_az import _outcome_from_state
 from chessckers_engine.variant_py import PyVariantClient
 
 
@@ -47,11 +47,11 @@ def play_recorded(white_pick, black_pick, client, max_plies, render=False, delay
             print(render_board(state["fen"]), flush=True)
             if delay:
                 time.sleep(delay)
-    return _state_to_outcome(state), moves, state["fen"]
+    return _outcome_from_state(state), moves, state["fen"]
 
 
 def main() -> int:
-    setup_logging()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     p = argparse.ArgumentParser()
     # The simplified training start: White's 8 pawns + king vs three 2-King towers.
     DEFAULT_START_FEN = "8/8/3kkk2/8/8/8/PPPPPPPP/4K3[d6:kk,e6:kk,f6:kk] w - - 0 1"
