@@ -24,8 +24,38 @@ Then, from **any directory**:
 | `cc run <script.py> [args]` | run any `engine/scripts/` script on the box | box |
 | `cc doctor` | **one-shot health + convergence report** | box |
 | `cc plot` | terminal sparklines of the run's curves | box |
-| `cc validate "<FEN>"` | is this start winnable for Black? mate length? | local |
+| `cc games [opts]` | **pull a RECORDED self-play game off the box + render its real moves** | box→local |
+| `cc watch [opts]` | pull the latest fleet net + watch it self-play live | box→local |
+| `cc restart-trainer [LR]` | **hardened clean warm-restart** (snapshot-guarded; optionally change LR) | box |
+| `cc play [opts]` | **play a human-vs-net game** against the latest fleet net | box→local |
 | `cc launch` | print the fresh-run runbook | local |
+
+`cc games` is the quick way to eyeball what the network is actually playing — it
+fetches the chunk and renders the *actual sampled moves* (not the visit-argmax)
+via `watch_game.py --chunk`:
+
+```
+cc games                  # newest recorded game, board move-by-move (no net needed)
+cc games --list [K]       # list the K newest chunks with ages (default 15)
+cc games --index N        # a specific training.N.gz
+cc games --eval           # also pull the fleet net + show per-ply WDL
+cc games --step           # any extra args (--step/--delay/--clear/--max-plies) pass through
+cc watch --device mps     # latest net plays a fresh game from the start FEN
+```
+
+`cc restart-trainer` is the ONLY supported way to change a live hyperparameter (the
+trainer reads `--lr` etc. once at startup). It captures the live deployment env from
+the running bridge, Ctrl-Cs the trainer for a clean shutdown, waits for a **fresh**
+`replay_buffer.pkl` (aborting rather than losing the ~4000-game window), relaunches
+warm with the new LR, and verifies. The heavy lifting is `lczero-server/scripts/restart_trainer.sh`
+(run on the box) so no long command is ever pasted — a terminal soft-wrap newline in a
+`tmux send-keys` line silently breaks the relaunch.
+
+```
+cc restart-trainer 0.002            # change LR to 0.002 and warm-restart
+cc restart-trainer                  # warm-restart at the current LR (just kick it)
+cc restart-trainer 0.002 --dry-run  # show the plan + captured env, touch nothing
+```
 
 > Multiple boxes running? `CC_INSTANCE=<id> cc ...` picks one. `cc box --refresh`
 > re-queries vast (cached 10 min).
@@ -101,20 +131,21 @@ cc run game_phase_stats.py     ../lczero-server/pgns/run1 400    # early/mid/lat
 cc run backrank_check_trend.py ../lczero-server/pgns/run1 300 10 # is Black learning the camp-denying check?
 ```
 
-## 4. Solving / designing positions
+## 4. Playing the net
 
-`solve_endgame.py` (local, pure rules):
+Play a human-vs-net game from any FEN — you pick from a numbered legal-move menu
+(no hand-typing cadence/deploy UCI), the net replies via MCTS, and the board +
+WDL eval render each ply:
 
 ```bash
-cc validate "<FEN>"                                  # winnable? mate length?
-.venv/bin/python scripts/solve_endgame.py --human    # YOU play Black vs heuristic White
-.venv/bin/python scripts/solve_endgame.py --play     # watch the box-shrink heuristic auto-mate
-.venv/bin/python scripts/solve_endgame.py --max-depth 8   # forced-mate prover (feasible only ~8-10 ply)
+cc play --color black                # play the LIVE fleet champion (pulls its net)
+.venv/bin/python scripts/play_net.py --color white --sims 200 --device mps
+.venv/bin/python scripts/play_net.py "<FEN>" --weights X.pt --color black
 ```
 
-The **box-shrink** Black policy (drive the king to the rim/corner + coordinate
-both towers, don't stalemate/hang) is the reference mating procedure; `--w-*`
-flags tune its weights. It auto-mates the e8/d8 start in ~6 moves.
+`--color` is the side YOU play (default black = the towers); at your turn `u`
+undoes your last move and `q` quits. To watch the net play ITSELF instead, use
+`watch_game.py` / `cc watch`.
 
 ## Script index
 
@@ -127,7 +158,7 @@ flags tune its weights. It auto-mates the e8/d8 start in ~6 moves.
 | `gen_probe_suite.py` | box | freeze the eval probe suite from real games |
 | `game_phase_stats.py` | box | early/mid/late game characterization |
 | `backrank_check_trend.py` | box | back-rank-check learning trend |
-| `solve_endgame.py` | local | solver / box-shrink policy / `--human` / `--validate` |
+| `play_net.py` | local | **human-vs-net** play from any FEN (numbered move menu) |
 | `lczero-server/scripts/new_run.sh` | box | guarded fresh-run setup (sets start FEN) |
 
 ## Gotchas (hard-won)
