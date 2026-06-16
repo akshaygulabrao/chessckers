@@ -539,11 +539,7 @@ def main() -> int:
         load_checkpoint(model, args.base)
         log.info("[train] warm-started from %s", args.base)
     model.train()
-    # SGD + Nesterov momentum + L2 weight decay — the AlphaZero/lc0 optimizer.
-    # Persistent across all steps (real continuous training); the LR schedule
-    # below (warmup -> step decay) drives g["lr"] per step.
-    opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
-                          nesterov=True, weight_decay=args.weight_decay)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)  # Adam, persistent across all steps (real continuous training)
     rng = random.Random(args.seed)
 
     # --- Phase 2: lc0-style LR schedule (warmup -> step decay). Constant LR when
