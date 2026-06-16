@@ -9,7 +9,10 @@ scripts to run on it.
   cc ssh [cmd...]               # ssh to the box (interactive, or run one command)
   cc run <script.py> [args]     # run engine/scripts/<script.py> ON the box
   cc doctor [args]              # one-shot run health/convergence report
+  cc status [args]              # fleet dashboard (live arena + gate decisions; runs fleet_status.py)
   cc plot [args]                # plot the run metrics time-series
+  cc ladder [args]              # round-robin champion nets -> terminal Elo + score matrix
+  cc gauntlet [args]            # current net vs ALL previous snapshots -> strength + regression curve
   cc games [opts] [watch args]  # pull a RECORDED fleet self-play game + render it
   cc watch [watch args]         # pull the latest fleet net + watch it self-play live
   cc restart-trainer [LR]       # clean warm-restart the trainer (optionally change LR)
@@ -245,6 +248,16 @@ def main():
         return _run_on_box("run_doctor.py", args)
     elif cmd == "plot":
         return _run_on_box("plot_run.py", args)
+    elif cmd == "ladder":
+        return _run_on_box("ladder.py", args)
+    elif cmd == "gauntlet":
+        return _run_on_box("gauntlet.py", args)
+    elif cmd == "status":
+        # fleet_status.py lives in lczero-server (outside engine) — run it from there.
+        box = resolve()
+        remote = (f"cd {SERVER_DIR} && {ENGINE_DIR}/.venv/bin/python scripts/fleet_status.py "
+                  + " ".join(_q(a) for a in args))
+        return subprocess.call(_ssh(box) + [remote])
     elif cmd == "games":
         return cmd_games(args)
     elif cmd == "watch":

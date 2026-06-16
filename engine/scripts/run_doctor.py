@@ -3,8 +3,8 @@
 
 Runs ON the box (via `cc doctor`). Consolidates everything I used to poke for by
 hand: process liveness, trainer step/rate/lr + agreement signals, game count +
-TRUE newest-game age (mtime, not the lexicographic-buggy field), the W/B/draw
-trend over the whole run, and a convergence VERDICT.
+TRUE newest-game age (mtime, not the lexicographic-buggy field), and the W/B/draw
+trend over the whole run.
 
   cc doctor                         # full report
   cc doctor --csv run_metrics.csv   # also append one metrics row (use in a loop = sampler)
@@ -49,23 +49,6 @@ def trend(pgn_dir, block):
     return sorted(rows, key=lambda r: r[0])
 
 
-def verdict(rows):
-    if len(rows) < 2:
-        return "TOO EARLY", "not enough games"
-    avg = lambda rs, i: sum(r[i] for r in rs) / len(rs)
-    recent, earlier = rows[-3:], (rows[-6:-3] or rows[:1])
-    b_now, b_old, w_now = avg(recent, 3), avg(earlier, 3), avg(recent, 2)
-    if abs(b_now - b_old) > 12:
-        return "LEARNING / IN TRANSITION", f"Black {'rising' if b_now>b_old else 'falling'} {b_old:.0f}%→{b_now:.0f}%"
-    if b_now >= 90:
-        return "CONVERGED — BLACK SOLVES IT", f"Black wins {b_now:.0f}%, stable"
-    if w_now >= 90:
-        flat = sum(1 for r in rows[-8:] if r[2] >= 90)
-        return ("STALLED / SATURATED — WHITE", f"White {w_now:.0f}% flat for {flat} blocks") if flat >= 6 \
-            else ("TRAINING (White-dominant)", f"White {w_now:.0f}% — watch for a flip")
-    return "TRAINING", f"mixed W{w_now:.0f}/B{b_now:.0f}"
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=SERVER)
@@ -81,9 +64,7 @@ def main():
     st = json.load(open(stats_f)) if os.path.exists(stats_f) else {}
     age = newest_age_min(pgn_dir)
     rows = trend(pgn_dir, a.block)
-    vlabel, vwhy = verdict(rows)
 
-    G, R = "\033[32m", "\033[0m"
     print(f"== run {run} ==")
     print("procs:   " + "  ".join(f"{lbl}{'✓' if up[lbl] else '✗'}" for lbl in PROCS.values()))
     if st:
@@ -99,17 +80,16 @@ def main():
         print("trend (block start | n | W% B% draw%):")
         for r in rows[::max(1, len(rows) // 14)] + ([rows[-1]] if len(rows) > 1 else []):
             print(f"   #{int(r[0]):>7}  n={int(r[1]):<5} W{r[2]:5.1f}  B{r[3]:5.1f}  d{r[4]:5.1f}")
-    print(f"VERDICT: {G}{vlabel}{R} — {vwhy}")
 
     if a.csv:
         new = not os.path.exists(a.csv)
         last = rows[-1] if rows else (0, 0, 0, 0, 0)
         with open(a.csv, "a") as f:
             if new:
-                f.write("ts,step,games_seen,games_per_s,lr,vsign,ptop1,W,B,draw,verdict\n")
+                f.write("ts,step,games_seen,games_per_s,lr,vsign,ptop1,W,B,draw\n")
             f.write(f"{int(time.time())},{st.get('steps','')},{st.get('games_seen','')},"
                     f"{st.get('games_per_s','')},{st.get('lr','')},{st.get('value_sign_agree','')},"
-                    f"{st.get('policy_top1_agree','')},{last[2]},{last[3]},{last[4]},{vlabel}\n")
+                    f"{st.get('policy_top1_agree','')},{last[2]},{last[3]},{last[4]}\n")
         print(f"(appended metrics row to {a.csv})")
 
 

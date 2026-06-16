@@ -23,7 +23,10 @@ Then, from **any directory**:
 | `cc ssh [cmd]` | shell on the box, or run one command | box |
 | `cc run <script.py> [args]` | run any `engine/scripts/` script on the box | box |
 | `cc doctor` | **one-shot health + convergence report** | box |
+| `cc status` | **fleet dashboard** — live arena + gate promote/reject decisions | box |
 | `cc plot` | terminal sparklines of the run's curves | box |
+| `cc ladder [opts]` | **round-robin champion nets → terminal Elo + score matrix** | box |
+| `cc gauntlet [opts]` | **current net vs ALL previous snapshots** → strength + regression curve | box |
 | `cc games [opts]` | **pull a RECORDED self-play game off the box + render its real moves** | box→local |
 | `cc watch [opts]` | pull the latest fleet net + watch it self-play live | box→local |
 | `cc restart-trainer [LR]` | **hardened clean warm-restart** (snapshot-guarded; optionally change LR) | box |
@@ -108,9 +111,11 @@ loop to accumulate a CSV, then plot it:
 while true; do cc run run_doctor.py --csv run_metrics.csv >/dev/null; sleep 300; done
 ```
 
-The fleet's own dashboard is `lczero-server/scripts/fleet_status.py`
-(`cc run ../lczero-server/scripts/fleet_status.py` — note: lives outside engine).
-Its "latest Xm ago" field was lexicographically buggy and is now fixed.
+The fleet's own dashboard is `cc status` (it runs `lczero-server/scripts/fleet_status.py`
+on the box; that script lives outside engine, so `cc run` can't reach it). It shows the
+LIVE arena match + the gate's recent promote/reject decisions — it used to hardcode
+"arenas removed" (false since the 2026-06-13 re-enable). Its "latest Xm ago" field's
+lexicographic bug is also fixed.
 
 ## 3. Diagnosing "is it learning, or stuck?"
 
@@ -130,6 +135,35 @@ or more exploration). Supporting views:
 cc run game_phase_stats.py     ../lczero-server/pgns/run1 400    # early/mid/late: result, length, material, captures
 cc run backrank_check_trend.py ../lczero-server/pgns/run1 300 10 # is Black learning the camp-denying check?
 ```
+
+**Head-to-head strength (no oracle needed):** `cc ladder` plays champion snapshots
+against each other and prints a pairwise score matrix + a Bradley-Terry Elo ranking
++ a chronological Elo curve — the oracle-free answer to "is the best actually beating
+its past selves?", and it surfaces the non-transitivity (A>B>C>A) the probe-suite
+curve can't. Runs on the box (nets + GPU are there).
+
+```bash
+cc ladder                              # ~6 snapshots sampled from the run dir, round-robin
+cc ladder --n 8 --games 6 --sims 200   # more nets / games / search = less noise
+cc ladder --vs-best                    # everyone vs the newest only (quick anchor ladder)
+cc ladder a.pt b.pt c.pt               # explicit nets
+```
+
+**Current vs all its past selves** — `cc gauntlet` is the focused "is the live net
+stronger than every net before it?" audit the lenient gate can't do: it plays the
+current `weights.pt` vs each sampled `iter-async-*.pt` snapshot, prints a per-opponent
+score + Elo + a strength curve (oldest→newest), and flags any older net that beats
+current (a promoted regression). The published `.bin` champions aren't loadable in the
+Python MCTS path, so the trainer checkpoint lineage stands in for "previous nets".
+
+```
+cc gauntlet                            # current vs ~6 sampled snapshots (~10-20 min)
+cc gauntlet --n 16 --games 6 --sims 200
+cc gauntlet --all                      # vs EVERY snapshot (hours)
+```
+
+(Slow: pure-Python PyVariant MCTS is CPU-bound and shares the box with the live
+fleet — background a big run, or keep `--sims`/`--games`/`--n` modest.)
 
 ## 4. Playing the net
 
@@ -158,6 +192,8 @@ undoes your last move and `q` quits. To watch the net play ITSELF instead, use
 | `gen_probe_suite.py` | box | freeze the eval probe suite from real games |
 | `game_phase_stats.py` | box | early/mid/late game characterization |
 | `backrank_check_trend.py` | box | back-rank-check learning trend |
+| `ladder.py` | box | round-robin / vs-best Elo + score matrix over sampled nets |
+| `gauntlet.py` | box | **current net vs all previous snapshots** — strength + regression curve |
 | `play_net.py` | local | **human-vs-net** play from any FEN (numbered move menu) |
 | `lczero-server/scripts/new_run.sh` | box | guarded fresh-run setup (sets start FEN) |
 
