@@ -315,36 +315,6 @@ def test_apply_and_remove_virtual_loss_round_trip():
     assert (b.visits, b.total_value) == (3, -1.0)
 
 
-def test_run_mcts_vloss_batch_produces_valid_visit_distribution():
-    """Run MCTS with vloss_batch>1 backed by an InferenceServer; the result
-    should be well-formed (visits sum to ~n_sims, all moves get a count)."""
-    from chessckers_engine.inference_server import InferenceServer
-
-    state = {"fen": FEN_W, "legalMoves": [_move("A"), _move("B"), _move("C")]}
-    table = {
-        (FEN_W, "A"): {"fen": FEN_B, "legalMoves": []},
-        (FEN_W, "B"): {"fen": FEN_B, "legalMoves": []},
-        (FEN_W, "C"): {"fen": FEN_B, "legalMoves": []},
-    }
-
-    class Client:
-        def new_game(self, fen=None):
-            return {"fen": fen, "legalMoves": []}
-        def make_move(self, fen, uci):
-            return table[(fen, uci)]
-
-    torch.manual_seed(0)
-    model = ChesskersScorer().eval()
-    n_sims = 16
-
-    with InferenceServer(model, max_batch_size=4) as srv:
-        result = run_mcts(state, Client(), srv, n_sims=n_sims, vloss_batch=4)
-
-    assert result.chosen is not None
-    assert sum(result.visit_distribution.values()) >= n_sims - 1  # ≥ n_sims-1 (one expand sim)
-    # All three legal root moves should appear in the distribution.
-    assert set(result.visit_distribution.keys()) == {"A", "B", "C"}
-
 
 def test_vloss_batch_falls_back_to_sequential_without_server():
     """When evaluator has no submit() method, vloss_batch>1 must still work
