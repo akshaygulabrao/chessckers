@@ -64,10 +64,13 @@ def _build_coord_key_table() -> dict[tuple[int, int], str]:
 _COORD_KEY: dict[tuple[int, int], str] = _build_coord_key_table()
 
 
+# Maximum tower height. Stacks are capped at 5 pieces.
+from chessckers_engine.variant_py.state import MAX_TOWER_HEIGHT  # noqa: E402
+
 # Maximum trace length for any capture-walk. The largest tower on the board
-# has 24 pieces; n+1 ≤ 25. We cap at 26 to keep all paths in-table without
-# overflow safety checks.
-_MAX_HOP_STEPS = 26
+# has MAX_TOWER_HEIGHT pieces; n+1 ≤ 6. We cap at 10 to keep all paths in-table
+# with headroom.
+_MAX_HOP_STEPS = 10
 
 
 def _build_capture_paths() -> dict[tuple[int, int, int, int], list[tuple]]:
@@ -232,7 +235,8 @@ def black_diagonal_quiet_moves(state: State) -> list[dict[str, Any]]:
                 # Non-empty square: classify and stop.
                 if owner == SQ_BLACK and to_sq in stacks:
                     # Friendly Black tower → merge is legal here, but blocks further walk.
-                    moves.append(_quiet_move(from_name, to_sq, top))
+                    if len(stacks[to_sq]) + height <= MAX_TOWER_HEIGHT:
+                        moves.append(_quiet_move(from_name, to_sq, top))
                 # White piece (or any non-friendly): stop, no emit (captures handled separately).
                 break
 
@@ -257,7 +261,8 @@ def black_diagonal_quiet_moves(state: State) -> list[dict[str, Any]]:
                 if owner == SQ_EMPTY:
                     moves.append(_quiet_move(from_name, to_sq, top))
                 elif owner == SQ_BLACK and to_sq in stacks:
-                    moves.append(_quiet_move(from_name, to_sq, top))
+                    if len(stacks[to_sq]) + 1 <= MAX_TOWER_HEIGHT:
+                        moves.append(_quiet_move(from_name, to_sq, top))
 
     return moves
 
@@ -319,7 +324,8 @@ def black_deploy_moves(state: State) -> list[dict[str, Any]]:
                         moves.append(_deploy_move(from_name, to_sq, top, s))
                         continue
                     if owner == SQ_BLACK and to_sq in stacks:
-                        moves.append(_deploy_move(from_name, to_sq, top, s))
+                        if len(stacks[to_sq]) + s <= MAX_TOWER_HEIGHT:
+                            moves.append(_deploy_move(from_name, to_sq, top, s))
                     break
     return moves
 
@@ -835,6 +841,9 @@ def _move_full_tower(state: State, from_sq: chess.Square, to_sq: chess.Square,
     state.board.remove_piece_at(from_sq)
     existing = state.stacks.get(to_sq, "")
     new_stack = existing + moving  # incoming on top
+    assert len(new_stack) <= MAX_TOWER_HEIGHT, (
+        f"move would create tower height {len(new_stack)} > {MAX_TOWER_HEIGHT}"
+    )
     state.stacks[to_sq] = new_stack
     _set_top_piece_on_board(state, to_sq, new_stack[-1])
 
@@ -1221,6 +1230,10 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
                     continue
 
                 # Non-ram landing (empty or friendly merge).
+                if is_friendly_merge and len(state.stacks.get(to_sq, "")) + len(pieces) > MAX_TOWER_HEIGHT:
+                    stop_after = True
+                    continue
+
                 if n_kings == d:
                     # Forced demotion — null fields.
                     new_pieces = list(pieces)

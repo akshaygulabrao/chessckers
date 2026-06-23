@@ -1,4 +1,4 @@
-# Chessckers: Formal Specification (v3)
+# Chessckers: Formal Specification (v5)
 
 **Players.** White (Chess) and Black (Swarm). White plays standard FIDE chess; Black follows the rules in §3.
 
@@ -23,6 +23,7 @@
 *   **White piece.** Any standard FIDE piece — Pawn, Knight, Bishop, Rook, Queen, or King.
 *   **Black piece.** Either a **Stone** or a **King**. Each Stone carries a `hasMoved` flag used by Back Rank Sprint (§3A). The flag is per-stone, not per-tower: it persists when the stone's tower merges into another, and once true it never resets.
 *   **Tower.** An ordered sequence of Black pieces sharing a square, written bottom-to-top. Its **height** is the number of pieces; call it $n$. The **top piece** governs the tower's capabilities, and a tower whose top piece is a King is a **King Tower**. The height $n$ doubles as the maximum distance the tower can move on a non-capturing turn and the maximum distance it can scan along a diagonal when capturing.
+*   **Maximum height.** A tower may never exceed **5** pieces. Friendly merges (quiet diagonal landing, deploy merge, charge merge, or capture-hop landing onto a friendly tower) that would produce a tower taller than 5 are illegal; the merge is simply removed from the legal-move list. The same cap is enforced at FEN parse time — any FEN containing a tower of 6 or more pieces is rejected as non-canonical. The starting position's 24 singleton towers never exceed height 1, so the rule only affects midgame merges. (Added v5; earlier versions had no height cap.)
 
 <!-- §1 code anchors:
   per-stone hasMoved persistence — Chessckers.scala:1022 (Stone.hasMoved field); preserved through Vector concatenation on merge (lines 297, 313, 331).

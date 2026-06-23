@@ -434,11 +434,12 @@ class ChesskersScorerV2(nn.Module):
         self.se_ratio = se_ratio
         # Full reconstruction recipe (see ChesskersScorer.arch). n_tf_blocks=0 →
         # pure ResNet trunk; >0 interleaves Transformer blocks (residual-first).
-        # se_ratio>0 makes every residual block an SEResidualBlock -> this is V4
-        # (the SE-ResNet generation); the version string reflects it so the
-        # .arch.json sidecar rebuilds the exact net (incl. SE) on load.
+        # se_ratio>0 makes every residual block an SEResidualBlock.
+        # V5 tag: per-depth tower encoding (MAX_TOWER_HEIGHT=5 cap) supersedes
+        # the old V4 aggregate channel encoding — input planes are still 15/16,
+        # but channels 8-12 carry stack[d] piece values instead of counts.
         self.arch = {
-            "version": "v4" if se_ratio > 0 else "v2",
+            "version": "v5",
             "d_hidden": d_hidden, "c_filters": c_filters,
             "n_blocks": n_blocks, "n_tf_blocks": n_tf_blocks,
             "n_heads": n_heads, "tf_ff_mult": tf_ff_mult,
@@ -634,5 +635,5 @@ def build_model(version: str = "v1", **arch):
     (build_model(**model_arch)). Default 'v1' keeps every existing caller — the
     whole fleet — byte-identical until a run opts into 'v2'. 'v4' is the SE-ResNet
     generation: same gather-head class as v2, with se_ratio>0 selecting SE blocks."""
-    cls = ChesskersScorerV2 if version in ("v2", "v4") else ChesskersScorer
+    cls = ChesskersScorerV2 if version in ("v2", "v4", "v5") else ChesskersScorer
     return cls(**arch)

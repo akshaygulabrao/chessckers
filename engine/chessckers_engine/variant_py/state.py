@@ -28,6 +28,10 @@ from dataclasses import dataclass, field
 import chess
 
 
+# Maximum tower height. Stacks are capped at 5 pieces.
+MAX_TOWER_HEIGHT = 5
+
+
 # Canonical initial Chessckers FEN, preserving `KQkq` as scalachess emits at
 # game start (after any move both engines strip `kq` since Chessckers Black
 # has no chess king to castle).
@@ -114,6 +118,11 @@ def parse_fen(fen: str) -> State:
             except ValueError as e:
                 raise ValueError(f"invalid square in overlay: {entry!r}") from e
             stacks[sq] = pieces
+            if len(pieces) > MAX_TOWER_HEIGHT:
+                raise ValueError(
+                    f"tower at {sq_name} has height {len(pieces)}, "
+                    f"exceeds max {MAX_TOWER_HEIGHT}"
+                )
 
     return State(
         board=board,

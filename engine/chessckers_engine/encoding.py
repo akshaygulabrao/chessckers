@@ -9,13 +9,18 @@ Position tensor: shape (15, 8, 8), dtype float32. Channels:
    5  White King
    6  Stone-top           (Chessckers convention: Black-Pawn bitboard = Stone top)
    7  King-top            (Black-King bitboard = King top)
-   8  tower_height        (len(stack) / 24)
-   9  stone_count         (count(Stone) / 24)
-  10  king_count          (count(King) / 24)
-  11  top_is_unmoved_stone (1 iff stack top is unmoved Stone 's')
-  12  second_is_king      (1 iff stack[-2] is a King)
+   8  piece at stack[0]   (bottom; 0.33=s, 0.67=S, 1.0=k, 0=none)
+   9  piece at stack[1]
+  10  piece at stack[2]
+  11  piece at stack[3]
+  12  piece at stack[4]   (top; only written for height-5 towers)
   13  side_to_move        (all-1 if Black to move, else all-0)
   14  rank8_progress      (rank8_count / 3, constant plane — White's rank-8 win counter)
+
+The per-depth channels 8-12 encode the full tower order bottom-to-top. Aggregate
+counts (height, stone/king count, top/second identity) are recoverable from these
+— a height-3 tower has non-zero values in channels 8,9,10 and zeros in 11,12; the
+top piece is the value at the last non-zero channel.
 
 Squares use (file, rank) → tensor index (rank, file). Internal y axis runs
 0 (rank 1) to 7 (rank 8); FEN ranks are read top-to-bottom, so FEN's first
@@ -29,7 +34,7 @@ Move feature vector: shape (240,), dtype float32:
    bit  130       is_deploy        (deployCount set)
    bit  131       is_ortho         (demotionsRequired set)
    bit  132       chain_length / 8
-   bit  133       deploy_count / 24
+   bit  133       deploy_count / MAX_TOWER_HEIGHT
    bit  134       demotions_required / 8
    bits 135..139  promotion one-hot over (none, q, r, b, n)
    bits 140..239  waypoint mask over the 10×10 grid (board + 1-square rim).
@@ -47,6 +52,8 @@ import re
 from typing import Any
 
 import torch
+
+from chessckers_engine.variant_py.state import MAX_TOWER_HEIGHT
 
 POS_C = 15
 MOVE_D = 240
@@ -75,14 +82,14 @@ MV2_K = 12
 MOVE_D_V2 = MV2_SCALAR_BASE + MV2_K  # 114
 # Type-scalar layout (offsets from MV2_SCALAR_BASE):
 #   0 is_capture  1 is_chain  2 is_deploy  3 is_ortho
-#   4 chain_len/8  5 deploy_count/24  6 demotions/8
+#   4 chain_len/8  5 deploy_count/MAX_TOWER_HEIGHT  6 demotions/8
 #   7..11 promotion one-hot (none, q, r, b, n)
 
 # Position channel indices
 CH_W_PAWN, CH_W_KNIGHT, CH_W_BISHOP, CH_W_ROOK, CH_W_QUEEN, CH_W_KING = range(6)
 CH_STONE_TOP, CH_KING_TOP = 6, 7
-CH_TOWER_HEIGHT, CH_STONE_COUNT, CH_KING_COUNT = 8, 9, 10
-CH_TOP_IS_UNMOVED_STONE, CH_SECOND_IS_KING = 11, 12
+CH_DEPTH_BASE = 8   # per-depth stack channels 8..12 (bottom-to-top, cap 5)
+CH_DEPTH_END = CH_DEPTH_BASE + MAX_TOWER_HEIGHT
 CH_SIDE_TO_MOVE = 13
 CH_RANK8 = 14
 
@@ -95,6 +102,9 @@ _WHITE_PIECE_CH = {
     "K": CH_W_KING,
 }
 _BLACK_BITBOARD_CH = {"p": CH_STONE_TOP, "k": CH_KING_TOP}
+
+# Piece character → per-depth channel scalar value.
+_PIECE_DEPTH_VALUE = {"s": 1.0 / 3.0, "S": 2.0 / 3.0, "k": 1.0}
 
 # Move feature offsets
 MV_CAPTURE = 128
@@ -167,18 +177,11 @@ def _encode_position_py(fen: str) -> torch.Tensor:
                 continue
             sq, pieces = entry.split(":", 1)
             x, y = square_xy(sq)
-            height = len(pieces)
-            if height == 0:
+            if len(pieces) == 0:
                 continue
-            stones = sum(1 for p in pieces if p in "sS")
-            kings = sum(1 for p in pieces if p == "k")
-            out[CH_TOWER_HEIGHT, y, x] = height / 24.0
-            out[CH_STONE_COUNT, y, x] = stones / 24.0
-            out[CH_KING_COUNT, y, x] = kings / 24.0
-            if pieces[-1] == "s":
-                out[CH_TOP_IS_UNMOVED_STONE, y, x] = 1.0
-            if height >= 2 and pieces[-2] == "k":
-                out[CH_SECOND_IS_KING, y, x] = 1.0
+            for d, p in enumerate(pieces):
+                if d < MAX_TOWER_HEIGHT:
+                    out[CH_DEPTH_BASE + d, y, x] = _PIECE_DEPTH_VALUE.get(p, 0.0)
 
     if turn == "b":
         out[CH_SIDE_TO_MOVE].fill_(1.0)
@@ -235,27 +238,13 @@ def _encode_position_state_py(state: Any) -> torch.Tensor:
         out[ch, y, x] = 1.0
 
     for sq, pieces in state.stacks.items():
-        height = len(pieces)
-        if height == 0:
+        if len(pieces) == 0:
             continue
         y = sq >> 3
         x = sq & 7
-        # Iterate once for both stones and kings rather than two list-comps.
-        stones = 0
-        kings = 0
-        for p in pieces:
-            if p == "k":
-                kings += 1
-            else:
-                # 's' or 'S'
-                stones += 1
-        out[CH_TOWER_HEIGHT, y, x] = height / 24.0
-        out[CH_STONE_COUNT, y, x] = stones / 24.0
-        out[CH_KING_COUNT, y, x] = kings / 24.0
-        if pieces[-1] == "s":
-            out[CH_TOP_IS_UNMOVED_STONE, y, x] = 1.0
-        if height >= 2 and pieces[-2] == "k":
-            out[CH_SECOND_IS_KING, y, x] = 1.0
+        for d, p in enumerate(pieces):
+            if d < MAX_TOWER_HEIGHT:
+                out[CH_DEPTH_BASE + d, y, x] = _PIECE_DEPTH_VALUE.get(p, 0.0)
 
     if board.turn == chess.BLACK:
         out[CH_SIDE_TO_MOVE].fill_(1.0)
@@ -286,7 +275,7 @@ def _encode_move_py(move: dict[str, Any]) -> torch.Tensor:
         out[MV_ORTHO] = 1.0
 
     out[MV_CHAIN_LEN] = len(waypoints) / 8.0
-    out[MV_DEPLOY_COUNT] = (move.get("deployCount") or 0) / 24.0
+    out[MV_DEPLOY_COUNT] = (move.get("deployCount") or 0) / MAX_TOWER_HEIGHT
     out[MV_DEMOTIONS_REQ] = (move.get("demotionsRequired") or 0) / 8.0
 
     promo = move.get("promotion")
@@ -370,18 +359,11 @@ def encode_position_v2(fen: str) -> torch.Tensor:
             sq, pieces = entry.split(":", 1)
             x, y = square_xy(sq)
             r10, f10 = _board_cell(x, y)
-            height = len(pieces)
-            if height == 0:
+            if len(pieces) == 0:
                 continue
-            stones = sum(1 for p in pieces if p in "sS")
-            kings = sum(1 for p in pieces if p == "k")
-            out[CH_TOWER_HEIGHT, r10, f10] = height / 24.0
-            out[CH_STONE_COUNT, r10, f10] = stones / 24.0
-            out[CH_KING_COUNT, r10, f10] = kings / 24.0
-            if pieces[-1] == "s":
-                out[CH_TOP_IS_UNMOVED_STONE, r10, f10] = 1.0
-            if height >= 2 and pieces[-2] == "k":
-                out[CH_SECOND_IS_KING, r10, f10] = 1.0
+            for d, p in enumerate(pieces):
+                if d < MAX_TOWER_HEIGHT:
+                    out[CH_DEPTH_BASE + d, r10, f10] = _PIECE_DEPTH_VALUE.get(p, 0.0)
 
     if turn == "b":
         out[CH_SIDE_TO_MOVE, 1:9, 1:9] = 1.0
@@ -411,23 +393,12 @@ def encode_position_state_v2(state: Any) -> torch.Tensor:
         out[ch, r10, f10] = 1.0
 
     for sq, pieces in state.stacks.items():
-        height = len(pieces)
-        if height == 0:
+        if len(pieces) == 0:
             continue
         r10, f10 = (sq >> 3) + 1, (sq & 7) + 1
-        stones = kings = 0
-        for p in pieces:
-            if p == "k":
-                kings += 1
-            else:
-                stones += 1
-        out[CH_TOWER_HEIGHT, r10, f10] = height / 24.0
-        out[CH_STONE_COUNT, r10, f10] = stones / 24.0
-        out[CH_KING_COUNT, r10, f10] = kings / 24.0
-        if pieces[-1] == "s":
-            out[CH_TOP_IS_UNMOVED_STONE, r10, f10] = 1.0
-        if height >= 2 and pieces[-2] == "k":
-            out[CH_SECOND_IS_KING, r10, f10] = 1.0
+        for d, p in enumerate(pieces):
+            if d < MAX_TOWER_HEIGHT:
+                out[CH_DEPTH_BASE + d, r10, f10] = _PIECE_DEPTH_VALUE.get(p, 0.0)
 
     if board.turn == chess.BLACK:
         out[CH_SIDE_TO_MOVE, 1:9, 1:9] = 1.0
@@ -472,7 +443,7 @@ def encode_move_v2(move: dict[str, Any]) -> torch.Tensor:
     if move.get("demotionsRequired") is not None:
         out[s + 3] = 1.0
     out[s + 4] = len(waypoints) / 8.0
-    out[s + 5] = (move.get("deployCount") or 0) / 24.0
+    out[s + 5] = (move.get("deployCount") or 0) / MAX_TOWER_HEIGHT
     out[s + 6] = (move.get("demotionsRequired") or 0) / 8.0
     out[s + 7 + _PROMO_INDEX.get(move.get("promotion"), 0)] = 1.0
     return out

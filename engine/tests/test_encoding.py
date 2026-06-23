@@ -1,14 +1,10 @@
 import torch
 
 from chessckers_engine.encoding import (
-    CH_KING_COUNT,
+    CH_DEPTH_BASE,
     CH_KING_TOP,
-    CH_SECOND_IS_KING,
     CH_SIDE_TO_MOVE,
-    CH_STONE_COUNT,
     CH_STONE_TOP,
-    CH_TOP_IS_UNMOVED_STONE,
-    CH_TOWER_HEIGHT,
     CH_W_KNIGHT,
     CH_W_PAWN,
     MOVE_D,
@@ -78,41 +74,42 @@ def test_starting_fen_king_top_marker_hot_on_rank_7():
     assert king_plane[6].tolist() == [1.0] * 8
 
 
-def test_starting_fen_tower_height_is_one_over_24_on_all_24_tower_squares():
+def test_starting_fen_tower_stack_depth_is_one():
+    """All 24 starting towers have height 1 → only channel CH_DEPTH_BASE+0 is non-zero."""
     t = encode_position(INITIAL_FEN)
-    height_plane = t[CH_TOWER_HEIGHT]
-    expected = 1.0 / 24.0
-    nonzero = (height_plane > 0).sum().item()
+    depth0 = t[CH_DEPTH_BASE]  # ch 8 = piece at stack[0] (bottom = top for height-1)
+    nonzero = (depth0 > 0).sum().item()
     assert nonzero == 24
-    # Every nonzero entry equals the singleton-tower height
-    for y in [5, 6, 7]:
-        for x in range(8):
-            assert abs(height_plane[y, x].item() - expected) < 1e-6
+    # Ranks 6 (stones) and 8 (stones) have value ~0.33; rank 7 (kings) has value 1.0
+    for x in range(8):
+        assert abs(depth0[5, x].item() - 1.0/3.0) < 1e-6  # a6..h6 = stone 's'
+        assert abs(depth0[6, x].item() - 1.0) < 1e-6      # a7..h7 = king 'k'
+        assert abs(depth0[7, x].item() - 1.0/3.0) < 1e-6  # a8..h8 = stone 's'
+    # Deeper channels are all zero
+    for d in range(1, 5):
+        assert t[CH_DEPTH_BASE + d].sum().item() == 0.0
 
 
-def test_starting_fen_top_is_unmoved_stone_set_for_initial_stones_only():
-    t = encode_position(INITIAL_FEN)
-    plane = t[CH_TOP_IS_UNMOVED_STONE]
-    # 16 unmoved stones (ranks 6 and 8), 0 elsewhere
-    assert plane.sum().item() == 16.0
-    assert plane[5].tolist() == [1.0] * 8
-    assert plane[7].tolist() == [1.0] * 8
-    assert plane[6].sum().item() == 0.0  # rank 7 is kings
+def test_per_depth_encodes_tower_order():
+    """Tower 'kSs' at e7: bottom=k (1.0), middle=S (0.67), top=s (0.33)."""
+    fen = "8/8/8/8/8/8/8/8[e7:kSs] w - - 0 1"
+    t = encode_position(fen)
+    x, y = 4, 6  # e7
+    assert abs(t[CH_DEPTH_BASE + 0, y, x].item() - 1.0) < 1e-6      # bottom = k
+    assert abs(t[CH_DEPTH_BASE + 1, y, x].item() - 2.0/3.0) < 1e-6   # middle = S
+    assert abs(t[CH_DEPTH_BASE + 2, y, x].item() - 1.0/3.0) < 1e-6   # top = s
+    assert t[CH_DEPTH_BASE + 3, y, x].item() == 0.0  # beyond height
+    assert t[CH_DEPTH_BASE + 4, y, x].item() == 0.0
 
 
-def test_starting_fen_stone_count_and_king_count_normalize_by_24():
-    t = encode_position(INITIAL_FEN)
-    # All 24 starting towers have height 1: stones on 6/8, kings on 7
-    one_over_24 = 1.0 / 24.0
-    assert abs(t[CH_STONE_COUNT, 5, 0].item() - one_over_24) < 1e-6  # a6 stone
-    assert abs(t[CH_KING_COUNT, 6, 0].item() - one_over_24) < 1e-6  # a7 king
-    assert t[CH_STONE_COUNT, 6, 0].item() == 0.0  # a7 has no stones
-    assert t[CH_KING_COUNT, 5, 0].item() == 0.0  # a6 has no kings
-
-
-def test_starting_fen_second_is_king_is_zero_everywhere_for_singleton_towers():
-    t = encode_position(INITIAL_FEN)
-    assert t[CH_SECOND_IS_KING].sum().item() == 0.0
+def test_per_depth_king_under_top():
+    """Tower 'kS': bottom=k (1.0), top=S (0.67)."""
+    fen = "8/8/8/8/8/8/8/8[d4:kS] w - - 0 1"
+    t = encode_position(fen)
+    x, y = 3, 3  # d4
+    assert abs(t[CH_DEPTH_BASE + 0, y, x].item() - 1.0) < 1e-6       # bottom = k
+    assert abs(t[CH_DEPTH_BASE + 1, y, x].item() - 2.0/3.0) < 1e-6    # top = S
+    assert t[CH_DEPTH_BASE + 2, y, x].item() == 0.0
 
 
 def test_side_to_move_plane_zero_when_white_to_move():
@@ -126,28 +123,26 @@ def test_side_to_move_plane_all_ones_when_black_to_move():
     assert t[CH_SIDE_TO_MOVE].sum().item() == 64.0
 
 
-def test_overlay_with_taller_tower_encodes_height_and_second_is_king():
-    # Single tower at e7: bottom King, then Stone(moved), then Stone(unmoved) on top
-    # pieces string is bottom-to-top: "kSs" → height 3, top=s, second=S
+def test_overlay_with_taller_tower_encodes_per_depth():
+    """Tower 'kSs' at e7: bottom=k, middle=S, top=s, the rest zero."""
     fen = "8/8/8/8/8/8/8/8[e7:kSs] w - - 0 1"
     t = encode_position(fen)
     x, y = 4, 6  # e7
-    assert abs(t[CH_TOWER_HEIGHT, y, x].item() - 3 / 24) < 1e-6
-    assert abs(t[CH_STONE_COUNT, y, x].item() - 2 / 24) < 1e-6
-    assert abs(t[CH_KING_COUNT, y, x].item() - 1 / 24) < 1e-6
-    assert t[CH_TOP_IS_UNMOVED_STONE, y, x].item() == 1.0
-    # Second-from-top is S (moved stone), not k → plane stays 0
-    assert t[CH_SECOND_IS_KING, y, x].item() == 0.0
+    assert abs(t[CH_DEPTH_BASE + 0, y, x].item() - 1.0) < 1e-6
+    assert abs(t[CH_DEPTH_BASE + 1, y, x].item() - 2.0/3.0) < 1e-6
+    assert abs(t[CH_DEPTH_BASE + 2, y, x].item() - 1.0/3.0) < 1e-6
+    assert t[CH_DEPTH_BASE + 3, y, x].item() == 0.0
+    assert t[CH_DEPTH_BASE + 4, y, x].item() == 0.0
 
 
-def test_overlay_with_king_under_top_sets_second_is_king():
-    # Tower kS: King at bottom, moved Stone on top → second-from-top is k
+def test_overlay_with_king_under_top_sets_second_depth():
+    """Tower 'kS': bottom=k, top=S."""
     fen = "8/8/8/8/8/8/8/8[d4:kS] w - - 0 1"
     t = encode_position(fen)
     x, y = 3, 3  # d4
-    assert t[CH_SECOND_IS_KING, y, x].item() == 1.0
-    # Top is S, not s, so unmoved-stone marker stays 0
-    assert t[CH_TOP_IS_UNMOVED_STONE, y, x].item() == 0.0
+    assert abs(t[CH_DEPTH_BASE + 0, y, x].item() - 1.0) < 1e-6
+    assert abs(t[CH_DEPTH_BASE + 1, y, x].item() - 2.0/3.0) < 1e-6
+    assert t[CH_DEPTH_BASE + 2, y, x].item() == 0.0
 
 
 # ---- Move encoding ----
@@ -221,7 +216,7 @@ def test_chain_waypoint_mask_includes_rim_squares():
 def test_move_deploy_sets_deploy_flag_and_count():
     v = encode_move(_bare_move(deployCount=3))
     assert v[MV_DEPLOY].item() == 1.0
-    assert abs(v[MV_DEPLOY_COUNT].item() - 3 / 24) < 1e-6
+    assert abs(v[MV_DEPLOY_COUNT].item() - 3 / 5) < 1e-6
 
 
 def test_move_ortho_sets_ortho_flag_and_demotions():
