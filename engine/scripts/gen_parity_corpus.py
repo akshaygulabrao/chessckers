@@ -11,7 +11,7 @@ The C++ parity_test.cc loads the JSONL and asserts its own move-gen + status
 agree. Regenerate after any rule change:
 
     .venv/bin/python scripts/gen_parity_corpus.py \
-        ../akshay-chessckers-0/src/chessckers/corpus/parity_corpus.jsonl
+        ../../akshay-chessckers-0/src/chessckers/corpus/parity_corpus.jsonl
 
 Determinism: seeded RNG + fixed traversal, and (per the env note) Chessckers
 move-gen is deterministic, so the corpus is reproducible.

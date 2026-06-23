@@ -20,7 +20,7 @@ argmax, and only this path (FEN-matched reconstruction) renders the real game.
   cd engine
   .venv/bin/python scripts/watch_game.py "8/8/8/8/3kk3/8/8/4K3[d4:kk,e4:kk] b - - 0 1"   # net plays
   .venv/bin/python scripts/watch_game.py --moves "<selfplay PGN line>" --no-eval         # replay a movelist
-  .venv/bin/python scripts/watch_game.py --chunk ../lczero-server/games/run1/training.1079.gz  # replay a DB game
+  .venv/bin/python scripts/watch_game.py --chunk ../../lczero-server/games/run1/training.1079.gz  # replay a DB game
   # options: --weights X.pt  --sims 200  --max-plies 200  --device cpu|mps  --delay 0.5
 """
 from __future__ import annotations
@@ -48,7 +48,7 @@ def _engine_start_fen() -> str:
     (akshay-chessckers-0/src/chess/board.cc). Read it from source so this default can
     never drift from the engine (it concatenates adjacent C++ string literals); fall
     back to the constant if the file is unreadable."""
-    board = os.path.join(_ENG, "..", "akshay-chessckers-0", "src", "chess", "board.cc")
+    board = os.path.join(_ENG, "..", "..", "akshay-chessckers-0", "src", "chess", "board.cc")
     try:
         m = re.search(r"kStartposFen\s*=\s*(.+?);", open(board).read(), re.S)
         if m:
@@ -106,7 +106,7 @@ def _resolve_weights(arg: str, latest: bool = False) -> list[str]:
     if latest:
         # The live published net the fleet is training right now: the trainer's
         # rolling weights.pt in the server run-dir. Leads so --latest picks it first.
-        cands.insert(0, os.path.join(_ENG, "..", "lczero-server",
+        cands.insert(0, os.path.join(_ENG, "..", "..", "lczero-server",
                                      "trainer", "run1", "weights.pt"))
     found = [p for p in cands if os.path.exists(p)]
     if not found:
@@ -290,7 +290,7 @@ def main() -> int:
                          "'a2a4 e6f7 c3:h5~e2->e2 d6c5[1] ...'.")
     ap.add_argument("--chunk", default="",
                     help="replay a RECORDED ccz1 self-play game (e.g. "
-                         "../lczero-server/games/run1/training.N.gz). Recovers the start FEN and the "
+                         "../../lczero-server/games/run1/training.N.gz). Recovers the start FEN and the "
                          "ACTUAL played moves from the chunk (not the visit-argmax) and renders it. "
                          "Overrides the positional FEN and --moves.")
     ap.add_argument("--no-eval", action="store_true",

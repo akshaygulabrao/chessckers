@@ -199,14 +199,14 @@ def cmd_fresh_run(args):
 
     # 1. Provision (server + engine, no state seed).
     print("\n--- 1/6: provisioning box (toolchain, server, engine) ---")
-    prov = os.path.join(LOCAL_ENGINE, "../lczero-server/scripts/provision_server_vast.sh")
+    prov = os.path.join(LOCAL_ENGINE, "..", "..", "lczero-server", "scripts", "provision_server_vast.sh")
     subprocess.run(["bash", prov],
                    env={**os.environ, "VAST_HOST": host, "VAST_PORT": str(port),
                         "SEED_STATE": "false"}, check=True)
 
     # 2. Rsync + build the fork.
     print("\n--- 2/6: building akshay-chessckers-0 ---")
-    fork_local = os.path.join(LOCAL_ENGINE, "../akshay-chessckers-0")
+    fork_local = os.path.join(LOCAL_ENGINE, "..", "..", "akshay-chessckers-0")
     sh_ok(f"pip3 install meson ninja 2>/dev/null; apt-get install -y libopenblas-dev 2>/dev/null")
     rsync_cmd = ["rsync", "-az", "-e", f"ssh -p {port} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20",
                  f"{fork_local}/", f"root@{host}:/workspace/chessckers/akshay-chessckers-0/",
@@ -219,7 +219,7 @@ def cmd_fresh_run(args):
 
     # 3. Rsync + build the client.
     print("\n--- 3/6: building lczero-client ---")
-    client_local = os.path.join(LOCAL_ENGINE, "../lczero-client")
+    client_local = os.path.join(LOCAL_ENGINE, "..", "..", "lczero-client")
     rsync_cmd2 = ["rsync", "-az", "-e", f"ssh -p {port} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20",
                   f"{client_local}/", f"root@{host}:/workspace/chessckers/lczero-client/",
                   "--exclude=.git/"]
@@ -380,7 +380,7 @@ def main():
         print(f"# See scripts/README.md 'Launching a run'. In short, on the box:")
         print(f"#   {SERVER_DIR}/scripts/reset_fleet.sh         # wipe prior run (DESTRUCTIVE)")
         print(f"#   {SERVER_DIR}/scripts/run_server_vast.sh     # server + trainer bridge")
-        print(f"#   {ENGINE_DIR}/../lczero-client/scripts/launch_vast_direct.sh   # self-play")
+        print(f"#   {ENGINE_DIR}/../../lczero-client/scripts/launch_vast_direct.sh   # self-play")
         print(f"# Set the start FEN in akshay-chessckers-0/src/chess/board.cc (kStartposFen).")
     elif cmd == "fresh-run":
         return cmd_fresh_run(args)

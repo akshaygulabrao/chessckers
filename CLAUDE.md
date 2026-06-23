@@ -2,6 +2,24 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚠️ WHERE THE FLEET RUNS — READ FIRST
+
+**The training fleet runs on a cloud GPU box, NOT on this Mac.** Do not launch
+`launch_server.sh` / `launch_trainer.sh` / `launch_client.sh` locally. All fleet
+operations go through the Vast.ai CUDA box.
+
+- **Fleet command center:** `engine/scripts/cc.py` — resolves the live box,
+  dispatches everything via SSH. Use it. Commands: `cc box`, `cc ssh`, `cc status`,
+  `cc games`, `cc fresh-run`, `cc restart-trainer`, `cc play`, etc.
+- **Box:** Vast.ai instance (resolve with `cc box` or `vastai show instances`).
+  Fleet runs in tmux sessions `cc` (server + trainer) and `cc-client` (self-play).
+- **Server URL** (from `cc box`): public IP + Vast-mapped port (e.g. `http://115.76.162.100:15180`).
+  Internally on the box: `localhost:10100`.
+- **Engine binary:** built ON the box (`-Dbuild_backends=false -Dnvcc=true` for CUDA;
+  `-Dbuild_backends=false` for CPU-only). Never cross-compiled — CUDA needs nvcc there.
+- **This Mac** is for: code editing, `scripts/watch_game.py` analysis, `cc.py` fleet
+  commands, and reading logs. It does NOT run the server/trainer/client.
+
 ## What This Is
 
 Chessckers is a chess-vs-checkers hybrid game. The repository centers on one `engine/` tree (pure Python) — now serving as the project's trainer, rules authority, and analysis tooling (production play, self-play, and the C++ engine have all moved to the lc0-ecosystem forks; see *Current role* below):
@@ -16,23 +34,26 @@ The game logic lives in **PyVariant** (`engine/chessckers_engine/variant_py/`), 
 
 ## Where things live (navigation index)
 
-Jump straight to the file instead of grepping the tree. Paths under `engine/` unless noted; the fleet repos live under this repo at `{lczero-server,lczero-client,akshay-chessckers-0,lczero-training}/`.
+Jump straight to the file instead of grepping the tree. Paths under `engine/` unless noted.
+
+The fleet repos are **sibling directories** (not subdirectories of this repo):
+`../akshay-chessckers-0/`, `../lczero-server/`, `../lczero-client/`, `../lczero-training/`.
 
 **This repo (engine — trainer / rules / analysis):**
 - Rules oracle, Black move-gen: `chessckers_engine/variant_py/moves_black.py`; White: `moves_white.py` (check predicate `_is_white_in_chessckers_check`); state/FEN: `variant_py/state.py`; in-proc API: `variant_py/client.py`
-- C++ rules/engine: **not in this repo** — they live only in the `akshay-chessckers-0` fork (`src/chessckers/`); the in-repo `engine/cpp` port was removed in the lc0-split cleanup
+- C++ rules/engine: **not in this repo** — they live only in the `../akshay-chessckers-0` fork (`src/chessckers/`); the in-repo `engine/cpp` port was removed in the lc0-split cleanup
 - Continuous trainer: `chessckers_engine/train_continuous.py` — optimizer L542 (**Adam**), hyperparam args ~L430 (`--lr`/`--momentum`/`--weight-decay`), LR schedule `_lr_at`, EMA publish, replay buffer ingest/`_drain`
 - Net/arch: `model.py` (`build_model`, V1/V2/V4 SE-ResNet), `encoding.py`, `mcts_puct.py`, `selfplay_az.py` (reference loop)
 - **Analysis — `scripts/watch_game.py [FEN] --moves "<selfplay PGN line>" [--no-eval] [--weights X.pt] [--sims N] [--device mps]`** — replay a PGN move-by-move OR watch the net self-play; renders 10×10 board + WDL eval + top lines. Default FEN = the simplified training start. `--no-eval` skips loading a net. Loads nets via their `.arch.json` sidecar, so V1/V2/V4 (incl. SE-ResNet) all load correctly.
 - Terminal render: `render_board.py`; rules spec: `chessckers.md` (repo root)
 
 **Fleet (subdirectories of this repo):**
-- Live status dashboard: `lczero-server/scripts/fleet_status.py` — processes, games/buffer, trainer step+rate, active arena, db counts
-- Server: `lczero-server/main.go` — `nextGame` (token%3 **slice** dispatch), `createMatch` (slice-0 arena = `matches.games`×5), `uploadNetwork` (SHA dedup → 400 "already exists"; bootstrap sets first net best; regression matches)
-- Server config: `lczero-server/serverconfig.json` — `matches.games` (arena size; ×5 at slice 0), `matches.threshold` (Elo promotion gate, e.g. −20), `matches.parameters` (arena `--visits`/`--temperature`)
-- Ops/launch: `lczero-server/scripts/launch_{server,trainer}.sh` (trainer env knobs: `PUBLISH_GAMES`, `WINDOW_GAMES`, `LR`, `EMA_DECAY`, `MIN_BUFFER`), `reset_fleet.sh`; bridge `lczero-server/trainer/trainer_bridge.py`
-- Clients: `lczero-client/scripts/launch_{client,vast1,vast2}.sh`, `lc0_main.go` (self-play `--visits=800`)
-- Production player: `akshay-chessckers-0` (lc0 fork; own rules copy under `src/chessckers/`, start FEN `src/chess/board.cc`)
+- Live status dashboard: `../lczero-server/scripts/fleet_status.py` — processes, games/buffer, trainer step+rate, active arena, db counts
+- Server: `../lczero-server/main.go` — `nextGame`
+- Server config: `../lczero-server/serverconfig.json`
+- Ops/launch: `../lczero-server/scripts/launch_{server,trainer}.sh`
+- Clients: `../lczero-client/scripts/launch_{client,vast1,vast2}.sh`
+- Production player: `../akshay-chessckers-0` (lc0 fork; own rules copy under `src/chessckers/`, start FEN `src/chess/board.cc`)
 - Training orchestration: `lczero-training/`
 
 **Operational gotchas (so you don't rediscover them):**
@@ -99,7 +120,7 @@ Key invariant: for every Black square, `stacks[sq]`'s top piece matches the bitb
 
 ### AlphaZero engine
 
-`model.py` (`ChesskersScorer`: policy + value heads), `encoding.py` (board/move tensors), `mcts_puct.py` (PUCT MCTS), `selfplay_az.py` (`play_az_game` — the reference self-play loop, used by `train_az`/`replay_buffer`), `inference_server.py` (batched GPU eval), `replay_buffer.py`, `train_az.py`. **Production self-play runs outside this repo**: the lc0-split cutover retired the Python self-play engine (`selfplay_worker_async`/`selfplay_workers_only`/`selfplay_az_async`); every fleet game is now played by the `akshay-chessckers-0` lc0 fork (run by `lczero-client`), which uploads ccz1 games to `lczero-server` for `train_continuous` to consume. Self-play correctness depends on the move-gen + check detection above; `n_sims` should be ≥ 50 (lower yields degenerate visit distributions).
+`model.py` (`ChesskersScorer`: policy + value heads), `encoding.py` (board/move tensors), `mcts_puct.py` (PUCT MCTS), `selfplay_az.py` (`play_az_game` — the reference self-play loop, used by `train_az`/`replay_buffer`), `inference_server.py` (batched GPU eval), `replay_buffer.py`, `train_az.py`. **Production self-play runs outside this repo**: the lc0-split cutover retired the Python self-play engine (`selfplay_worker_async`/`selfplay_workers_only`/`selfplay_az_async`); every fleet game is now played by the `../akshay-chessckers-0` lc0 fork (run by `../lczero-client`), which uploads ccz1 games to `../lczero-server` for `train_continuous` to consume. Self-play correctness depends on the move-gen + check detection above; `n_sims` should be ≥ 50 (lower yields degenerate visit distributions).
 
 ### FEN Extension
 
@@ -121,4 +142,4 @@ The formal spec is in `chessckers.md` (monorepo root). Key points (v3 terms):
 ## Code Style
 
 - **Python**: type hints throughout, dict shapes preserved at the `PyVariantClient` boundary (these mirror what the old Scala server returned). Keep changes surgical.
-- **C++ rules** now live only in the `akshay-chessckers-0` fork (`src/chessckers/`) — a PyVariant rule change must be mirrored there, not in this repo.
+- **C++ rules** now live only in the `../akshay-chessckers-0` fork (`src/chessckers/`) — a PyVariant rule change must be mirrored there, not in this repo.

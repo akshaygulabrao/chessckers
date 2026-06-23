@@ -32,7 +32,7 @@ touches. It is omitted on terminal positions (no legal moves).
 Regenerate after any rule change (alongside gen_parity_corpus.py):
 
     .venv/bin/python scripts/gen_rules_scenarios.py \
-        ../akshay-chessckers-0/src/chessckers/corpus/rules_scenarios.jsonl
+        ../../akshay-chessckers-0/src/chessckers/corpus/rules_scenarios.jsonl
 
 Determinism: no RNG — every position is either an explicit seed FEN or the
 result of an explicit named move, so the corpus is fully reproducible.

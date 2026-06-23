@@ -9,3 +9,10 @@ engine/engine/
 
 # lc0 reference clones (read-only architecture reference, not our code)
 reference/
+
+# Fleet repos are now SIBLING directories, not submodules.
+# These entries prevent accidental re-addition.
+/akshay-chessckers-0/
+/lczero-client/
+/lczero-server/
+/lczero-training/
