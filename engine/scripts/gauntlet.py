@@ -37,7 +37,7 @@ import sys
 # Default to the live fleet run dir (relative to the engine on the box).
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ENG = os.path.dirname(_HERE)
-_DEFAULT_RUN_DIR = os.path.join(_ENG, "..", "lczero-server", "trainer", "run1")
+_DEFAULT_RUN_DIR = os.path.join(_ENG, "..", "..", "lczero-server", "trainer", "run1")
 sys.path.insert(0, _HERE)  # so `import watch_game` resolves regardless of cwd
 from watch_game import DEFAULT_START_FEN  # noqa: E402  (the training start FEN, read from the fork)
 

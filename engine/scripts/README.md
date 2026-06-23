@@ -51,7 +51,7 @@ cc watch --device mps     # latest net plays a fresh game from the start FEN
 trainer reads `--lr` etc. once at startup). It captures the live deployment env from
 the running bridge, Ctrl-Cs the trainer for a clean shutdown, waits for a **fresh**
 `replay_buffer.pkl` (aborting rather than losing the ~4000-game window), relaunches
-warm with the new LR, and verifies. The heavy lifting is `lczero-server/scripts/restart_trainer.sh`
+warm with the new LR, and verifies. The heavy lifting is `../lczero-server/scripts/restart_trainer.sh`
 (run on the box) so no long command is ever pasted — a terminal soft-wrap newline in a
 `tmux send-keys` line silently breaks the relaunch.
 
@@ -80,13 +80,13 @@ cc fresh-run --run-name=V5_exp2 --arch=v5 --parallelism=64
 ```bash
 # set the start position (one mechanical step the helper does safely):
 FEN='3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] b - - 0 1' CONFIRM=yes \
-  lczero-server/scripts/new_run.sh          # rewrites kStartposFen in board.cc
+  ../lczero-server/scripts/new_run.sh          # rewrites kStartposFen in board.cc
 
 # rebuild the fork engine (board.cc changed) — see chessckers-engine-cuda-linux-port memory
 # then (DESTRUCTIVE — wipes the prior run):
-lczero-server/scripts/reset_fleet.sh
-lczero-server/scripts/run_server_vast.sh          # server + trainer bridge
-lczero-client/scripts/launch_vast_direct.sh       # self-play
+../lczero-server/scripts/reset_fleet.sh
+../lczero-server/scripts/run_server_vast.sh          # server + trainer bridge
+../lczero-client/scripts/launch_vast_direct.sh       # self-play
 ```
 
 Trainer knobs are env vars on `launch_trainer.sh` (`LR`, `WINDOW_GAMES`,
@@ -119,7 +119,7 @@ loop to accumulate a CSV, then plot it:
 while true; do cc run run_doctor.py --csv run_metrics.csv >/dev/null; sleep 300; done
 ```
 
-The fleet's own dashboard is `cc status` (it runs `lczero-server/scripts/fleet_status.py`
+The fleet's own dashboard is `cc status` (it runs `../lczero-server/scripts/fleet_status.py`
 on the box; that script lives outside engine, so `cc run` can't reach it). It shows the
 LIVE arena match + the gate's recent promote/reject decisions — it used to hardcode
 "arenas removed" (false since the 2026-06-13 re-enable). Its "latest Xm ago" field's
@@ -203,7 +203,7 @@ undoes your last move and `q` quits. To watch the net play ITSELF instead, use
 | `ladder.py` | box | round-robin / vs-best Elo + score matrix over sampled nets |
 | `gauntlet.py` | box | **current net vs all previous snapshots** — strength + regression curve |
 | `play_net.py` | local | **human-vs-net** play from any FEN (numbered move menu) |
-| `lczero-server/scripts/new_run.sh` | box | guarded fresh-run setup (sets start FEN) |
+| `../lczero-server/scripts/new_run.sh` | box | guarded fresh-run setup (sets start FEN) |
 
 ## Gotchas (hard-won)
 
