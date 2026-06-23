@@ -461,7 +461,7 @@ def main() -> int:
     p.add_argument("--d-hidden", type=int, default=256)
     p.add_argument("--c-filters", type=int, default=96)
     p.add_argument("--n-blocks", type=int, default=4)
-    p.add_argument("--arch-version", choices=["v1", "v2", "v4"], default="v1",
+    p.add_argument("--arch-version", choices=["v1", "v2", "v4", "v5"], default="v1",
                    help="Net arch: v1 (pooled), v2 (gather head + optional transformer), "
                         "v4 (gather head + Squeeze-Excitation ResNet blocks).")
     p.add_argument("--tf-blocks", type=int, default=0,
@@ -528,11 +528,11 @@ def main() -> int:
     arch_kwargs = {
         "d_hidden": args.d_hidden, "c_filters": args.c_filters, "n_blocks": args.n_blocks,
     }
-    if args.arch_version in ("v2", "v4"):
+    if args.arch_version in ("v2", "v4", "v5"):
         arch_kwargs.update(
             n_tf_blocks=args.tf_blocks, n_heads=args.tf_heads, tf_ff_mult=args.tf_ff_mult,
         )
-    if args.arch_version == "v4":
+    if args.arch_version in ("v4", "v5"):
         arch_kwargs.update(se_ratio=args.se_ratio)  # SE-ResNet blocks
     model = build_model(version=args.arch_version, **arch_kwargs).to(device)
     if args.base:
