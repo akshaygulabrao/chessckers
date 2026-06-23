@@ -5,12 +5,12 @@ This is the real-AZ architecture: self-play runs SEPARATELY — the lc0 fleet
 the server feeds their chunks into `<run-dir>/buffer`. This trainer never pauses:
 
   - continuously INGESTS new game pkls into a rolling replay buffer (cap N positions),
-  - does SGD steps NON-STOP on sampled minibatches,
+  - does training steps NON-STOP on sampled minibatches,
   - PUBLISHES `weights.pt` on a timer (`--publish-seconds`, NOT every step) — the
     self-play workers + the leena sidecar hot-reload it on their mtime poll, so the
     ~1.3s/10MB leena copy cost is amortized (publish every ~45s -> a few % overhead),
   - throttles training to `--replay-factor` x (positions ingested) so it can't
-    overfit a small buffer when self-play is slower than SGD,
+    overfit a small buffer when self-play is slower than training,
   - checkpoints + logs every `--ckpt-seconds`.
 
 Self-play and training OVERLAP (self-play on CPU, training on MPS), reclaiming the
@@ -263,7 +263,7 @@ def _window_cap(games_seen: int, min_w: int, max_w: int, alpha: float) -> int:
 # Replay-buffer snapshot: the in-RAM window persisted to disk so a restart (to
 # tweak a hyperparameter) resumes the EXACT training state — buffer positions,
 # the per-game sizes that drive window eviction, the ingest counters that drive
-# the replay-factor throttle + window ramp, AND the optimizer state (SGD momentum
+# the replay-factor throttle + window ramp, AND the optimizer state (Adam
 # + the step counter that drives the LR schedule) — with no cold rebuild. This is
 # the lc0 "data lives on disk" property for our RAM-windowed trainer. Distinct
 # from --archive-dir (a cold tier of WHOLE games for re-labeling): the snapshot
@@ -287,9 +287,9 @@ def _to_cpu(o):
 def _save_buffer_snapshot(path: Path, buf: list, game_sizes: "deque[int]",
                           games_seen: int, positions_ingested: int,
                           steps: int, opt_state: "dict | None") -> None:
-    """Atomically persist the live replay window AND the optimization process (SGD
+    """Atomically persist the live replay window AND the optimization process (Adam
     momentum + the step counter that drives the LR schedule), so a restart resumes
-    where it left off instead of re-warming the LR and zeroing momentum. Best-effort:
+    where it left off instead of re-warming the LR and zeroing optimizer state. Best-effort:
     a write failure is logged and never interrupts shutdown. tmp + os.replace so a
     torn write can never replace a good snapshot."""
     try:
@@ -337,12 +337,12 @@ _STEP_STATE_VERSION = 1
 
 
 def _save_step_state(path: Path, steps: int, opt_state: "dict | None") -> None:
-    """Persist JUST the training clock (LR-schedule step counter) + SGD momentum,
+    """Persist JUST the training clock (LR-schedule step counter) + Adam optimizer state,
     decoupled from the large replay-buffer snapshot so it can be written on the
     FREQUENT publish cadence (crash-safe) instead of only at clean shutdown. This is
     what keeps `steps` from resetting to 0 after a SIGKILL / crash / reboot (the
     buffer snapshot, written shutdown-only, would be stale or absent). Small (~MBs:
-    momentum buffers only). tmp + os.replace so a torn write can't clobber a good one."""
+    Adam state buffers only). tmp + os.replace so a torn write can't clobber a good one."""
     try:
         tmp = path.with_suffix(".pkl.tmp")
         with open(tmp, "wb") as f:
@@ -419,7 +419,7 @@ def main() -> int:
     p.add_argument("--min-buffer", type=int, default=2000, help="start training once the buffer reaches this")
     p.add_argument("--replay-factor", type=float, default=8.0,
                    help="cap total samples at this x positions-ingested (prevents overfitting a small buffer "
-                        "when self-play is slower than SGD); 0 = unthrottled")
+                        "when self-play is slower than training); 0 = unthrottled")
     p.add_argument("--per-game-keep", type=float, default=1.0,
                    help="per-game downsampling (lc0-style SKIP): keep each position of a game with this "
                         "probability before it enters the live replay window — consecutive plies are "
@@ -428,9 +428,10 @@ def main() -> int:
                         "game-diversity ~4x (positions_ingested grows ~4x slower, so the replay-factor "
                         "throttle permits proportionally fewer steps; raise --replay-factor to offset).")
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=2e-2,
-                   help="base LR (SGD-scale, ~20x the old Adam 1e-3); warmed up via --lr-warmup-steps")
-    p.add_argument("--momentum", type=float, default=0.9, help="SGD Nesterov momentum (lc0/AZ: 0.9)")
+    p.add_argument("--lr", type=float, default=1e-3,
+                   help="Adam learning rate")
+    p.add_argument("--momentum", type=float, default=0.9,
+                   help="Adam beta1 (first-moment decay)")
     p.add_argument("--weight-decay", type=float, default=1e-4, help="L2 weight decay (lc0/AZ: 1e-4)")
     p.add_argument("--grad-clip", type=float, default=1000.0)
     p.add_argument("--value-loss-weight", type=float, default=1.0)
@@ -471,13 +472,13 @@ def main() -> int:
     p.add_argument("--se-ratio", type=int, default=8,
                    help="V4: Squeeze-Excitation reduction ratio (channels c -> c/r in the SE bottleneck).")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--max-steps", type=int, default=0, help="stop after N SGD steps (0 = until STOP)")
+    p.add_argument("--max-steps", type=int, default=0, help="stop after N training steps (0 = until STOP)")
     p.add_argument("--max-games", type=int, default=0,
                    help="stop the WHOLE run after N games ingested (local+leena); 0 = until STOP")
     # --- Phase 1: publish gating on TRAINING PROGRESS, not wall-clock. Any set
     #     trigger fires a publish; --publish-seconds stays as an optional floor. ---
     p.add_argument("--publish-steps", type=int, default=0,
-                   help="publish after this many SGD steps since the last publish (0 = off)")
+                   help="publish after this many training steps since the last publish (0 = off)")
     p.add_argument("--publish-games", type=int, default=0,
                    help="publish after this many games ingested since the last publish (0 = off)")
     # --- Phase 2: lc0-style generational training (windowed data, LR schedule, SWA/EMA). ---
@@ -553,7 +554,7 @@ def main() -> int:
         return lr
 
     # --- Phase 2: EMA of weights (continuous analog of lc0 SWA). The PUBLISHED net
-    #     is the EMA; SGD keeps running on `model`. GroupNorm => no BN stats to
+    #     is the EMA; Adam keeps running on `model`. GroupNorm => no BN stats to
     #     recalibrate, so the average is directly loadable. ---
     ema_model = None
     if args.ema_decay:
@@ -625,7 +626,7 @@ def main() -> int:
     # --no-prime forces a cold start (waits for --min-buffer).
     step_state_path = run_dir / "train_state.pkl"
     snap = None if args.no_prime else _load_buffer_snapshot(snapshot_path)
-    # The training CLOCK (step counter + SGD momentum) persists via TWO sources: the
+    # The training CLOCK (step counter + Adam state) persists via TWO sources: the
     # buffer snapshot (clean-shutdown only) and the train_state sidecar (written every
     # publish, so it survives a crash/SIGKILL). Resume from whichever is MORE ADVANCED
     # — after a clean stop the snapshot wins (it's >= the last publish); after a crash
@@ -649,7 +650,7 @@ def main() -> int:
             log.info("[train] primed replay window from archive: %d positions (cap %d)", len(buf), args.buffer_cap)
     elif args.no_prime:
         log.info("[train] cold start (--no-prime): not priming from snapshot/archive; trainer waits for min_buffer")
-    # Resume the OPTIMIZATION process: the SGD momentum buffers. load_state_dict
+    # Resume the OPTIMIZATION process: the Adam state buffers. load_state_dict
     # overwrites the param-group knobs with the saved ones, so re-apply the CURRENT
     # CLI knobs afterward — a restart to TWEAK --lr/--momentum/--weight-decay must
     # still take effect; only the momentum BUFFERS carry over. Best-effort: an arch
@@ -662,9 +663,9 @@ def main() -> int:
             opt.load_state_dict(resume_opt)
             for g, hp in zip(opt.param_groups, fresh_hyper):
                 g.update(hp)
-            log.info("[train] resumed optimizer state (SGD momentum + LR schedule at step %d)", resume_steps)
+            log.info("[train] resumed optimizer state (Adam + LR schedule at step %d)", resume_steps)
         except (ValueError, KeyError, RuntimeError) as e:
-            log.warning("[train] could not resume optimizer state (%s) — fresh momentum; "
+            log.warning("[train] could not resume optimizer state (%s) — fresh Adam; "
                         "LR schedule still resumes at step %d", e, resume_steps)
     steps = resume_steps   # resume the LR-schedule clock (warmup/decay)
     games_seen = snap["games_seen"] if snap else 0
@@ -768,7 +769,7 @@ def main() -> int:
             max_norm=(args.grad_clip if args.grad_clip and args.grad_clip > 0 else float("inf")),
         ))
         # On a log-due step, snapshot weights before/after to measure ||Δw||/||w|| (the
-        # scale-free "update-to-weight ratio"; healthy SGD ~1e-3, >1e-2 => steps too big).
+        # scale-free "update-to-weight ratio"; healthy ~1e-3, >1e-2 => steps too big).
         measure_upd = log_due
         if diag:
             lwin_vsign = diag["value_sign_agree"]
