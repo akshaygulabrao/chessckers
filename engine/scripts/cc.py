@@ -17,7 +17,8 @@ scripts to run on it.
   cc watch [watch args]         # pull the latest fleet net + watch it self-play live
   cc restart-trainer [LR]       # clean warm-restart the trainer (optionally change LR)
   cc play [play args]           # play a human-vs-net game against the latest fleet net
-  cc launch                     # print the fresh-run runbook
+  cc fresh-run [--run-name=X] [--arch=v5] [--parallelism=32]
+                              # provision + launch a fresh training run from scratch
 
 cc games — render the network's actual self-play games (newest by default):
   cc games                      # newest recorded game, board move-by-move (no net needed)
@@ -155,6 +156,109 @@ def _fetch_fleet_net(box):
     return local
 
 
+def cmd_fresh_run(args):
+    """Provision + launch a fresh training run on the resolved vast.ai box.
+
+    One command that does everything between "empty box" and "fleet running":
+      1. provision the box (toolchain, repos, build server + engine)
+      2. rsync + build the akshay-chessckers-0 fork with the right flags
+      3. rsync + build the lczero-client
+      4. reset fleet state (wipe old DB/nets/games)
+      5. launch server + trainer in tmux 'cc'
+      6. launch self-play client in tmux 'cc-client'
+
+    Flags override defaults:
+      cc fresh-run --run-name V5_myexp --arch v5 --parallelism 32
+    """
+    box = resolve()
+    host = box.get("ip") or box["ssh_host"]
+    port = box.get("ssh_port_direct") or box["ssh_port"]
+    ssh_cmd = ["ssh", "-p", str(port), f"root@{host}",
+               "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20"]
+    def sh(cmd):
+        print(f"  $ {cmd}")
+        return subprocess.call(ssh_cmd + [cmd])
+    def sh_ok(cmd):
+        r = sh(cmd)
+        if r != 0:
+            sys.exit(f"Command failed (exit {r}): {cmd}")
+        return r
+
+    run_name = "V5_e8d8"
+    arch = "v5"
+    parallelism = "32"
+    for a in args:
+        if a.startswith("--run-name="):
+            run_name = a.split("=", 1)[1]
+        elif a.startswith("--arch="):
+            arch = a.split("=", 1)[1]
+        elif a.startswith("--parallelism="):
+            parallelism = a.split("=", 1)[1]
+
+    print(f"=== fresh-run: box={host}:{port}  run={run_name}  arch={arch}  p={parallelism} ===")
+
+    # 1. Provision (server + engine, no state seed).
+    print("\n--- 1/6: provisioning box (toolchain, server, engine) ---")
+    prov = os.path.join(LOCAL_ENGINE, "../lczero-server/scripts/provision_server_vast.sh")
+    subprocess.run(["bash", prov],
+                   env={**os.environ, "VAST_HOST": host, "VAST_PORT": str(port),
+                        "SEED_STATE": "false"}, check=True)
+
+    # 2. Rsync + build the fork.
+    print("\n--- 2/6: building akshay-chessckers-0 ---")
+    fork_local = os.path.join(LOCAL_ENGINE, "../akshay-chessckers-0")
+    sh_ok(f"pip3 install meson ninja 2>/dev/null; apt-get install -y libopenblas-dev 2>/dev/null")
+    rsync_cmd = ["rsync", "-az", "-e", f"ssh -p {port} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20",
+                 f"{fork_local}/", f"root@{host}:/workspace/chessckers/akshay-chessckers-0/",
+                 "--exclude=build/", "--exclude=.git/"]
+    subprocess.run(rsync_cmd, check=True)
+    sh_ok("export PATH=$HOME/.local/bin:$PATH && cd /workspace/chessckers/akshay-chessckers-0 && "
+          "rm -rf build/release && meson setup build/release --buildtype release "
+          "-Dblas=false -Dplain_cuda=false -Donnx=false -Dbuild_backends=false && "
+          "ninja -C build/release akshay-chessckers-0")
+
+    # 3. Rsync + build the client.
+    print("\n--- 3/6: building lczero-client ---")
+    client_local = os.path.join(LOCAL_ENGINE, "../lczero-client")
+    rsync_cmd2 = ["rsync", "-az", "-e", f"ssh -p {port} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20",
+                  f"{client_local}/", f"root@{host}:/workspace/chessckers/lczero-client/",
+                  "--exclude=.git/"]
+    subprocess.run(rsync_cmd2, check=True)
+    sh_ok("export PATH=/usr/local/go/bin:$PATH && cd /workspace/chessckers/lczero-client && go build -o lc0-client .")
+    sh_ok("mkdir -p /workspace/chessckers/lczero-client/.enginebin && "
+          "ln -sfT /workspace/chessckers/akshay-chessckers-0/build/release/akshay-chessckers-0 "
+          "/workspace/chessckers/lczero-client/.enginebin/akshay-chessckers-0")
+
+    # 4. Reset fleet (DESTRUCTIVE).
+    print("\n--- 4/6: resetting fleet (wipe old state) ---")
+    sh_ok("cd /workspace/chessckers/lczero-server && bash scripts/reset_fleet.sh")
+
+    # 5. Launch server + trainer in tmux 'cc'.
+    print("\n--- 5/6: launching server + trainer ---")
+    sh_ok(f"tmux kill-session -t cc 2>/dev/null; sleep 1; "
+          f"SRV=/workspace/chessckers/lczero-server ENG=/workspace/chessckers/engine; "
+          f"cd $SRV && tmux new-session -d -s cc -n server -c $SRV && "
+          f"tmux send-keys -t cc:server "
+          f"'cd '\"'\"'$SRV'\"'\"' && PATH=/usr/local/go/bin:\$PATH RUN_NAME='\"'\"'{run_name}'\"'\"' scripts/launch_server.sh 2>&1 | tee -a server.log' C-m && "
+          f"tmux new-window -t cc -n trainer -c $SRV && sleep 0.5 && "
+          f"tmux send-keys -t cc:trainer "
+          f"'cd '\"'\"'$SRV'\"'\"' && sleep 6 && ENGINE_DIR='\"'\"'$ENG'\"'\"' SERVER=http://localhost:10100 ARCH_VERSION={arch} scripts/launch_trainer.sh 2>&1 | tee -a trainer.log' C-m")
+
+    # 6. Launch client in tmux 'cc-client'.
+    print("\n--- 6/6: launching self-play client ---")
+    sh_ok(f"tmux kill-session -t cc-client 2>/dev/null; sleep 1; "
+          f"CL=/workspace/chessckers/lczero-client; "
+          f"cd $CL && tmux new-session -d -s cc-client -n selfplay -c $CL && sleep 0.5 && "
+          f"tmux send-keys -t cc-client "
+          f"'export PATH='\"'\"'$CL/.enginebin:\$PATH'\"'\"'; cd '\"'\"'$CL'\"'\"'; ./lc0-client -hostname http://localhost:10100 -user vast -password chessckers -run 1 -parallelism {parallelism} 2>&1 | tee -a client.log' C-m")
+
+    print(f"\n=== fresh-run complete ===")
+    print(f"  ssh -p {port} root@{host} -t tmux attach -t cc     # server + trainer")
+    print(f"  ssh -p {port} root@{host} -t tmux attach -t cc-client  # self-play")
+    print(f"  cc status                                           # fleet dashboard")
+    return 0
+
+
 def cmd_games(args):
     """Pull a RECORDED self-play game off the box and render its ACTUAL moves locally."""
     box = resolve()
@@ -278,6 +382,8 @@ def main():
         print(f"#   {SERVER_DIR}/scripts/run_server_vast.sh     # server + trainer bridge")
         print(f"#   {ENGINE_DIR}/../lczero-client/scripts/launch_vast_direct.sh   # self-play")
         print(f"# Set the start FEN in akshay-chessckers-0/src/chess/board.cc (kStartposFen).")
+    elif cmd == "fresh-run":
+        return cmd_fresh_run(args)
     else:
         sys.exit(f"cc: unknown command {cmd!r}\n{__doc__}")
     return 0

@@ -31,7 +31,8 @@ Then, from **any directory**:
 | `cc watch [opts]` | pull the latest fleet net + watch it self-play live | box→local |
 | `cc restart-trainer [LR]` | **hardened clean warm-restart** (snapshot-guarded; optionally change LR) | box |
 | `cc play [opts]` | **play a human-vs-net game** against the latest fleet net | box→local |
-| `cc launch` | print the fresh-run runbook | local |
+| `cc fresh-run [opts]` | **provision + launch a complete training run from scratch** | box |
+| `cc launch` | print the fresh-run runbook (manual steps) | local |
 
 `cc games` is the quick way to eyeball what the network is actually playing — it
 fetches the chunk and renders the *actual sampled moves* (not the visit-argmax)
@@ -65,9 +66,16 @@ cc restart-trainer 0.002 --dry-run  # show the plan + captured env, touch nothin
 
 ## 1. Launching a run
 
-The fleet is the lc0 ecosystem on the box: `cc-server` (collects games, serves
-nets) + `trainer_bridge → chessckers_engine.train_continuous` (this repo) +
-`akshay-chessckers-0` self-play clients. To start a fresh run **on the box**:
+**One command (recommended):** `cc fresh-run` provisions the box, builds the fork
++ client, resets fleet state, and launches server/trainer/client — all 6 steps
+in one shot.
+
+```bash
+cc fresh-run                          # defaults: V5_e8d8, v5 arch, 32 parallelism
+cc fresh-run --run-name=V5_exp2 --arch=v5 --parallelism=64
+```
+
+**Manual steps** (what `cc fresh-run` automates):
 
 ```bash
 # set the start position (one mechanical step the helper does safely):
