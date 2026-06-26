@@ -17,7 +17,9 @@
 | Optimizer | Adam **lr=1e-3** (run 6's winner) |
 | Self-play visits | 800 (visits ablation deferred — see deferred-low-visits.md) |
 | **Rule change** | **Charge of *d* squares demotes the bottom *d* Kings (forced); no player choice** |
-| Status | in implementation (spec + dual-impl edits + parity re-validation) |
+| Fleet box | vast 42618148 (RTX 3060) — cold-relaunched 2026-06-26 |
+| Started | 2026-06-26 |
+| Status | **active** — cold launched, parity-validated, self-play running |
 
 ## Hypothesis
 
@@ -100,8 +102,17 @@ A move-gen rule change must stay in sync across both oracles + spec + encoding (
   strength" rests **only** on the strategic argument (bottom-*d* keeps the top Kings ≈ optimal) and
   **must be measured** vs run 6's net — it is NOT an encoding free pass. The speedup is still the
   legal-move/branching reduction; `encoding.py` itself needs no edit (move vector unchanged).
-- **Remaining:** fork C++ rules copy (#3, `../akshay-chessckers-0/src/chessckers/movegen.hpp` +
-  rebuild) — the production player; display/parse spot-check (#5); parity re-validation (#6).
+- `06-26` **Fork C++ (#3) DONE + cold launched.** Mirrored `black_charge_moves` in
+  `movegen.hpp` (bottom-*d*, removed `combinations`); committed lc0 `b609e41`. Backed up run 6's
+  net first, stopped its fleet, `cc fresh-run --run-name=V6_e8d8_botcharge --arch=v5 -p32` — the
+  v6 fork **compiled clean** and the launch used the fixed (absolute-path) tmux commands. Trainer
+  verified `lr=1e-3 / arch=v5 c48 b5 / base=random init` (cold); self-play ~8366 games/day.
+- `06-26` **Parity (#6) validated.** A fork-generated v6 game (55 plies, incl. orthogonal charges
+  like `d8e8` with no `{}` suffix) replayed **cleanly through the local PyVariant v6 oracle**, same
+  WHITE-WIN outcome. Smoke test (one game = fork moves ⊆ PyVariant-legal), not an exhaustive
+  per-position set-equality; the fleet will surface any deeper divergence (replay failures).
+- **Now training.** Watch for: branching/legal-move drop vs run 6, games-to-converge, and the
+  strength gate — net vs run 6's backed-up net (`~/chessckers-backups/run6-e8d8-lr1e3-20260626/`).
 
 ## Result
 
