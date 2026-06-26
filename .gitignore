@@ -16,3 +16,5 @@ reference/
 /lczero-client/
 /lczero-server/
 /lczero-training/
+# Local Pi runtime state
+.atl/

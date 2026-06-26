@@ -36,8 +36,10 @@ The game logic lives in **PyVariant** (`engine/chessckers_engine/variant_py/`), 
 
 Jump straight to the file instead of grepping the tree. Paths under `engine/` unless noted.
 
-The fleet repos are **sibling directories** (not subdirectories of this repo):
-`../akshay-chessckers-0/`, `../lczero-server/`, `../lczero-client/`, `../lczero-training/`.
+The fleet repos are **sibling directories** on this Mac (`../lczero-server/`, `../lczero-client/`,
+`../akshay-chessckers-0/`, `../lczero-training/`) and **subdirectories of `/workspace/chessckers/`** on
+the box (which syncs this repo into `/workspace/chessckers/engine/`). Paths in this doc are
+relative to this repo on the Mac unless noted; `cc.py` uses box-side paths.
 
 **This repo (engine — trainer / rules / analysis):**
 - Rules oracle, Black move-gen: `chessckers_engine/variant_py/moves_black.py`; White: `moves_white.py` (check predicate `_is_white_in_chessckers_check`); state/FEN: `variant_py/state.py`; in-proc API: `variant_py/client.py`
@@ -47,17 +49,22 @@ The fleet repos are **sibling directories** (not subdirectories of this repo):
 - **Analysis — `scripts/watch_game.py [FEN] --moves "<selfplay PGN line>" [--no-eval] [--weights X.pt] [--sims N] [--device mps]`** — replay a PGN move-by-move OR watch the net self-play; renders 10×10 board + WDL eval + top lines. Default FEN = the simplified training start. `--no-eval` skips loading a net. Loads nets via their `.arch.json` sidecar, so V1/V2/V4 (incl. SE-ResNet) all load correctly.
 - Terminal render: `render_board.py`; rules spec: `chessckers.md` (repo root)
 
-**Fleet (subdirectories of this repo):**
+**Fleet:**
 - Live status dashboard: `../lczero-server/scripts/fleet_status.py` — processes, games/buffer, trainer step+rate, active arena, db counts
 - Server: `../lczero-server/main.go` — `nextGame`
-- Server config: `../lczero-server/serverconfig.json`
+- Server config: `../lczero-server/serverconfig.json` (port `:10100`)
 - Ops/launch: `../lczero-server/scripts/launch_{server,trainer}.sh`
 - Clients: `../lczero-client/scripts/launch_{client,vast1,vast2}.sh`
 - Production player: `../akshay-chessckers-0` (lc0 fork; own rules copy under `src/chessckers/`, start FEN `src/chess/board.cc`)
-- Training orchestration: `lczero-training/`
+- Training orchestration: `../lczero-training/`
 
 **Operational gotchas (so you don't rediscover them):**
-- The trainer does **not** resume on restart (`launch_trainer.sh` passes no `--base`) → it rebuilds from **random init**. Random init is deterministic (`seed 0` + fixed arch) → the first `upload_network` after a restart usually returns **400 "Network already exists"**, which is a benign SHA dedup (the bridge treats it as non-fatal).
+- The trainer **warm-resumes by default**: `launch_trainer.sh` auto-detects an existing `weights.pt`
+  and passes `--base` so training picks up where it left off (SGD momentum, LR schedule, and
+  replay buffer all restored). To force a **random init**, set `BASE=""` explicitly. Random init
+  is deterministic (`seed 0` + fixed arch) → the first `upload_network` after a cold restart
+  usually returns **400 "Network already exists"**, which is a benign SHA dedup (the bridge
+  treats it as non-fatal).
 - **Restarting `cc-server` preserves all state** (SQLite DB + `networks/` on disk; the trainer is a separate process holding its own RAM buffer). Only `reset_fleet.sh` wipes things.
 - **Match slicing footgun:** `target_slice` 1/2/3 only reaches clients whose `token%3` matches; a 1–2 node fleet can't cover all slices, so a sliced match starves at 0/N forever. Keep all matches at **slice 0** on a small fleet.
 - Dashboard "trained %" = `GamesPlayed / 40000` (`main.go`) — an inherited lc0 UI constant, not a real convergence target.
@@ -85,8 +92,8 @@ The `slow` marker tags end-to-end tests that spawn subprocess workers (self-play
 
 **Training.** `chessckers_engine.train_continuous` is the continuous AlphaZero trainer: it ingests ccz1 game chunks into a rolling replay buffer, does non-stop SGD, and publishes `weights.pt` + a C++-loadable `weights.bin` on a timer. When the fleet is running it is **driven by the lc0 ecosystem**, not launched here directly — `lczero-server/scripts/launch_trainer.sh` runs a bridge (`lczero-server/trainer/trainer_bridge.py`) that spawns `train_continuous`, feeds it the games the server collected, and uploads each fresh `weights.bin` back for promotion.
 
-**The fleet repos** live under this repo (`lczero-server/`, `lczero-client/`, `akshay-chessckers-0/`, `lczero-training/`). When running, they would be foreground tabs:
-- `lczero-server/scripts/launch_server.sh` — the lc0 server: collects ccz1 games, distributes nets, runs promotion matches (port 9830).
+On the box, they would be foreground tabs:
+- `lczero-server/scripts/launch_server.sh` — the lc0 server: collects ccz1 games, distributes nets, runs promotion matches (port 10100, from `serverconfig.json`).
 - `lczero-server/scripts/launch_trainer.sh` — the trainer bridge → `chessckers_engine.train_continuous` (this repo).
 - `lczero-client/scripts/launch_client.sh` (+ `launch_leena.sh`) — self-play clients running the `akshay-chessckers-0` engine, uploading games to the server.
 
