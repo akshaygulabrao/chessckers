@@ -18,3 +18,4 @@ reference/
 /lczero-training/
 # Local Pi runtime state
 .atl/
+.pi/
