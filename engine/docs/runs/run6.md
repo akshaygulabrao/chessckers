@@ -15,7 +15,7 @@
 | Key commit / branch | `chore/run-ledger-and-config-defaults` (cb844f8) + fleet-script fixes (see Log) |
 | Fleet box | vast id **42618148** (RTX 3060), server `http://171.248.168.109:39411` (int `:10100`) |
 | Started | 2026-06-26 |
-| Status | active |
+| Status | **done** — converged ~8k games; baseline for [run 7](run7.md) |
 
 ## Hypothesis
 
@@ -75,5 +75,10 @@ vs [run 5](run5.md) — **one change only**:
 
 ## Result
 
-<leave empty while active — record games-to-convergence vs run 5's ~38k, and whether the
-result curve is smoother>
+**Converged at ~8k games** — roughly **5× faster than run 5's ~38k** at lr=2e-2. The lr=1e-3
+ablation succeeded: the lower LR learns the e8/d8 Black mate substantially faster (in games).
+Confirms run 5's result was undertraining made worse by too-high LR, not a different ceiling.
+This converged net is the **baseline** for [run 7](run7.md)'s strength comparison.
+
+(User also noted run 6 "finished in measurably longer" — wall-clock vs run 5 left as an open
+detail; the games-to-converge comparison, 8k vs ~38k, is the headline and clearly favors 1e-3.)

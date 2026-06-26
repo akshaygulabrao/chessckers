@@ -1,69 +1,90 @@
-# Run 7 — e8/d8, low self-play visits (800 → 100)
+# Run 7 — forced bottom-N charge demotion (rule change)
 
-> **PLANNED / PARKED** (drafted 2026-06-26 while [run 6](run6.md) is still training, to
-> capture the idea). Most Identity fields inherit run 6's *winning* config and are filled
-> once run 6 concludes. The one deliberate change is the self-play visit count.
+> **IN IMPLEMENTATION** (2026-06-26). This is the renumbered ex-run-8: the low-self-play-visits
+> idea (old run 7) was **deferred** — see [deferred-low-visits.md](deferred-low-visits.md) — on
+> the judgment that visits won't move the needle much, so the charge rule change took the run-7
+> slot. Unlike a config knob, this is a **variant rule change** — it touches the spec, both rules
+> implementations (PyVariant oracle + the fork's C++ copy), and the move encoding. Treat it as a
+> new variant generation.
 
 ## Identity
 
 | Field | Value |
 |---|---|
-| `RUN_NAME` | `V5_e8d8_v100` (proposed) |
-| Start FEN | `3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] w - - 0 1` (assume same as run 6 — confirm at launch) |
-| Arch | inherit run 6 (SE-ResNet v5 c48/b5) — TBD |
-| Optimizer | inherit run 6's winner (run 6 tests Adam 1e-3 vs run 5's 2e-2) — TBD |
-| **Self-play visits** | **100** (run 6 / run 5 ran **800**) ← the change |
-| Key commit / branch | TBD |
-| Fleet box | TBD |
-| Started | TBD (after run 6) |
-| Status | planned |
+| `RUN_NAME` | `V6_e8d8_botcharge` (proposed; rule bump → new tag) |
+| Start FEN | `3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] w - - 0 1` (e8/d8, from run 6) |
+| Arch | SE-ResNet v5 c48/b5 ~364K (from run 6) |
+| Optimizer | Adam **lr=1e-3** (run 6's winner) |
+| Self-play visits | 800 (visits ablation deferred — see deferred-low-visits.md) |
+| **Rule change** | **Charge of *d* squares demotes the bottom *d* Kings (forced); no player choice** |
+| Status | in implementation (spec + dual-impl edits + parity re-validation) |
 
 ## Hypothesis
 
-Drop self-play search from **800 → 100 visits/move**. Each game becomes ~8× cheaper, so the
-fleet generates far more games per unit **wall-clock**. For this near-solved e8/d8 mate, the
-bet is that the network learns the mate faster from **sheer data volume** — many cheap mate
-examples per hour — rather than needing deep per-move search to find it. Framed by the user:
-the net should *remember* which moves lead to mate (lots of fast examples) instead of having
-to *search-discover* it expensively each game; the relevant (mate) data accumulates far quicker.
+Today a charge of distance *d* from a tower with `n_kings > d` enumerates **`C(n_kings, d)`
+separate legal moves** — one per choice of which Kings to demote (`moves_black.py:1088`). Forcing
+the demotion to the **bottom *d* Kings** collapses each (from→to) charge to a **single move**,
+removing that combinatorial fan-out from Black's legal-move set and MCTS branching.
 
-**Success criterion:** reach Black-mate convergence in **less wall-clock time** than the
-800-visit baseline (run 5 ≈ 38k games / ~8 days; run 6 TBD). Measure both **games-to-converge**
-and **wall-clock-to-converge** — the bet only pays if higher throughput (games/hr) more than
-offsets any increase in games-needed.
+The bet: this **trains the net faster** (smaller move set / less branching / sharper visit
+distributions per node) while **barely losing real-world strength**, because demoting from the
+bottom **preserves the top Kings** — i.e. keeps the tower King-top and fully mobile, which is
+usually the strategically preferred choice anyway. The discarded choices (demoting a higher King)
+are rare and marginal.
 
-## Design delta
+**Success criterion:** measurable drop in mean Black legal-move count / branching on charge-heavy
+positions, faster convergence (games and wall-clock) vs the choice-version baseline, with strength
+(net-vs-net, or vs run 6's converged net on a fixed eval) **not materially worse**.
 
-vs run 6 — **one change**:
+## Rule change (precise)
 
-- **Self-play `--visits` 800 → 100.** Seeded in the DB training-run params at
-  `lczero-server/cmd/bootstrap/main.go:43` (`trainParams` JSON, the `--visits=800` entry).
-  Edit there → takes effect on the next **cold bootstrap** (`reset_fleet.sh` / `cc fresh-run`).
-  For a quick no-rebuild test, set `CC_VISITS=100` in the client env instead
-  (`lczero-client/lc0_main.go:478` reads it; default 100 only applies when the server sends no
-  `--visits`, which it does — so the env/bootstrap value is what actually binds).
-- Everything else inherits run 6's winning config (start FEN, arch, LR, replay window, batch,
-  temp/noise). No other change.
+Spec §3C.3 today: *"If the tower has more Kings than the cost requires, the player picks which
+ones to demote (1-indexed from bottom)."* → Change to: *"The bottom *d* Kings are demoted
+(positions 1..*d* from the bottom); there is no choice."* A demoted King still becomes a
+`Stone(hasMoved=true)`; cost, path-capture, ram, rim-overshoot, and mandate rules are unchanged.
+The `{a,b,…}` demoted-King notation suffix becomes obsolete (the choice is gone).
 
-## Watch-for (the real tension)
+## Landing sites (implementation checklist)
 
-The throughput win is not free — lower visits degrades search quality:
+A move-gen rule change must stay in sync across both oracles + spec + encoding (see CLAUDE.md
+"Rule-change landing sites"):
 
-- **Noisier policy targets.** The AZ policy target *is* the MCTS visit distribution; at 100
-  visits it's spread thin → less peaked / noisier than at 800. `CLAUDE.md` warns `n_sims ≥ 50`
-  to avoid degenerate visit distributions — 100 clears that floor but sits closer to it.
-- **Slower cold-start mate discovery.** Run 5 needed ~38k games at 800 partly because Black's
-  mate line is deep; 100-visit search may discover it even more slowly (the
-  `chessckers-monitoring-findings` notes already flagged 800 as *shallow* for Black's line). So
-  it's plausible run 7 needs **more games** — the experiment is whether games/hr wins anyway.
-- Anchor the comparison on **wall-clock**, and track games-to-first-Black-win + games-to-converge
-  vs run 6/run 5, not raw win-rate alone (which isn't a strength signal without an anchor).
+1. **Spec** — `chessckers.md` §3C.3 (rewrite "Choice of demoted Kings"), and the §3C **Notation**
+   `{a,b,…}` suffix (drop it). Bump version note.
+2. **PyVariant oracle** — `engine/chessckers_engine/variant_py/moves_black.py`:
+   `black_charge_moves` (stop enumerating demotion combinations; emit one move demoting bottom *d*)
+   and `_apply_charge` (~L924-927; `chosen = bottom-d` instead of `move["demotedKings"]`). The
+   `demotedKings`/`demotionsRequired` move fields become derived, not chosen.
+3. **Fork C++ rules copy** — `../akshay-chessckers-0/src/chessckers/` (charge gen in `movegen.hpp`)
+   — mirror exactly; this is the production player.
+4. **Encoding / policy** — `encoding.py` move features (`is_ortho`, `demotions_required`) + however
+   charges index into the policy move space. **Verify first** whether the policy currently
+   distinguishes demotion choices at all — the 240-dim move vector has `demotions_required` but no
+   "which Kings" field, so the choices may already collide in feature space; if so, the net can't
+   even express the choice today, which *strengthens* the "barely loses strength" argument and
+   means the main win is MCTS branching, not policy-head size.
+5. **Notation / display** — `watch_game.py` / `render_board.py` charge rendering (drop the
+   demoted-King suffix).
+6. **Parity corpus** — `corpus/rules_scenarios.jsonl` charge scenarios; re-validate PyVariant↔fork
+   parity after the change (the dual-impl must agree).
+
+## Watch-for
+
+- **Parity is non-negotiable** — PyVariant and the fork must produce identical charge moves after
+  the change, or self-play data and the oracle diverge. Re-run the parity corpus.
+- **Strength check** — confirm the bet: play the bottom-N net vs run 6's choice-version net (fixed
+  eval / gauntlet). "Barely loses" must be *measured*, not assumed.
+- **Encoding collision** (point 4) — settle whether choices were ever distinguished; it changes
+  where the speedup actually comes from.
 
 ## Log
 
-- `06-26` Idea parked: self-play visits 800→100 for throughput-driven faster learning. Knob =
-  `bootstrap/main.go:43`. Awaiting run 6's outcome to set the inherited config (arch/LR).
+- `06-26` Idea parked (as run 8): force charge demotion to bottom *d* Kings (no choice) to kill
+  the `C(n_kings,d)` charge fan-out. Rule change — spec + PyVariant + fork + encoding + parity.
+- `06-26` **Promoted to run 7 + implementation started.** Run 6 converged (~8k games, lr=1e-3);
+  the visits ablation was deferred, so this took the run-7 slot. Inherits run 6's e8/d8 / v5
+  c48b5 / Adam 1e-3. Beginning with the PyVariant oracle (`black_charge_moves` / `_apply_charge`).
 
 ## Result
 
-<leave empty — fill once run 7 runs; compare wall-clock-to-converge vs run 6 (and run 5's ~38k games / ~8 days at 800 visits)>
+<leave empty — fill once implemented + run; report branching reduction + strength delta vs the choice-version>
