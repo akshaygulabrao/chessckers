@@ -81,5 +81,11 @@ is smaller than that stop-point implied). The lr=1e-3 ablation succeeded **direc
 lower LR learns the e8/d8 Black mate somewhat faster in games (~8k vs ~10k). This converged net is
 the **baseline** for [run 7](run7.md)'s strength comparison.
 
+**Backup (2026-06-26):** the converged net is saved off-box at
+`~/chessckers-backups/run6-e8d8-lr1e3-20260626/` (`weights.pt` + `.arch.json` v5/c48/b5 +
+`weights.bin`), pulled from box `trainer/run1/weights.pt` while the fleet was still live. Do this
+**before** any `reset_fleet`/`fresh-run` for run 7. The 111 `iter-async-*.pt` strength-curve
+snapshots remain on the box (not yet pulled).
+
 (User also noted run 6 "finished in measurably longer" — wall-clock vs run 5 left as an open
-detail; the games-to-converge comparison, 8k vs ~38k, is the headline and clearly favors 1e-3.)
+detail; the games-to-converge comparison, ~8k vs ~10k, is the headline and favors 1e-3.)
