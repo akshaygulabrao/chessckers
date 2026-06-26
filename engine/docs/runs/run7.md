@@ -90,11 +90,16 @@ A move-gen rule change must stay in sync across both oracles + spec + encoding (
   one recorded-game replay using the old `f6e6{2}` top-king-demote was updated to `f6e6`.
 - `06-26` **Spec (#1) DONE.** §3C.3 rewritten to forced bottom-first (v6 note + `binom{n}{d}`
   rationale); notation `{a,b,…}` suffix removed.
-- `06-26` **Encoding (#4) confirmed no-op.** The 240-dim move vector has `demotions_required` but
-  no "which Kings" field, so demotion choices already **collided** in policy feature space — the
-  net never distinguished them. Encoding tests pass unchanged → the speedup is purely the
-  legal-move/branching reduction (as predicted), and "barely loses strength" is strengthened (the
-  removed choices were inexpressible to the policy anyway).
+- `06-26` **Encoding (#4): no `encoding.py` change needed, but the earlier "net can't express the
+  choice" claim was WRONG (corrected).** Two distinct encodings: the 240-dim **move** vector has
+  `demotions_required` but no "which-Kings" field, so demotion choices of the same `from→to` share
+  the same **policy prior** (collide at the move-prior level). BUT the **per-depth tower channels
+  8–12** (the v5 position encoding) *do* encode the resulting tower, so the net distinguishes the
+  choices via the **resulting-position value/policy** through MCTS — a colliding prior is not
+  inexpressible. So forcing bottom-*d* removes a **real** degree of freedom, and "barely loses
+  strength" rests **only** on the strategic argument (bottom-*d* keeps the top Kings ≈ optimal) and
+  **must be measured** vs run 6's net — it is NOT an encoding free pass. The speedup is still the
+  legal-move/branching reduction; `encoding.py` itself needs no edit (move vector unchanged).
 - **Remaining:** fork C++ rules copy (#3, `../akshay-chessckers-0/src/chessckers/movegen.hpp` +
   rebuild) — the production player; display/parse spot-check (#5); parity re-validation (#6).
 
