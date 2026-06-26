@@ -462,9 +462,10 @@ def main() -> int:
     p.add_argument("--d-hidden", type=int, default=256)
     p.add_argument("--c-filters", type=int, default=96)
     p.add_argument("--n-blocks", type=int, default=4)
-    p.add_argument("--arch-version", choices=["v1", "v2", "v4", "v5"], default="v1",
-                   help="Net arch: v1 (pooled), v2 (gather head + optional transformer), "
-                        "v4 (gather head + Squeeze-Excitation ResNet blocks).")
+    p.add_argument("--arch-version", choices=["v1", "v2", "v4", "v5"], default="v2",
+                   help="Net arch: v1 (pooled; NOT engine-loadable — 15ch input), v2 (gather head "
+                        "+ optional transformer), v4 (gather head + Squeeze-Excitation ResNet blocks). "
+                        "Default v2 = the engine-minimum 16ch representation.")
     p.add_argument("--tf-blocks", type=int, default=0,
                    help="V2/V4: Transformer blocks interleaved into the trunk (0 = pure ResNet).")
     p.add_argument("--tf-heads", type=int, default=4, help="V2 transformer attention heads.")
