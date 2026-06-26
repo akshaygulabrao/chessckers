@@ -17,6 +17,7 @@ scripts to run on it.
   cc watch [watch args]         # pull the latest fleet net + watch it self-play live
   cc restart-trainer [LR]       # clean warm-restart the trainer (optionally change LR)
   cc play [play args]           # play a human-vs-net game against the latest fleet net
+  cc lengths [--window=50]      # average game length over training (survival→mate curve)
   cc fresh-run [--run-name=X] [--arch=v5] [--parallelism=32]
                               # provision + launch a fresh training run from scratch
 
@@ -30,19 +31,33 @@ cc games — render the network's actual self-play games (newest by default):
 Env: CC_INSTANCE=<id> forces a box when several are running.
 Run as `python scripts/cc.py <cmd>` or alias `cc` to it (see scripts/README.md).
 """
-import json, os, shlex, subprocess, sys, time, urllib.request, urllib.error
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.error
 
 CACHE = os.path.expanduser("~/.cache/cc_box.json")
 CACHE_TTL = 600
-ENGINE_DIR = "/workspace/chessckers/engine"          # repo path ON THE BOX
+ENGINE_DIR = "/workspace/chessckers/engine"  # repo path ON THE BOX
 SERVER_DIR = "/workspace/chessckers/lczero-server"
 LOCAL_ENGINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GAMES_CACHE = os.path.expanduser("~/.cache/cc_games")  # pulled chunks + fleet net land here
+GAMES_CACHE = os.path.expanduser(
+    "~/.cache/cc_games"
+)  # pulled chunks + fleet net land here
 
 
 def _instances():
-    out = subprocess.run(["vastai", "show", "instances", "--raw"],
-                         capture_output=True, text=True, timeout=40).stdout
+    out = subprocess.run(
+        ["vastai", "show", "instances", "--raw"],
+        capture_output=True,
+        text=True,
+        timeout=40,
+    ).stdout
     s = out.find("[")
     data = json.loads(out[s:]) if s >= 0 else []
     res = []
@@ -50,11 +65,20 @@ def _instances():
         if i.get("actual_status") != "running":
             continue
         p = (i.get("ports") or {}).get("10100/tcp")
-        d = (i.get("ports") or {}).get("22/tcp")   # DIRECT ssh; vast's proxy (sshN.vast.ai) is unreliable/dead
-        res.append({"id": i["id"], "ssh_host": i.get("ssh_host"), "ssh_port": i.get("ssh_port"),
-                    "ip": i.get("public_ipaddr"), "server_port": p[0]["HostPort"] if p else None,
-                    "ssh_port_direct": d[0]["HostPort"] if d else i.get("ssh_port"),
-                    "gpu": i.get("gpu_name")})
+        d = (i.get("ports") or {}).get(
+            "22/tcp"
+        )  # DIRECT ssh; vast's proxy (sshN.vast.ai) is unreliable/dead
+        res.append(
+            {
+                "id": i["id"],
+                "ssh_host": i.get("ssh_host"),
+                "ssh_port": i.get("ssh_port"),
+                "ip": i.get("public_ipaddr"),
+                "server_port": p[0]["HostPort"] if p else None,
+                "ssh_port_direct": d[0]["HostPort"] if d else i.get("ssh_port"),
+                "gpu": i.get("gpu_name"),
+            }
+        )
     return res
 
 
@@ -65,30 +89,42 @@ def _serves(ip, port):
         urllib.request.urlopen(f"http://{ip}:{port}/", timeout=3)
         return True
     except urllib.error.HTTPError:
-        return True                       # responded at all => it's the server
+        return True  # responded at all => it's the server
     except Exception:
         return False
 
 
 def resolve(refresh=False):
     if not refresh and os.path.exists(CACHE):
-        c = json.load(open(CACHE))
+        with open(CACHE) as f:
+            c = json.load(f)
         if time.time() - c.get("_ts", 0) < CACHE_TTL:
             return c
     inst = _instances()
     if not inst:
         sys.exit("cc: no running vast instances")
     force = os.environ.get("CC_INSTANCE")
-    box = (next((x for x in inst if str(x["id"]) == str(force)), None) if force
-           else inst[0] if len(inst) == 1
-           else next((x for x in inst if _serves(x["ip"], x["server_port"])), None))
+    if force:
+        box = next((x for x in inst if str(x["id"]) == str(force)), None)
+    elif len(inst) == 1:
+        box = inst[0]
+    else:
+        box = next((x for x in inst if _serves(x["ip"], x["server_port"])), None)
     if box is None:
-        sys.exit(f"cc: {len(inst)} running boxes ({', '.join(str(x['id']) for x in inst)}); "
-                 f"set CC_INSTANCE=<id>")
-    box = {**box, "server_url": f"http://{box['ip']}:{box['server_port']}" if box["server_port"] else None,
-           "_ts": time.time()}
+        sys.exit(
+            f"cc: {len(inst)} running boxes ({', '.join(str(x['id']) for x in inst)}); "
+            f"set CC_INSTANCE=<id>"
+        )
+    box = {
+        **box,
+        "server_url": f"http://{box['ip']}:{box['server_port']}"
+        if box["server_port"]
+        else None,
+        "_ts": time.time(),
+    }
     os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-    json.dump(box, open(CACHE, "w"))
+    with open(CACHE, "w") as f:
+        json.dump(box, f)
     return box
 
 
@@ -97,17 +133,31 @@ def _ssh(box):
     # ssh (sshN.vast.ai:NNNNN) is unreliable/dead, so prefer the direct mapping.
     host = box.get("ip") or box["ssh_host"]
     port = box.get("ssh_port_direct") or box["ssh_port"]
-    return ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20",
-            "-p", str(port), f"root@{host}"]
+    return [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ConnectTimeout=20",
+        "-p",
+        str(port),
+        f"root@{host}",
+    ]
 
 
 def _q(s):
-    return "'" + s.replace("'", "'\\''") + "'" if (not s or any(c in s for c in " \"'$&|;<>()")) else s
+    return (
+        "'" + s.replace("'", "'\\''") + "'"
+        if (not s or any(c in s for c in " \"'$&|;<>()"))
+        else s
+    )
 
 
 def _run_on_box(script, rest):
     box = resolve()
-    remote = f"cd {ENGINE_DIR} && .venv/bin/python scripts/{script} " + " ".join(_q(a) for a in rest)
+    remote = f"cd {ENGINE_DIR} && .venv/bin/python scripts/{script} " + " ".join(
+        _q(a) for a in rest
+    )
     return subprocess.call(_ssh(box) + [remote])
 
 
@@ -122,8 +172,11 @@ def _fetch(box, remote, local):
     Returns 0 on success; cleans up a partial/empty file on failure."""
     os.makedirs(os.path.dirname(local), exist_ok=True)
     with open(local, "wb") as f:
-        rc = subprocess.call(_ssh(box) + [f"cat {shlex.quote(remote)}"], stdout=f,
-                             stderr=subprocess.DEVNULL)  # drop the ssh motd banner
+        rc = subprocess.call(
+            _ssh(box) + [f"cat {shlex.quote(remote)}"],
+            stdout=f,
+            stderr=subprocess.DEVNULL,
+        )  # drop the ssh motd banner
     if (rc != 0 or os.path.getsize(local) == 0) and os.path.exists(local):
         os.remove(local)
         return rc or 1
@@ -132,7 +185,9 @@ def _fetch(box, remote, local):
 
 def _games_dir(box):
     """Newest games/<run>/ dir on the box (so this never hardcodes run1)."""
-    d = _ssh_out(box, "ls -dt /workspace/chessckers/lczero-server/games/*/ 2>/dev/null | head -1").strip()
+    d = _ssh_out(
+        box, "ls -dt /workspace/chessckers/lczero-server/games/*/ 2>/dev/null | head -1"
+    ).strip()
     return d or f"{SERVER_DIR}/games/run1/"
 
 
@@ -152,7 +207,9 @@ def _fetch_fleet_net(box):
     if _fetch(box, remote, local) != 0:
         return None
     if _fetch(box, remote + ".arch.json", local + ".arch.json") != 0:
-        print("# warning: no .arch.json sidecar — eval may load a wrong (fallback) arch")
+        print(
+            "# warning: no .arch.json sidecar — eval may load a wrong (fallback) arch"
+        )
     return local
 
 
@@ -173,11 +230,12 @@ def cmd_fresh_run(args):
     box = resolve()
     host = box.get("ip") or box["ssh_host"]
     port = box.get("ssh_port_direct") or box["ssh_port"]
-    ssh_cmd = ["ssh", "-p", str(port), f"root@{host}",
-               "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20"]
+    ssh = _ssh(box)
+
     def sh(cmd):
         print(f"  $ {cmd}")
-        return subprocess.call(ssh_cmd + [cmd])
+        return subprocess.call(ssh + [cmd])
+
     def sh_ok(cmd):
         r = sh(cmd)
         if r != 0:
@@ -195,39 +253,71 @@ def cmd_fresh_run(args):
         elif a.startswith("--parallelism="):
             parallelism = a.split("=", 1)[1]
 
-    print(f"=== fresh-run: box={host}:{port}  run={run_name}  arch={arch}  p={parallelism} ===")
+    print(
+        f"=== fresh-run: box={host}:{port}  run={run_name}  arch={arch}  p={parallelism} ==="
+    )
 
     # 1. Provision (server + engine, no state seed).
     print("\n--- 1/6: provisioning box (toolchain, server, engine) ---")
-    prov = os.path.join(LOCAL_ENGINE, "..", "..", "lczero-server", "scripts", "provision_server_vast.sh")
-    subprocess.run(["bash", prov],
-                   env={**os.environ, "VAST_HOST": host, "VAST_PORT": str(port),
-                        "SEED_STATE": "false"}, check=True)
+    prov = os.path.join(
+        LOCAL_ENGINE, "..", "..", "lczero-server", "scripts", "provision_server_vast.sh"
+    )
+    subprocess.run(
+        ["bash", prov],
+        env={
+            **os.environ,
+            "VAST_HOST": host,
+            "VAST_PORT": str(port),
+            "SEED_STATE": "false",
+        },
+        check=True,
+    )
 
     # 2. Rsync + build the fork.
     print("\n--- 2/6: building akshay-chessckers-0 ---")
     fork_local = os.path.join(LOCAL_ENGINE, "..", "..", "akshay-chessckers-0")
-    sh_ok(f"pip3 install meson ninja 2>/dev/null; apt-get install -y libopenblas-dev 2>/dev/null")
-    rsync_cmd = ["rsync", "-az", "-e", f"ssh -p {port} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20",
-                 f"{fork_local}/", f"root@{host}:/workspace/chessckers/akshay-chessckers-0/",
-                 "--exclude=build/", "--exclude=.git/"]
+    sh_ok(
+        "pip3 install meson ninja 2>/dev/null; apt-get install -y libopenblas-dev 2>/dev/null"
+    )
+    rsync_cmd = [
+        "rsync",
+        "-az",
+        "-e",
+        f"ssh -p {port} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20",
+        f"{fork_local}/",
+        f"root@{host}:/workspace/chessckers/akshay-chessckers-0/",
+        "--exclude=build/",
+        "--exclude=.git/",
+    ]
     subprocess.run(rsync_cmd, check=True)
-    sh_ok("export PATH=$HOME/.local/bin:$PATH && cd /workspace/chessckers/akshay-chessckers-0 && "
-          "rm -rf build/release && meson setup build/release --buildtype release "
-          "-Dblas=false -Dplain_cuda=false -Donnx=false -Dbuild_backends=false && "
-          "ninja -C build/release akshay-chessckers-0")
+    sh_ok(
+        "export PATH=$HOME/.local/bin:$PATH && cd /workspace/chessckers/akshay-chessckers-0 && "
+        "rm -rf build/release && meson setup build/release --buildtype release "
+        "-Dblas=false -Dplain_cuda=false -Donnx=false -Dbuild_backends=false && "
+        "ninja -C build/release akshay-chessckers-0"
+    )
 
     # 3. Rsync + build the client.
     print("\n--- 3/6: building lczero-client ---")
     client_local = os.path.join(LOCAL_ENGINE, "..", "..", "lczero-client")
-    rsync_cmd2 = ["rsync", "-az", "-e", f"ssh -p {port} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20",
-                  f"{client_local}/", f"root@{host}:/workspace/chessckers/lczero-client/",
-                  "--exclude=.git/"]
+    rsync_cmd2 = [
+        "rsync",
+        "-az",
+        "-e",
+        f"ssh -p {port} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20",
+        f"{client_local}/",
+        f"root@{host}:/workspace/chessckers/lczero-client/",
+        "--exclude=.git/",
+    ]
     subprocess.run(rsync_cmd2, check=True)
-    sh_ok("export PATH=/usr/local/go/bin:$PATH && cd /workspace/chessckers/lczero-client && go build -o lc0-client .")
-    sh_ok("mkdir -p /workspace/chessckers/lczero-client/.enginebin && "
-          "ln -sfT /workspace/chessckers/akshay-chessckers-0/build/release/akshay-chessckers-0 "
-          "/workspace/chessckers/lczero-client/.enginebin/akshay-chessckers-0")
+    sh_ok(
+        "export PATH=/usr/local/go/bin:$PATH && cd /workspace/chessckers/lczero-client && go build -o lc0-client ."
+    )
+    sh_ok(
+        "mkdir -p /workspace/chessckers/lczero-client/.enginebin && "
+        "ln -sfT /workspace/chessckers/akshay-chessckers-0/build/release/akshay-chessckers-0 "
+        "/workspace/chessckers/lczero-client/.enginebin/akshay-chessckers-0"
+    )
 
     # 4. Reset fleet (DESTRUCTIVE).
     print("\n--- 4/6: resetting fleet (wipe old state) ---")
@@ -235,27 +325,31 @@ def cmd_fresh_run(args):
 
     # 5. Launch server + trainer in tmux 'cc'.
     print("\n--- 5/6: launching server + trainer ---")
-    sh_ok(f"tmux kill-session -t cc 2>/dev/null; sleep 1; "
-          f"SRV=/workspace/chessckers/lczero-server ENG=/workspace/chessckers/engine; "
-          f"cd $SRV && tmux new-session -d -s cc -n server -c $SRV && "
-          f"tmux send-keys -t cc:server "
-          f"'cd '\"'\"'$SRV'\"'\"' && PATH=/usr/local/go/bin:\$PATH RUN_NAME='\"'\"'{run_name}'\"'\"' scripts/launch_server.sh 2>&1 | tee -a server.log' C-m && "
-          f"tmux new-window -t cc -n trainer -c $SRV && sleep 0.5 && "
-          f"tmux send-keys -t cc:trainer "
-          f"'cd '\"'\"'$SRV'\"'\"' && sleep 6 && ENGINE_DIR='\"'\"'$ENG'\"'\"' SERVER=http://localhost:10100 ARCH_VERSION={arch} scripts/launch_trainer.sh 2>&1 | tee -a trainer.log' C-m")
+    sh_ok(
+        f"tmux kill-session -t cc 2>/dev/null; sleep 1; "
+        f"SRV=/workspace/chessckers/lczero-server ENG=/workspace/chessckers/engine; "
+        f"cd $SRV && tmux new-session -d -s cc -n server -c $SRV && "
+        f"tmux send-keys -t cc:server "
+        f"'cd '\"'\"'$SRV'\"'\"' && PATH=/usr/local/go/bin:$PATH RUN_NAME='\"'\"'{run_name}'\"'\"' scripts/launch_server.sh 2>&1 | tee -a server.log' C-m && "
+        f"tmux new-window -t cc -n trainer -c $SRV && sleep 0.5 && "
+        f"tmux send-keys -t cc:trainer "
+        f"'cd '\"'\"'$SRV'\"'\"' && sleep 6 && ENGINE_DIR='\"'\"'$ENG'\"'\"' SERVER=http://localhost:10100 ARCH_VERSION={arch} scripts/launch_trainer.sh 2>&1 | tee -a trainer.log' C-m"
+    )
 
     # 6. Launch client in tmux 'cc-client'.
     print("\n--- 6/6: launching self-play client ---")
-    sh_ok(f"tmux kill-session -t cc-client 2>/dev/null; sleep 1; "
-          f"CL=/workspace/chessckers/lczero-client; "
-          f"cd $CL && tmux new-session -d -s cc-client -n selfplay -c $CL && sleep 0.5 && "
-          f"tmux send-keys -t cc-client "
-          f"'export PATH='\"'\"'$CL/.enginebin:\$PATH'\"'\"'; cd '\"'\"'$CL'\"'\"'; ./lc0-client -hostname http://localhost:10100 -user vast -password chessckers -run 1 -parallelism {parallelism} 2>&1 | tee -a client.log' C-m")
+    sh_ok(
+        f"tmux kill-session -t cc-client 2>/dev/null; sleep 1; "
+        f"CL=/workspace/chessckers/lczero-client; "
+        f"cd $CL && tmux new-session -d -s cc-client -n selfplay -c $CL && sleep 0.5 && "
+        f"tmux send-keys -t cc-client "
+        f"'export PATH='\"'\"'$CL/.enginebin:$PATH'\"'\"'; cd '\"'\"'$CL'\"'\"'; ./lc0-client -hostname http://localhost:10100 -user vast -password chessckers -run 1 -parallelism {parallelism} 2>&1 | tee -a client.log' C-m"
+    )
 
-    print(f"\n=== fresh-run complete ===")
+    print("\n=== fresh-run complete ===")
     print(f"  ssh -p {port} root@{host} -t tmux attach -t cc     # server + trainer")
     print(f"  ssh -p {port} root@{host} -t tmux attach -t cc-client  # self-play")
-    print(f"  cc status                                           # fleet dashboard")
+    print("  cc status                                           # fleet dashboard")
     return 0
 
 
@@ -266,14 +360,17 @@ def cmd_games(args):
     if "--list" in args:
         i = args.index("--list")
         k = int(args[i + 1]) if i + 1 < len(args) and args[i + 1].isdigit() else 15
-        out = _ssh_out(box, f"find {shlex.quote(gdir)} -name 'training.*.gz' "
-                            f"-printf '%T@ %f\\n' 2>/dev/null | sort -n | tail -{k}")
+        out = _ssh_out(
+            box,
+            f"find {shlex.quote(gdir)} -name 'training.*.gz' "
+            f"-printf '%T@ %f\\n' 2>/dev/null | sort -n | tail -{k}",
+        )
         now = time.time()
         print(f"# {gdir}  (newest last)")
         for ln in out.splitlines():
             parts = ln.split(None, 1)
             if len(parts) == 2:
-                print(f"  {parts[1]:<22} {(now - float(parts[0]))/60:6.1f}m ago")
+                print(f"  {parts[1]:<22} {(now - float(parts[0])) / 60:6.1f}m ago")
         return 0
 
     eval_on = "--eval" in args
@@ -282,15 +379,18 @@ def cmd_games(args):
     if "--index" in args:
         i = args.index("--index")
         idx = args[i + 1]
-        args = args[:i] + args[i + 2:]
+        args = args[:i] + args[i + 2 :]
 
     if idx is not None:
         remote = f"{gdir.rstrip('/')}/training.{idx}.gz"
     else:
         # find (not an ls glob): a run dir holds tens of thousands of chunks, so
         # `ls training.*.gz` overflows ARG_MAX and silently returns nothing.
-        line = _ssh_out(box, f"find {shlex.quote(gdir)} -name 'training.*.gz' "
-                             f"-printf '%T@ %p\\n' 2>/dev/null | sort -n | tail -1").strip()
+        line = _ssh_out(
+            box,
+            f"find {shlex.quote(gdir)} -name 'training.*.gz' "
+            f"-printf '%T@ %p\\n' 2>/dev/null | sort -n | tail -1",
+        ).strip()
         remote = line.split(None, 1)[1] if line else ""
         if not remote:
             sys.exit(f"cc games: no chunks under {gdir}")
@@ -317,6 +417,24 @@ def cmd_watch(args):
     return _watch_game(extra + args)
 
 
+def cmd_restart_trainer(args):
+    """Warm-restart the trainer bridge in the existing tmux cc:trainer window.
+
+    Optional positional arg = the Adam LR. It is exported as the LR *env var*
+    because launch_trainer.sh reads ${LR}; positional args to that script are
+    ignored, so `cc restart-trainer 0.001` used to be a silent no-op."""
+    box = resolve()
+    _ssh_out(box, f"rm -f {SERVER_DIR}/trainer/run1/STOP")
+    lr_env = f"LR={args[0]} " if args else ""
+    remote = (
+        f"tmux send-keys -t cc:trainer C-c && sleep 0.3 && "
+        f"tmux send-keys -t cc:trainer "
+        f"'{lr_env}ENGINE_DIR={ENGINE_DIR} SERVER=http://localhost:10100 ARCH_VERSION=v4 "
+        f"bash {SERVER_DIR}/scripts/launch_trainer.sh 2>&1 | tee -a {SERVER_DIR}/trainer.log' C-m"
+    )
+    return subprocess.call(_ssh(box) + [remote])
+
+
 def cmd_play(args):
     """Pull the latest fleet net and play an interactive human-vs-net game against it."""
     box = resolve()
@@ -333,12 +451,15 @@ def cmd_play(args):
 
 def main():
     if len(sys.argv) < 2:
-        print(__doc__); return 0
+        print(__doc__)
+        return 0
     cmd, args = sys.argv[1], sys.argv[2:]
     if cmd == "box":
         b = resolve("--refresh" in args)
         print(f"id={b['id']}  gpu={b['gpu']}")
-        print(f"ssh:    ssh -p {b.get('ssh_port_direct') or b['ssh_port']} root@{b.get('ip') or b['ssh_host']}  (direct; proxy sshN.vast.ai is dead)")
+        print(
+            f"ssh:    ssh -p {b.get('ssh_port_direct') or b['ssh_port']} root@{b.get('ip') or b['ssh_host']}  (direct; proxy sshN.vast.ai is dead)"
+        )
         print(f"server: {b['server_url']}")
         print(f"engine (on box): {ENGINE_DIR}")
     elif cmd == "ssh":
@@ -359,29 +480,37 @@ def main():
     elif cmd == "status":
         # fleet_status.py lives in lczero-server (outside engine) — run it from there.
         box = resolve()
-        remote = (f"cd {SERVER_DIR} && {ENGINE_DIR}/.venv/bin/python scripts/fleet_status.py "
-                  + " ".join(_q(a) for a in args))
+        remote = (
+            f"cd {SERVER_DIR} && {ENGINE_DIR}/.venv/bin/python scripts/fleet_status.py "
+            + " ".join(_q(a) for a in args)
+        )
         return subprocess.call(_ssh(box) + [remote])
     elif cmd == "games":
         return cmd_games(args)
     elif cmd == "watch":
         return cmd_watch(args)
     elif cmd == "restart-trainer":
-        # Hardened clean warm-restart (snapshot-guarded, env-captured, self-verifying).
-        # The heavy lifting is a box-side script so nothing long is ever pasted.
-        box = resolve()
-        remote = f"bash {SERVER_DIR}/scripts/restart_trainer.sh " + " ".join(_q(a) for a in args)
-        return subprocess.call(_ssh(box) + [remote])
+        return cmd_restart_trainer(args)
     elif cmd == "play":
         return cmd_play(args)
     elif cmd == "launch":
         b = resolve()
         print(f"# Fresh run on box {b['id']} ({b['ssh_host']}:{b['ssh_port']}).")
-        print(f"# See scripts/README.md 'Launching a run'. In short, on the box:")
-        print(f"#   {SERVER_DIR}/scripts/reset_fleet.sh         # wipe prior run (DESTRUCTIVE)")
-        print(f"#   {SERVER_DIR}/scripts/run_server_vast.sh     # server + trainer bridge")
-        print(f"#   {ENGINE_DIR}/../../lczero-client/scripts/launch_vast_direct.sh   # self-play")
-        print(f"# Set the start FEN in akshay-chessckers-0/src/chess/board.cc (kStartposFen).")
+        print("# See scripts/README.md 'Launching a run'. In short, on the box:")
+        print(
+            f"#   {SERVER_DIR}/scripts/reset_fleet.sh         # wipe prior run (DESTRUCTIVE)"
+        )
+        print(
+            f"#   {SERVER_DIR}/scripts/run_server_vast.sh     # server + trainer bridge"
+        )
+        print(
+            f"#   {ENGINE_DIR}/../../lczero-client/scripts/launch_vast_direct.sh   # self-play"
+        )
+        print(
+            "# Set the start FEN in akshay-chessckers-0/src/chess/board.cc (kStartposFen)."
+        )
+    elif cmd == "lengths":
+        return _run_on_box("game_lengths.py", args)
     elif cmd == "fresh-run":
         return cmd_fresh_run(args)
     else:
