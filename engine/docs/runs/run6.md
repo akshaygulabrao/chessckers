@@ -12,9 +12,9 @@
 | Start FEN | `3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] w - - 0 1` (unchanged from run 5) |
 | Arch | SE-ResNet gather head, c_filters=48, n_blocks=5, ~364K params, tag `v5` (unchanged) |
 | Optimizer | Adam, lr=**1e-3** (run 5 ran 2e-2) |
-| Key commit / branch | TBD |
-| Fleet box | vast id TBD |
-| Started | 2026-06-25 |
+| Key commit / branch | `chore/run-ledger-and-config-defaults` (cb844f8) + fleet-script fixes (see Log) |
+| Fleet box | vast id **42618148** (RTX 3060), server `http://171.248.168.109:39411` (int `:10100`) |
+| Started | 2026-06-26 |
 | Status | active |
 
 ## Hypothesis
@@ -61,6 +61,17 @@ vs [run 5](run5.md) — **one change only**:
 
 - `06-25` Run defined: same e8/d8 start + arch as run 5, Adam **1e-3** (run 5 was 2e-2 by
   accident). To launch cold from random init for a clean LR A/B.
+- `06-26` Launched via `cc fresh-run` on vast 42618148. **Verified in trainer.log:**
+  `arch=v5 c=48 b=5`, `lr=1e-3`, `base=<random init>` (cold). Self-play ~5000 games/day;
+  early games all `1-0` (White), as expected for the e8/d8 cold start. Trainer on cuda,
+  published initial weights + promoted to best.
+- `06-26` **Three fleet-script bugs hit on launch** (all from the sibling-layout reorg, none in
+  run-6 config): (1) `provision_server_vast.sh:47` `ENGINE_SRC` pointed at `AAworkspace/engine`
+  not `chessckers/engine` — **fixed**. (2) `cc.py` `cmd_fresh_run` typed `cd '$SRV'` into the
+  tmux panes with `$SRV` single-quoted/undefined, so server+trainer+client never started —
+  worked around by relaunching the three panes by hand with absolute paths; **cc.py still needs
+  the quoting fix**. (3) `launch_server.sh:30` hard-codes a "listening on :9830" echo — cosmetic
+  only; the real bind is `:10100` from serverconfig.json.
 
 ## Result
 
