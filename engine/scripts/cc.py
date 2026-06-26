@@ -325,25 +325,29 @@ def cmd_fresh_run(args):
 
     # 5. Launch server + trainer in tmux 'cc'.
     print("\n--- 5/6: launching server + trainer ---")
+    # Interpolate absolute box paths (SERVER_DIR/ENGINE_DIR) directly into the
+    # send-keys command. Do NOT use shell $SRV/$ENG here: the pane runs its own
+    # shell where those are undefined, and single-quoting them (the old bug) types
+    # a literal `cd '$SRV'` that fails. $PATH stays single-quoted so the PANE
+    # expands it at runtime.
     sh_ok(
         f"tmux kill-session -t cc 2>/dev/null; sleep 1; "
-        f"SRV=/workspace/chessckers/lczero-server ENG=/workspace/chessckers/engine; "
-        f"cd $SRV && tmux new-session -d -s cc -n server -c $SRV && "
+        f"cd {SERVER_DIR} && tmux new-session -d -s cc -n server -c {SERVER_DIR} && "
         f"tmux send-keys -t cc:server "
-        f"'cd '\"'\"'$SRV'\"'\"' && PATH=/usr/local/go/bin:$PATH RUN_NAME='\"'\"'{run_name}'\"'\"' scripts/launch_server.sh 2>&1 | tee -a server.log' C-m && "
-        f"tmux new-window -t cc -n trainer -c $SRV && sleep 0.5 && "
+        f"'cd {SERVER_DIR} && PATH=/usr/local/go/bin:$PATH RUN_NAME={run_name} scripts/launch_server.sh 2>&1 | tee -a server.log' C-m && "
+        f"tmux new-window -t cc -n trainer -c {SERVER_DIR} && sleep 0.5 && "
         f"tmux send-keys -t cc:trainer "
-        f"'cd '\"'\"'$SRV'\"'\"' && sleep 6 && ENGINE_DIR='\"'\"'$ENG'\"'\"' SERVER=http://localhost:10100 ARCH_VERSION={arch} scripts/launch_trainer.sh 2>&1 | tee -a trainer.log' C-m"
+        f"'cd {SERVER_DIR} && sleep 6 && ENGINE_DIR={ENGINE_DIR} SERVER=http://localhost:10100 ARCH_VERSION={arch} scripts/launch_trainer.sh 2>&1 | tee -a trainer.log' C-m"
     )
 
     # 6. Launch client in tmux 'cc-client'.
     print("\n--- 6/6: launching self-play client ---")
+    cl = "/workspace/chessckers/lczero-client"
     sh_ok(
         f"tmux kill-session -t cc-client 2>/dev/null; sleep 1; "
-        f"CL=/workspace/chessckers/lczero-client; "
-        f"cd $CL && tmux new-session -d -s cc-client -n selfplay -c $CL && sleep 0.5 && "
+        f"cd {cl} && tmux new-session -d -s cc-client -n selfplay -c {cl} && sleep 0.5 && "
         f"tmux send-keys -t cc-client "
-        f"'export PATH='\"'\"'$CL/.enginebin:$PATH'\"'\"'; cd '\"'\"'$CL'\"'\"'; ./lc0-client -hostname http://localhost:10100 -user vast -password chessckers -run 1 -parallelism {parallelism} 2>&1 | tee -a client.log' C-m"
+        f"'export PATH={cl}/.enginebin:$PATH; cd {cl}; ./lc0-client -hostname http://localhost:10100 -user vast -password chessckers -run 1 -parallelism {parallelism} 2>&1 | tee -a client.log' C-m"
     )
 
     print("\n=== fresh-run complete ===")
