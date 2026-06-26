@@ -75,10 +75,11 @@ vs [run 5](run5.md) — **one change only**:
 
 ## Result
 
-**Converged at ~8k games** — roughly **5× faster than run 5's ~38k** at lr=2e-2. The lr=1e-3
-ablation succeeded: the lower LR learns the e8/d8 Black mate substantially faster (in games).
-Confirms run 5's result was undertraining made worse by too-high LR, not a different ceiling.
-This converged net is the **baseline** for [run 7](run7.md)'s strength comparison.
+**Converged at ~8k games** — modestly faster than run 5's **~10k**-game convergence at lr=2e-2
+(run 5 stabilized by ~10k but was left running to ~38k before being stopped, so the headline gap
+is smaller than that stop-point implied). The lr=1e-3 ablation succeeded **directionally**: the
+lower LR learns the e8/d8 Black mate somewhat faster in games (~8k vs ~10k). This converged net is
+the **baseline** for [run 7](run7.md)'s strength comparison.
 
 (User also noted run 6 "finished in measurably longer" — wall-clock vs run 5 left as an open
 detail; the games-to-converge comparison, 8k vs ~38k, is the headline and clearly favors 1e-3.)

@@ -14,7 +14,6 @@ Phase status:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from itertools import combinations
 from typing import Any
 
 import chess
@@ -1085,12 +1084,12 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
     capture). Friendly Black towers in the path block; landing on a
     friendly is a merge.
 
-    For non-ram landings with `n_kings > d` (charge distance), each
-    combinatorial choice of which Kings to demote produces a separate
-    move (UCI suffix `{a,b,c}`). When `n_kings == d` only one combination
-    exists and demotion fields are emitted as null. Rams always emit a
-    single move with null demotion fields (the tower dies at landing,
-    so the choice is moot).
+    A charge of distance `d` demotes the **bottom `d` Kings** (no player
+    choice; v6 rule change). Each (from -> landing) charge is therefore a
+    single move (no `{a,b,c}` suffix); `demotedKings` carries the forced
+    bottom-`d` positions and `demotionsRequired` = `d`. Rams always emit a
+    single move with null demotion fields (the tower dies at landing, so
+    the choice is moot).
 
     The `capture` field — when there are path captures, scalachess emits
     the closest-to-source captured square; for a ram with no path
@@ -1234,51 +1233,33 @@ def black_charge_moves(state: State) -> list[dict[str, Any]]:
                     stop_after = True
                     continue
 
-                if n_kings == d:
-                    # Forced demotion — null fields.
-                    new_pieces = list(pieces)
-                    for pos in king_positions:
-                        new_pieces[pos - 1] = "S"
-                    resulting_top = new_pieces[-1]
-                    moves.append({
-                        "uci": f"{from_name}{landing_repr}",
-                        "from": from_name,
-                        "to": to_name,
-                        "piece": _piece_name(resulting_top),
-                        "color": "black",
-                        "capture": capture_field,
-                        "waypoints": charge_waypoints,
-                        "chainHops": None,
-                        "promotion": None,
-                        "demotedKings": None,
-                        "demotionsRequired": None,
-                        "sourceKingPositions": None,
-                        "deployCount": None,
-                    })
-                else:
-                    # Multiple demotion choices.
-                    for choice in combinations(king_positions, d):
-                        choice_sorted = list(choice)  # combinations yields sorted
-                        new_pieces = list(pieces)
-                        for pos in choice_sorted:
-                            new_pieces[pos - 1] = "S"
-                        resulting_top = new_pieces[-1]
-                        choice_str = ",".join(str(x) for x in choice_sorted)
-                        moves.append({
-                            "uci": f"{from_name}{landing_repr}{{{choice_str}}}",
-                            "from": from_name,
-                            "to": to_name,
-                            "piece": _piece_name(resulting_top),
-                            "color": "black",
-                            "capture": capture_field,
-                            "waypoints": charge_waypoints,
-                            "chainHops": None,
-                            "promotion": None,
-                            "demotedKings": choice_sorted,
-                            "demotionsRequired": d,
-                            "sourceKingPositions": list(king_positions),
-                            "deployCount": None,
-                        })
+                # v6 rule change: a charge of distance d demotes the BOTTOM d
+                # Kings — no player choice. king_positions is ascending from the
+                # bottom, so king_positions[:d] is the bottom d. This preserves
+                # the upper Kings (keeps the tower King-top) and collapses each
+                # (from -> landing) charge to ONE move (no {choice} suffix),
+                # removing the old C(n_kings, d) demotion fan-out. When n_kings==d
+                # this is exactly the old forced-demote-all case.
+                chosen = king_positions[:d]
+                new_pieces = list(pieces)
+                for pos in chosen:
+                    new_pieces[pos - 1] = "S"
+                resulting_top = new_pieces[-1]
+                moves.append({
+                    "uci": f"{from_name}{landing_repr}",
+                    "from": from_name,
+                    "to": to_name,
+                    "piece": _piece_name(resulting_top),
+                    "color": "black",
+                    "capture": capture_field,
+                    "waypoints": charge_waypoints,
+                    "chainHops": None,
+                    "promotion": None,
+                    "demotedKings": chosen,
+                    "demotionsRequired": d,
+                    "sourceKingPositions": list(king_positions),
+                    "deployCount": None,
+                })
 
                 if is_friendly_merge:
                     # Friendly landing blocks further scanning beyond this d.

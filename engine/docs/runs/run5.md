@@ -57,9 +57,10 @@ Files changed for V5: spec `chessckers.md` (max-height rule); Python `encoding.p
   check / perpetual). Built diagnostics (`eval_history.py`, `gen_probe_suite.py`,
   `solve_endgame.py` box-shrink reference policy). Diagnosis split by depth: shallow skills
   saturated, the deep mate looked stuck.
-- `06-13` **Resolved: undertrained, not stuck.** Self-play flipped at ~#38k games, then
-  climbed to and **stabilized ~99.5% Black for 34k+ games**. Net plays the mate at temp 0
-  (~mate-in-15). It just took ~38k games to break the asymmetric cold-start trap.
+- `06-13` **Resolved: undertrained, not stuck.** Self-play flipped at ~#10k games, then
+  climbed to and **stabilized ~99.5% Black through ~38k games, where the run was stopped**.
+  Net plays the mate at temp 0 (~mate-in-15). It just took ~10k games to break the
+  asymmetric cold-start trap.
 - `06-15`→`06-16` Campaign churned start positions: detour to d6/e6/f6 scale-up, reverted to
   e8/d8 + Adam 1e-3 cold wipe, then reverted again to d6/e6/f6 (White-to-move) — see run 6.
 
@@ -67,7 +68,8 @@ Files changed for V5: spec `chessckers.md` (max-height rule); Python `encoding.p
 
 The e8/d8 KK-vs-K curriculum **converged**: Black learned the forced mate. Key lesson —
 on a fixed asymmetric-win start, a flat early win-rate is **undertraining, not a stall**;
-it needed ~38k games (at Adam lr=2e-2) to escape the cold-start equilibrium. This run is the
+it needed only ~10k games (at Adam lr=2e-2) to escape the cold-start equilibrium — the run
+was then left to run to ~38k games before being stopped. This run is the
 baseline the d6/e6/f6 scale-up (run 6) builds on. Best-net/checkpoints lived in
 `../lczero-server/trainer/run1/` (`weights.pt` + `iter-async-*.pt`).
 

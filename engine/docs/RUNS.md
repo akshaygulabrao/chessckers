@@ -10,7 +10,7 @@ Shared, run-independent arch/encoding tables live in
 | Run | Dates | Start FEN | Arch | Optimizer | Status | Doc |
 |---|---|---|---|---|---|---|
 | 5 | ~2026-06 | `3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] w` (e8/d8 KK-vs-K) | SE-ResNet c48/b5 v5 ~364K | Adam lr=2e-2 (accidental) | superseded → 6 | [run5.md](runs/run5.md) |
-| 6 | 2026-06-25 | `3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] w` (same as run 5) | SE-ResNet c48/b5 v5 ~364K (unchanged) | Adam lr=1e-3 | **done** — converged ~8k games (vs run 5 ~38k) | [run6.md](runs/run6.md) |
+| 6 | 2026-06-25 | `3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] w` (same as run 5) | SE-ResNet c48/b5 v5 ~364K (unchanged) | Adam lr=1e-3 | **done** — converged ~8k games (vs run 5 ~10k) | [run6.md](runs/run6.md) |
 | 7 | 2026-06-26 | e8/d8 (from run 6) | v5 c48/b5 (from run 6) | Adam lr=1e-3 (from run 6) | **in impl** — rule change: charge demotes **bottom-N** Kings (no choice) | [run7.md](runs/run7.md) |
 
 **Deferred ideas** (not numbered): [low self-play visits 800→100](runs/deferred-low-visits.md) —

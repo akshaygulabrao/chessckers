@@ -84,6 +84,19 @@ A move-gen rule change must stay in sync across both oracles + spec + encoding (
 - `06-26` **Promoted to run 7 + implementation started.** Run 6 converged (~8k games, lr=1e-3);
   the visits ablation was deferred, so this took the run-7 slot. Inherits run 6's e8/d8 / v5
   c48b5 / Adam 1e-3. Beginning with the PyVariant oracle (`black_charge_moves` / `_apply_charge`).
+- `06-26` **PyVariant oracle (#2) DONE.** `black_charge_moves` collapses to one move/charge
+  demoting `king_positions[:d]` (bottom *d*); `_apply_charge` unchanged (uses the explicit
+  `demotedKings`). Dropped the `combinations` import. Full non-slow suite green (164 passed); the
+  one recorded-game replay using the old `f6e6{2}` top-king-demote was updated to `f6e6`.
+- `06-26` **Spec (#1) DONE.** §3C.3 rewritten to forced bottom-first (v6 note + `binom{n}{d}`
+  rationale); notation `{a,b,…}` suffix removed.
+- `06-26` **Encoding (#4) confirmed no-op.** The 240-dim move vector has `demotions_required` but
+  no "which Kings" field, so demotion choices already **collided** in policy feature space — the
+  net never distinguished them. Encoding tests pass unchanged → the speedup is purely the
+  legal-move/branching reduction (as predicted), and "barely loses strength" is strengthened (the
+  removed choices were inexpressible to the policy anyway).
+- **Remaining:** fork C++ rules copy (#3, `../akshay-chessckers-0/src/chessckers/movegen.hpp` +
+  rebuild) — the production player; display/parse spot-check (#5); parity re-validation (#6).
 
 ## Result
 

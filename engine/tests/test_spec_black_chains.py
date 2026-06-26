@@ -88,7 +88,7 @@ def test_fleet_game_2026_06_10_no_phantom_king_capture():
     the game continues with White to move."""
     start = "8/8/3kkk2/8/8/8/PPPPPPPP/4K3[d6:kk,e6:kk,f6:kk] w - - 0 1"
     moves = ("c2c4 d6b6 g2g3 e6d5[1] e2e3 c2:d5~b3->b3 g3g4 e6d5 e1e2 d5e6 "
-             "e3e4 f6e6{2} e2e3 b3c3 e4e5 c2:c3~e1~g3->g3").split()
+             "e3e4 f6e6 e2e3 b3c3 e4e5 c2:c3~e1~g3->g3").split()
     c = PyVariantClient()
     r = c.new_game(start)
     for mv in moves:
