@@ -12,6 +12,7 @@ Shared, run-independent arch/encoding tables live in
 | 5 | ~2026-06 | `3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] w` (e8/d8 KK-vs-K) | SE-ResNet c48/b5 v5 ~364K | Adam lr=2e-2 (accidental) | superseded → 6 | [run5.md](runs/run5.md) |
 | 6 | 2026-06-25 | `3kk3/8/8/8/8/8/8/4K3[d8:kk,e8:kk] w` (same as run 5) | SE-ResNet c48/b5 v5 ~364K (unchanged) | Adam lr=1e-3 | active | [run6.md](runs/run6.md) |
 | 7 | after run 6 | e8/d8 (inherit run 6) | inherit run 6 | inherit run 6 | **planned** — self-play visits **100** (vs 800) | [run7.md](runs/run7.md) |
+| 8 | after run 6 | e8/d8 (inherit run 6) | inherit run 6 | inherit run 6 | **planned** — rule change: charge demotes **bottom-N** Kings (no choice) | [run8.md](runs/run8.md) |
 
 > **Numbering note:** run identity is the triple **(`RUN_NAME` env, compiled-in start FEN,
 > arch-version tag)** + optimizer. The 06-15→06-16 e8/d8 ↔ d6/e6/f6 reverts were churn
