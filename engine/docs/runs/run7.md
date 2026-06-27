@@ -19,7 +19,7 @@
 | **Rule change** | **Charge of *d* squares demotes the bottom *d* Kings (forced); no player choice** |
 | Fleet box | vast 42618148 (RTX 3060) — cold-relaunched 2026-06-26 |
 | Started | 2026-06-26 |
-| Status | **active** — cold launched, parity-validated, self-play running |
+| Status | **done** — converged ~99.3% Black @ 34,695 total games; net backed up |
 
 ## Hypothesis
 
@@ -116,4 +116,17 @@ A move-gen rule change must stay in sync across both oracles + spec + encoding (
 
 ## Result
 
-<leave empty — fill once implemented + run; report branching reduction + strength delta vs the choice-version>
+**Converged (2026-06-27).** Newest 300 self-play games: **298 Black / 2 White (~99.3% Black)**,
+mean **~23 plies/game** (fast mates), at **34,695 total games**. Black learned the e8/d8 mate
+under the v6 bottom-*d* charge rule — same converged profile as run 6 (~99.5% Black). Net backed
+up at `~/chessckers-backups/run7-e8d8-botcharge-v6-20260627/` (`weights.pt` + `.arch.json`
+v5/c48/b5 + `weights.bin`).
+
+**⚠️ The actual hypothesis is NOT yet answered.** 34,695 is *total* games, not games-to-converge.
+Whether v6 trained **faster** (the whole point — charge branching reduction) needs the
+balance-over-time curve to find the flip point and compare to run 6's ~8k. **Not computed yet** —
+if run 7 flipped much later than ~8k, the rule change *slowed* training (refuting the bet); if
+near/before ~8k, it helped. Worth computing before designing the next run.
+
+**Strength gate also pending:** match run 7's net vs run 6's backed-up net (gauntlet/arena) to
+test "barely loses strength." Both nets are saved, so this can run anytime.
