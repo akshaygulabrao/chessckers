@@ -13,7 +13,7 @@ scripts to run on it.
   cc plot [args]                # plot the run metrics time-series
   cc ladder [args]              # round-robin champion nets -> terminal Elo + score matrix
   cc gauntlet [args]            # current net vs ALL previous snapshots -> strength + regression curve
-  cc strength [args]           # current net vs past selves -> TABLE only (W-D-L/score/Elo + regression)
+  cc strength [args]           # strength TABLE from the in-fleet gate matches (fast; no games played)
   cc games [opts] [watch args]  # pull a RECORDED fleet self-play game + render it
   cc watch [watch args]         # pull the latest fleet net + watch it self-play live
   cc restart-trainer [LR]       # clean warm-restart the trainer (optionally change LR)
@@ -483,9 +483,10 @@ def main():
     elif cmd == "gauntlet":
         return _run_on_box("gauntlet.py", args)
     elif cmd == "strength":
-        # Table-only strength check (no sparkline) with stronger defaults than the
-        # gauntlet's; any flag here overrides (argparse takes the last value).
-        return _run_on_box("gauntlet.py", ["--no-curve", "--sims", "160", "--games", "4"] + args)
+        # Read the in-fleet GATE's match results (fast read-only DB query, NO games
+        # played). The gate already plays each net vs best with the fast C++ engine.
+        # For a slow deep OFFLINE check (fleet paused), use `cc gauntlet` instead.
+        return _run_on_box("strength.py", args)
     elif cmd == "status":
         # fleet_status.py lives in lczero-server (outside engine) — run it from there.
         box = resolve()
