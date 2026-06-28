@@ -22,10 +22,18 @@ import os
 import re
 import sys
 
-# Default to the live fleet run dir (relative to the engine on the box).
+# Default to the live fleet run dir. lczero-server is a SIBLING of engine on the
+# box (/workspace/chessckers/{engine,lczero-server}) but two levels up on the Mac
+# (engine nested in chessckers/, lczero-server its sibling). Pick whichever exists.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ENG = os.path.dirname(_HERE)
-_DEFAULT_RUN_DIR = os.path.join(_ENG, "..", "..", "lczero-server", "trainer", "run1")
+_SERVER_DIR = next(
+    (p for p in (os.path.join(_ENG, "..", "lczero-server"),
+                 os.path.join(_ENG, "..", "..", "lczero-server"))
+     if os.path.isdir(p)),
+    os.path.join(_ENG, "..", "lczero-server"),
+)
+_DEFAULT_RUN_DIR = os.path.join(_SERVER_DIR, "trainer", "run1")
 sys.path.insert(0, _HERE)  # so `import watch_game` resolves regardless of cwd
 from watch_game import DEFAULT_START_FEN  # noqa: E402  (the training start; reads the fork's board.cc)
 
