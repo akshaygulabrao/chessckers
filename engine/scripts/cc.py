@@ -513,11 +513,9 @@ def main():
             f"#   {SERVER_DIR}/scripts/run_server_vast.sh     # server + trainer bridge"
         )
         print(
-            f"#   {ENGINE_DIR}/../../lczero-client/scripts/launch_vast_direct.sh   # self-play"
-        )
-        print(
             "# Set the start FEN in akshay-chessckers-0/src/chess/board.cc (kStartposFen)."
         )
+        print("# (Or just use `cc fresh-run`, which does all of the above in one command.)")
     elif cmd == "lengths":
         return _run_on_box("game_lengths.py", args)
     elif cmd == "fresh-run":
