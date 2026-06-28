@@ -103,17 +103,18 @@ def _elo(score: float) -> float:
     return max(-800.0, min(800.0, -400.0 * math.log10(1.0 / score - 1.0)))
 
 
-def render(rows, agg_pts, agg_g):
-    """Per-opponent table + strength sparkline (oldest→newest) + regression verdict."""
+def render(rows, agg_pts, agg_g, curve=True):
+    """Per-opponent table (+ optional strength sparkline) + regression verdict."""
     w = max(6, max(len(r[0]) for r in rows))
     print(f"\n  {'opponent':>{w}}   W-D-L    cur%   Elo±")
     print("  " + "─" * (w + 23))
     for lbl, ww, dd, ll, sc in rows:
         print(f"  {lbl:>{w}}  {ww:>2}-{dd}-{ll:<2}  {100 * sc:>4.0f}%  {_elo(sc):>+5.0f}")
-    blocks = "▁▂▃▄▅▆▇█"
-    spark = "".join(blocks[min(7, int(sc * 7.999))] for *_, sc in rows)
-    print(f"\n  strength curve (current's score vs opponent, oldest→newest):\n    {spark}")
-    print("    (full bar = current crushes that old net; mid bar ≈ 50% = indistinguishable)")
+    if curve:
+        blocks = "▁▂▃▄▅▆▇█"
+        spark = "".join(blocks[min(7, int(sc * 7.999))] for *_, sc in rows)
+        print(f"\n  strength curve (current's score vs opponent, oldest→newest):\n    {spark}")
+        print("    (full bar = current crushes that old net; mid bar ≈ 50% = indistinguishable)")
     agg = 100 * agg_pts / agg_g if agg_g else 0
     print(f"  aggregate: current scored {agg:.0f}% over {int(agg_g)} games vs the field")
     regress = [(lbl, sc) for lbl, _, _, _, sc in rows if sc < 0.5]
@@ -140,6 +141,8 @@ def main() -> int:
     ap.add_argument("--start-fen", default=DEFAULT_START_FEN, help="start FEN (default: the training start)")
     ap.add_argument("--device", default="auto", help="auto|cuda|mps|cpu")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-curve", action="store_true", help="omit the strength sparkline; show only the table")
+    ap.add_argument("--out", default="", help="append one JSON history row (current vs opponents) to this file")
     args = ap.parse_args()
 
     import torch
@@ -194,7 +197,7 @@ def main() -> int:
         agg_g += ng
         print(f"  vs {lbl:>6}: {w}-{d}-{l}  ({100 * sc:.0f}%)", flush=True)
 
-    render(rows, agg_pts, agg_g)
+    render(rows, agg_pts, agg_g, curve=not args.no_curve)
     if n_trunc:
         frac = 100 * n_trunc / agg_g if agg_g else 0
         print(f"  \033[33m⚠ {n_trunc}/{int(agg_g)} games ({frac:.0f}%) hit the {args.max_plies}-ply cap "
@@ -202,6 +205,24 @@ def main() -> int:
         if frac >= 50:
             print("    Result is TRUNCATION-DOMINATED, not real draws — raise --sims "
                   "(self-play uses 800) and/or --max-plies for decisive games.")
+    if args.out:
+        import json, time
+        agg_score = agg_pts / agg_g if agg_g else 0.0
+        row = {
+            "ts": int(time.time()),
+            "current": cur_label,
+            "agg_score": round(agg_score, 4),
+            "agg_elo": round(_elo(agg_score), 1),
+            "regression": any(sc < 0.5 for *_, sc in rows),
+            "opponents": [
+                {"label": lbl, "w": ww, "d": dd, "l": ll,
+                 "score": round(sc, 4), "elo": round(_elo(sc), 1)}
+                for lbl, ww, dd, ll, sc in rows
+            ],
+        }
+        with open(args.out, "a") as f:
+            f.write(json.dumps(row) + "\n")
+        print(f"  appended history row → {args.out}")
     return 0
 
 
