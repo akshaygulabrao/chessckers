@@ -16,7 +16,7 @@
 | Rules | v6 bottom-*d* charge (same as run 7) |
 | **New: gate** | in-fleet lc0 gate — `calcElo > −20`, 40-game candidate-vs-best match per publish |
 | Fleet box | vast 42618148 (RTX 3060) — cold-launched 2026-06-28 |
-| Status | **active** — infra validated; running as a soak test |
+| Status | **done** — stopped 2026-06-29; gate + cc strength validated, mate learned |
 
 ## Purpose (not a hypothesis)
 
@@ -47,6 +47,19 @@ Validate the two pieces built this session against a live fleet:
 
 ## Result
 
-<infra goal met (gate + cc strength work). Leave the training "result" empty — this run isn't
-testing a training change; it converges like run 7. Open follow-ons: regression-ladder panel in
-the gate; a bigger run7-vs-run6 strength match; then a real unknown-answer experiment for run 9.>
+**Infra goal met.** The in-fleet gate and `cc strength` both work on the live fleet:
+- **Gate** validated end-to-end (bootstrap-promote → candidate-vs-best 40-game matches → calcElo
+  promote/reject). Promoted 11/11 early matches (all ~20-20-0, near-random) including one at −17
+  Elo — the lenient `calcElo>−20` design.
+- **`cc strength`** rebuilt to read the gate's `matches` table (instant DB read) after the Python
+  gauntlet proved far too slow concurrent with self-play (52 min for ~10 games). Shows the
+  cumulative-Elo chain; honestly read ~0 while nets were near-random.
+
+**Training:** stopped by the user at **9,314 games**, newest 300 = **274 Black / 13 White / 13
+draw (~91% Black)** — the v6 mate was learned (as expected; same config as run 7). The net
+(`trainer/run1/weights.pt`) persists on the box's disk (not backed up off-box — low value, it's
+run-7-equivalent).
+
+**Open follow-ons:** regression-ladder panel in the gate (catch backward drift; the −17 promotion
+shows the need); a real unknown-answer experiment for run 9 where the gate + cc strength earn their
+keep.
