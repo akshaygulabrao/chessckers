@@ -44,6 +44,12 @@ the gate is a real "this candidate is worse" flag.
 
 - `06-29` Set up: `board.cc` → d6/e6/f6 (White-to-move); run 8's net backed up off-box for the
   warm-start.
+- `06-29` **Box rebooted (vast infra) ~12:58 → fleet died silently; restarted.** No crash/OOM —
+  logs ran clean to step 1517 / gate match 57, then the box rebooted (booted 13:01) and tmux
+  (server+trainer+client) was gone. All state persisted on disk, so **warm-resumed run 9 from
+  `trainer/run1/weights.pt`** (not re-seeded) after deleting 13 reboot-truncated 0-byte chunks.
+  The first `upload_network` 400 is the benign already-exists dedup. ⚠️ Reboots can recur — an
+  auto-restart-on-reboot hook (`@reboot` relaunch) would stop silent death.
 - `06-29` **Launched, warm-start verified.** `cc fresh-run --base=/workspace/run8_seed/weights.pt`
   (new `--base` flag). Trainer `base=/workspace/run8_seed/weights.pt` (NOT random init); gate
   bootstrap-promoted the warm net (SHA 585ea4f4…, ≠ the cold-init cf42568…). Self-play runs from
