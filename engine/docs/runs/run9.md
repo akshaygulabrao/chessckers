@@ -15,7 +15,8 @@
 | Rules | v6 bottom-*d* charge (same) |
 | **Init** | **WARM-START from run 8's net** (`~/chessckers-backups/run8-e8d8-v6gated-20260629/weights.pt`), not cold — transfer the learned mate |
 | Gate | in-fleet lc0 gate live (calcElo > −20), 40-game candidate-vs-best |
-| Status | pending launch |
+| Fleet box | vast 42618148 (RTX 3060) — launched 2026-06-29 |
+| Status | **active** — warm-started from run 8, self-play on d6/e6/f6 |
 
 ## Hypothesis
 
@@ -42,7 +43,13 @@ the gate is a real "this candidate is worse" flag.
 ## Log
 
 - `06-29` Set up: `board.cc` → d6/e6/f6 (White-to-move); run 8's net backed up off-box for the
-  warm-start. Pending launch.
+  warm-start.
+- `06-29` **Launched, warm-start verified.** `cc fresh-run --base=/workspace/run8_seed/weights.pt`
+  (new `--base` flag). Trainer `base=/workspace/run8_seed/weights.pt` (NOT random init); gate
+  bootstrap-promoted the warm net (SHA 585ea4f4…, ≠ the cold-init cf42568…). Self-play runs from
+  d6/e6/f6 (White opens `g2g3`). **Early signal:** first game was a 10-ply Black win (`0-1`) — the
+  warm net converts as Black rather than flailing near-random, so the e8/d8 mate appears to
+  transfer. One game = noise; watch the gate Elo, not balance.
 
 ## Result
 
