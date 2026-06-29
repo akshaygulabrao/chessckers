@@ -16,7 +16,7 @@
 | **Init** | **WARM-START from run 8's net** (`~/chessckers-backups/run8-e8d8-v6gated-20260629/weights.pt`), not cold — transfer the learned mate |
 | Gate | in-fleet lc0 gate live (calcElo > −20), 40-game candidate-vs-best |
 | Fleet box | vast 42618148 (RTX 3060) — launched 2026-06-29 |
-| Status | **active** — warm-started from run 8, self-play on d6/e6/f6 |
+| Status | **done** — Black solved d6/e6/f6 (~99% Black @ 16k games); warm-start transferred → run 10 |
 
 ## Hypothesis
 
@@ -58,8 +58,21 @@ the gate is a real "this candidate is worse" flag.
   d6/e6/f6 (White opens `g2g3`). **Early signal:** first game was a 10-ply Black win (`0-1`) — the
   warm net converts as Black rather than flailing near-random, so the e8/d8 mate appears to
   transfer. One game = noise; watch the gate Elo, not balance.
+- `06-29` **Converged → declared done.** Self-play settled at **White 1% / Black 99%** over
+  16,013 games (485k positions, 96 nets, trainer step ~2274). The open question is answered:
+  **Black CAN force d6/e6/f6** — three 2-King towers break the full pawn wall and mate Ke1.
+  The e8/d8 mate transferred via the warm-start (early near-immediate Black wins, not the
+  ~95/5-White flailing a cold start showed). The in-fleet gate stayed flat as predicted for an
+  unknown-answer position (net-vs-net mostly 20-20-0 draws, cumElo oscillating ~+568) — confirming
+  self-play balance, not gate Elo, was the right signal here. Net backed up off-box
+  (`~/chessckers-backups/run9-d6e6f6-v6gated-20260629/weights.pt`, v5 c48/b5) + box seed
+  (`/workspace/run9_seed/weights.pt`) for the run 10 warm-start.
 
 ## Result
 
-<unknown-answer — fill once it runs. Watch the gate Elo (`cc strength`), NOT the W/B balance.
-Reject events = real regression signals. Open question: does Black break the pawn wall at all?>
+**Black wins d6/e6/f6.** Converged to ~99% Black over ~16k games; the warm-start from run 8's
+e8/d8 net transferred (no cold-start trap). Gate Elo flat throughout (expected: two copies of the
+same improving net on an unknown-answer position) — self-play balance was the operative signal.
+Best/seed net: `~/chessckers-backups/run9-d6e6f6-v6gated-20260629/weights.pt` (v5 c48/b5, Adam 1e-3).
+**Successor: [run 10](run10.md)** — warm-started from this net onto the **official full starting
+position** (the first run on the complete game).
