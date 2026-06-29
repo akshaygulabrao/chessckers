@@ -19,7 +19,7 @@ scripts to run on it.
   cc restart-trainer [LR]       # clean warm-restart the trainer (optionally change LR)
   cc play [play args]           # play a human-vs-net game against the latest fleet net
   cc lengths [--window=50]      # average game length over training (survival→mate curve)
-  cc fresh-run [--run-name=X] [--arch=v5] [--parallelism=32]
+  cc fresh-run [--run-name=X] [--arch=v5] [--parallelism=32] [--base=<box-net.pt>]
                               # provision + launch a fresh training run from scratch
 
 cc games — render the network's actual self-play games (newest by default):
@@ -246,6 +246,8 @@ def cmd_fresh_run(args):
     run_name = "V5_e8d8"
     arch = "v5"
     parallelism = "32"
+    base = ""  # warm-start: a net path ON THE BOX (must survive reset_fleet, e.g.
+    #            /workspace/run8_seed/weights.pt). Empty = cold random init.
     for a in args:
         if a.startswith("--run-name="):
             run_name = a.split("=", 1)[1]
@@ -253,9 +255,12 @@ def cmd_fresh_run(args):
             arch = a.split("=", 1)[1]
         elif a.startswith("--parallelism="):
             parallelism = a.split("=", 1)[1]
+        elif a.startswith("--base="):
+            base = a.split("=", 1)[1]
 
     print(
-        f"=== fresh-run: box={host}:{port}  run={run_name}  arch={arch}  p={parallelism} ==="
+        f"=== fresh-run: box={host}:{port}  run={run_name}  arch={arch}  p={parallelism}"
+        f"  init={'warm:' + base if base else 'cold'} ==="
     )
 
     # 1. Provision (server + engine, no state seed).
@@ -331,6 +336,9 @@ def cmd_fresh_run(args):
     # shell where those are undefined, and single-quoting them (the old bug) types
     # a literal `cd '$SRV'` that fails. $PATH stays single-quoted so the PANE
     # expands it at runtime.
+    # Warm-start: pass BASE so launch_trainer.sh feeds the trainer a seed net
+    # (--base) instead of cold random init. Empty = cold (the default).
+    base_env = f"BASE={base} " if base else ""
     sh_ok(
         f"tmux kill-session -t cc 2>/dev/null; sleep 1; "
         f"cd {SERVER_DIR} && tmux new-session -d -s cc -n server -c {SERVER_DIR} && "
@@ -338,7 +346,7 @@ def cmd_fresh_run(args):
         f"'cd {SERVER_DIR} && PATH=/usr/local/go/bin:$PATH RUN_NAME={run_name} scripts/launch_server.sh 2>&1 | tee -a server.log' C-m && "
         f"tmux new-window -t cc -n trainer -c {SERVER_DIR} && sleep 0.5 && "
         f"tmux send-keys -t cc:trainer "
-        f"'cd {SERVER_DIR} && sleep 6 && ENGINE_DIR={ENGINE_DIR} SERVER=http://localhost:10100 ARCH_VERSION={arch} scripts/launch_trainer.sh 2>&1 | tee -a trainer.log' C-m"
+        f"'cd {SERVER_DIR} && sleep 6 && {base_env}ENGINE_DIR={ENGINE_DIR} SERVER=http://localhost:10100 ARCH_VERSION={arch} scripts/launch_trainer.sh 2>&1 | tee -a trainer.log' C-m"
     )
 
     # 6. Launch client in tmux 'cc-client'.
