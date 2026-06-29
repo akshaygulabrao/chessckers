@@ -48,8 +48,10 @@ the gate is a real "this candidate is worse" flag.
   logs ran clean to step 1517 / gate match 57, then the box rebooted (booted 13:01) and tmux
   (server+trainer+client) was gone. All state persisted on disk, so **warm-resumed run 9 from
   `trainer/run1/weights.pt`** (not re-seeded) after deleting 13 reboot-truncated 0-byte chunks.
-  The first `upload_network` 400 is the benign already-exists dedup. ⚠️ Reboots can recur — an
-  auto-restart-on-reboot hook (`@reboot` relaunch) would stop silent death.
+  The first `upload_network` 400 is the benign already-exists dedup.
+- `06-29` **Auto-restart hardening added** (so a reboot self-heals): `restart_fleet.sh` (idempotent
+  warm-resume relaunch) + an `@reboot` cron on the box + `cc restart` + fresh-run installs the cron.
+  See [[chessckers-vast-reboot-autorestart]].
 - `06-29` **Launched, warm-start verified.** `cc fresh-run --base=/workspace/run8_seed/weights.pt`
   (new `--base` flag). Trainer `base=/workspace/run8_seed/weights.pt` (NOT random init); gate
   bootstrap-promoted the warm net (SHA 585ea4f4…, ≠ the cold-init cf42568…). Self-play runs from
