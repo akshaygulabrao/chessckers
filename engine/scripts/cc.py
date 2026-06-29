@@ -17,6 +17,7 @@ scripts to run on it.
   cc games [opts] [watch args]  # pull a RECORDED fleet self-play game + render it
   cc watch [watch args]         # pull the latest fleet net + watch it self-play live
   cc restart-trainer [LR]       # clean warm-restart the trainer (optionally change LR)
+  cc restart                    # relaunch the whole fleet (warm-resume) if down — idempotent
   cc play [play args]           # play a human-vs-net game against the latest fleet net
   cc lengths [--window=50]      # average game length over training (survival→mate curve)
   cc fresh-run [--run-name=X] [--arch=v5] [--parallelism=32] [--base=<box-net.pt>]
@@ -359,6 +360,17 @@ def cmd_fresh_run(args):
         f"'export PATH={cl}/.enginebin:$PATH; cd {cl}; ./lc0-client -hostname http://localhost:10100 -user vast -password chessckers -run 1 -parallelism {parallelism} 2>&1 | tee -a client.log' C-m"
     )
 
+    # Install/refresh the @reboot auto-restart cron so a vast.ai reboot (which
+    # kills tmux but keeps disk state) self-heals instead of silently dying.
+    print("\n--- installing @reboot auto-restart cron ---")
+    cron_line = (
+        f"@reboot RUN_NAME={run_name} ARCH_VERSION={arch} PARALLELISM={parallelism} "
+        f"{SERVER_DIR}/scripts/restart_fleet.sh --boot >> /workspace/restart_fleet.log 2>&1")
+    sh_ok(
+        f"chmod +x {SERVER_DIR}/scripts/restart_fleet.sh; "
+        f"( crontab -l 2>/dev/null | grep -v restart_fleet.sh; echo '{cron_line}' ) | crontab -; "
+        f"echo '[cron] @reboot auto-restart installed'")
+
     print("\n=== fresh-run complete ===")
     print(f"  ssh -p {port} root@{host} -t tmux attach -t cc     # server + trainer")
     print(f"  ssh -p {port} root@{host} -t tmux attach -t cc-client  # self-play")
@@ -509,6 +521,11 @@ def main():
         return cmd_watch(args)
     elif cmd == "restart-trainer":
         return cmd_restart_trainer(args)
+    elif cmd == "restart":
+        # Relaunch the whole fleet (server + trainer warm-resume + client) if it's
+        # down — idempotent, the same script the @reboot cron runs. No rebuild/wipe.
+        box = resolve()
+        return subprocess.call(_ssh(box) + [f"bash {SERVER_DIR}/scripts/restart_fleet.sh"])
     elif cmd == "play":
         return cmd_play(args)
     elif cmd == "launch":
