@@ -127,7 +127,14 @@ Key invariant: for every Black square, `stacks[sq]`'s top piece matches the bitb
 
 ### AlphaZero engine
 
-`model.py` (`ChesskersScorer`: policy + value heads), `encoding.py` (board/move tensors), `mcts_puct.py` (PUCT MCTS), `selfplay_az.py` (`play_az_game` — the reference self-play loop, used by `train_az`/`replay_buffer`), `inference_server.py` (batched GPU eval), `replay_buffer.py`, `train_az.py`. **Production self-play runs outside this repo**: the lc0-split cutover retired the Python self-play engine (`selfplay_worker_async`/`selfplay_workers_only`/`selfplay_az_async`); every fleet game is now played by the `../akshay-chessckers-0` lc0 fork (run by `../lczero-client`), which uploads ccz1 games to `../lczero-server` for `train_continuous` to consume. Self-play correctness depends on the move-gen + check detection above; `n_sims` should be ≥ 50 (lower yields degenerate visit distributions).
+`model.py` (`ChesskersScorer`: policy + value heads), `encoding.py` (board/move tensors), `mcts_puct.py` (PUCT MCTS), `selfplay_az.py` (`play_az_game` — the reference self-play loop, used by `train_az`/`replay_buffer`), `inference_server.py` (batched GPU eval), `replay_buffer.py`, `train_az.py`. **Production self-play runs outside this repo**: the lc0-split cutover retired the Python self-play engine (`selfplay_worker_async`/`selfplay_workers_only`/`selfplay_az_async`); every fleet game is now played by the `../akshay-chessckers-0` lc0 fork (run by `../lczero-client`), which uploads ccz1 games to `../lczero-server` for `train_continuous` to consume. Self-play correctness depends on the move-gen + check detection above. (The retired Python loop's `n_sims ≥ 50` floor no longer governs the fleet — **don't quote it as the live search depth**.)
+
+**Live fleet search/gate parameters** (authoritative source, not this doc — verify in code before quoting): self-play and gate settings are seeded into the DB training-run at `../lczero-server/cmd/bootstrap/main.go:43-44` and the gate size at `../lczero-server/serverconfig.json`:
+- **Self-play: 800 visits/move** (`trainParams --visits=800`), with Dirichlet exploration `--noise-epsilon=0.25 --noise-alpha=0.3 --temperature=1.0 --tempdecay-moves=15`. (A deferred idea to drop to 100 for throughput lives in `engine/docs/runs/deferred-low-visits.md`; never run.)
+- **Gate match: 128 visits/move** (`matchParams --visits=128`), `calcElo > −20` promotion threshold (`serverconfig.json matches.threshold`).
+- **Gate size = 40 games, not 8.** `serverconfig.json matches.games` is `8`, but `createMatch` in `main.go` does `gameCap *= 5` for `targetSlice == 0` (all small-fleet matches run at slice 0), so the effective candidate-vs-best match is **8 × 5 = 40 games**.
+
+Current run's net arch / start FEN / optimizer live in the per-run ledger under `engine/docs/runs/` (e.g. run 10 = v5 SE-ResNet c48/b5 ~364K params, Adam 1e-3, full official start) — read the newest `runN.md`, not memory, for what's live.
 
 ### FEN Extension
 
