@@ -15,7 +15,7 @@ Shared, run-independent arch/encoding tables live in
 | 8 | 2026-06-28 | e8/d8 (same as run 7) | v5 c48/b5 (same) | Adam lr=1e-3 (same) | **done** — infra validation: gate + `cc strength` validated; stopped ~91% Black @ 9.3k games | [run8.md](runs/run8.md) |
 
 | 9 | 2026-06-29 | `8/8/3kkk2/8/8/8/PPPPPPPP/4K3[d6:kk,e6:kk,f6:kk] w` (d6/e6/f6 vs pawn wall) | v5 c48/b5 (same) | Adam lr=1e-3 (same) | **done** — unknown-answer resolved: **Black wins** (~99% Black @ 16k games); warm-start from run 8 transferred | [run9.md](runs/run9.md) |
-| 10 | 2026-06-29 | `…/RNBQKBNR[…24-tower…] w KQkq - 0 1 {wm:2}` (**official full starting position**, opening double-move) | v5 c48/b5 (same) | Adam lr=1e-3 (same) | **active** — first run on the complete game; **warm-started from run 9 net** | [run10.md](runs/run10.md) |
+| 10 | 2026-06-29→30 | `…/RNBQKBNR[…24-tower…] w KQkq - 0 1 {wm:2}` (**official full starting position**, opening double-move) | v5 c48/b5 (same) | Adam lr=1e-3 (same) | **done** — first run on the complete game; **warm-started from run 9 net**; net swept its run-9 seed **10–0** from the full start (learned a coherent opening; absolute strength TBD) | [run10.md](runs/run10.md) |
 
 **Deferred ideas** (not numbered): [low self-play visits 800→100](runs/deferred-low-visits.md) —
 dropped 2026-06-26 (judged low-impact).
