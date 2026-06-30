@@ -258,15 +258,28 @@ def _moves_from_chunk(path: str) -> tuple[str, list[str]]:
         raise SystemExit(f"--chunk {path}: empty or undecodable chunk")
     client = PyVariantClient()
 
+    def norm(fen: str) -> str:
+        """Blank the en-passant field before comparing. En passant is disabled in
+        this variant (board.cc kPawnMask=0), so the fork records '-', but PyVariant
+        (python-chess) still stamps an ep target after a pawn double-step that lands
+        next to a Black Stone (encoded as a black pawn). That field is dead here, so
+        comparing it would spuriously mark such a legal double-step '?'. Mirrors
+        check_chunk_parity._norm."""
+        head, _, rest = fen.partition(" ")
+        parts = rest.split()
+        if len(parts) >= 3:
+            parts[2] = "-"
+        return head + " " + " ".join(parts)
+
     def applied_fen(fen: str, uci: str) -> str | None:
         try:
-            return client.make_move(fen, uci)["fen"]
+            return norm(client.make_move(fen, uci)["fen"])
         except Exception:  # noqa: BLE001 — illegal/garbled token, just skip it
             return None
 
     moves: list[str] = []
     for i in range(len(exs) - 1):
-        nxt = exs[i + 1].fen
+        nxt = norm(exs[i + 1].fen)
         played = next((m["uci"] for m in exs[i].legal_moves
                        if applied_fen(exs[i].fen, m["uci"]) == nxt), "?")
         moves.append(played)
