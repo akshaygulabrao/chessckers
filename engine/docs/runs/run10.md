@@ -16,7 +16,7 @@
 | **Init** | **WARM-START from run 9's net** (`~/chessckers-backups/run9-d6e6f6-v6gated-20260629/weights.pt`; box seed `/workspace/run9_seed/weights.pt`), not cold |
 | Gate | in-fleet lc0 gate live (calcElo > −20), 40-game candidate-vs-best |
 | Fleet box | vast (resolve with `cc box`) — launched 2026-06-29 |
-| Status | **active** — launched 2026-06-29 from the official start, warm-started from run 9 |
+| Status | **done** — stopped 2026-06-30; net beat its run-9 seed 10–0 from the full start (learned a coherent opening; see Result) |
 
 ## Hypothesis
 
@@ -56,9 +56,24 @@ Success = a coherent, improving policy (decisive self-play balance settling, san
   full board — full chess vs all 24 towers — so self-play runs from the official start. Server +
   bridge + trainer UP, games flowing, DB reset clean. Early balance White 0% / Black 100% (noise at
   4 games — Black's 24-tower material edge). `@reboot` auto-restart cron reinstalled.
+- `06-30` **Declared done.** Pulled the live best net off-box to
+  `~/chessckers-backups/run10-fullstart-20260630/weights.pt` (+ `.arch.json`; v5 c48/b5 ~364K) and
+  played it head-to-head vs the run-9 seed from the official full start FEN (10 games, 100 sims,
+  both colors, local CPU ×6). **Run 10 swept 10–0–0** — 5–0 as White, 5–0 as Black.
 
 ## Result
 
-<active — fill once it runs. First-order signal: self-play W/B balance + whether opening lines in
-`cc games` look coherent. Open question: is the full start a Black win, and does the d6/e6/f6 net
-transfer to the 24-tower opening?>
+**Run 10 net beats its own run-9 seed 10–0–0 (100%) from the full start** — 5–0 as White, 5–0 as
+Black, 100 sims/move, no draws or losses (≥ the +800 Elo measurement floor). Match log:
+`/tmp/r10_v_r9_par.log`; reproduce with the two backed-up nets via `scripts/gauntlet.py`
+(`--current` run10, positional run9, `--start-fen` = official `STARTING_FEN`).
+
+- **Open question 2 answered — yes, the run learned something coherent.** Run 10 decisively beats
+  the seed it was warm-started *from*, so on-distribution training on the 24-tower opening dominated
+  the transferred d6/e6/f6 features. Run 9 is effectively out-of-distribution on the full start (it
+  only ever saw a 3-tower endgame), so this is the expected, clean outcome — and it confirms the net
+  isn't just noise.
+- **Open question 1 (is the full start a Black win?) — still unknown.** Gate Elo was flat as
+  predicted (two copies of the same net), and a sweep over an OOD opponent is **not** an absolute
+  strength signal. The real strength read is a `cc gauntlet` of run 10 vs its own earlier
+  `iter-async-*` snapshots on the full start (deferred — not run here).
