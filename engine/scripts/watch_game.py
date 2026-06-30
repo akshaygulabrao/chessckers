@@ -252,24 +252,15 @@ def _moves_from_chunk(path: str) -> tuple[str, list[str]]:
     why --chunk exists: hand-rolling decode + argmax silently mislabels the game."""
     from chessckers_engine.training_chunk import decode_chunk
     from chessckers_engine.variant_py import PyVariantClient
+    # Reuse the parity checker's FEN canonicalizer: it blanks the dead en-passant
+    # field (disabled in this variant) so a legal pawn double-step landing next to a
+    # Black Stone isn't spuriously marked '?'. Single source of truth for both tools.
+    from check_chunk_parity import _norm as norm
 
     exs = decode_chunk(open(path, "rb").read())
     if not exs:
         raise SystemExit(f"--chunk {path}: empty or undecodable chunk")
     client = PyVariantClient()
-
-    def norm(fen: str) -> str:
-        """Blank the en-passant field before comparing. En passant is disabled in
-        this variant (board.cc kPawnMask=0), so the fork records '-', but PyVariant
-        (python-chess) still stamps an ep target after a pawn double-step that lands
-        next to a Black Stone (encoded as a black pawn). That field is dead here, so
-        comparing it would spuriously mark such a legal double-step '?'. Mirrors
-        check_chunk_parity._norm."""
-        head, _, rest = fen.partition(" ")
-        parts = rest.split()
-        if len(parts) >= 3:
-            parts[2] = "-"
-        return head + " " + " ".join(parts)
 
     def applied_fen(fen: str, uci: str) -> str | None:
         try:
