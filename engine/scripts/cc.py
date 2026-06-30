@@ -15,6 +15,7 @@ scripts to run on it.
   cc gauntlet [args]            # current net vs ALL previous snapshots -> strength + regression curve
   cc strength [args]           # strength TABLE from the in-fleet gate matches (fast; no games played)
   cc games [opts] [watch args]  # pull a RECORDED fleet self-play game + render it
+  cc verify-chunks [opts]       # scan recent chunks for oracle-illegal moves (fork-vs-PyVariant parity)
   cc watch [watch args]         # pull the latest fleet net + watch it self-play live
   cc restart-trainer [LR]       # clean warm-restart the trainer (optionally change LR)
   cc restart                    # relaunch the whole fleet (warm-resume) if down — idempotent
@@ -474,6 +475,50 @@ def cmd_play(args):
     return subprocess.call([py, pn, *extra, *args])
 
 
+def cmd_verify_chunks(args):
+    """Scan recent self-play chunks for oracle-illegal moves (fork vs PyVariant parity).
+
+    Pulls the newest N chunks (or a specific --index) off the box and replays each
+    through PyVariant: any ply whose recorded transition no PyVariant-legal move can
+    reproduce is a fork rules divergence (the class of bug behind training.218.gz —
+    a quiet diagonal sliding through a White piece). Exit 1 if any are found.
+
+      cc verify-chunks                 # newest 200 chunks
+      cc verify-chunks --count 1000    # newest 1000
+      cc verify-chunks --index 218     # one specific chunk
+    """
+    box = resolve()
+    gdir = _games_dir(box)
+    if "--index" in args:
+        i = args.index("--index")
+        remotes = [f"{gdir.rstrip('/')}/training.{args[i + 1]}.gz"]
+    else:
+        count = 200
+        if "--count" in args:
+            count = int(args[args.index("--count") + 1])
+        out = _ssh_out(
+            box,
+            f"find {shlex.quote(gdir)} -name 'training.*.gz' "
+            f"-printf '%T@ %p\\n' 2>/dev/null | sort -n | tail -{count}",
+        )
+        remotes = [ln.split(None, 1)[1] for ln in out.splitlines() if len(ln.split(None, 1)) == 2]
+        if not remotes:
+            sys.exit(f"cc verify-chunks: no chunks under {gdir}")
+
+    locals_ = []
+    for remote in remotes:
+        # Always re-fetch (overwrite): chunk numbers reset per run, so a same-named
+        # file cached from a PRIOR run is stale and would scan the wrong game.
+        local = os.path.join(GAMES_CACHE, os.path.basename(remote))
+        if _fetch(box, remote, local) != 0:
+            print(f"# skip (fetch failed): {remote}")
+            continue
+        locals_.append(local)
+    print(f"# scanning {len(locals_)} chunk(s) for oracle-illegal moves ...", flush=True)
+    checker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_chunk_parity.py")
+    return subprocess.call([sys.executable, checker, *locals_])
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -517,6 +562,8 @@ def main():
         return subprocess.call(_ssh(box) + [remote])
     elif cmd == "games":
         return cmd_games(args)
+    elif cmd == "verify-chunks":
+        return cmd_verify_chunks(args)
     elif cmd == "watch":
         return cmd_watch(args)
     elif cmd == "restart-trainer":
