@@ -305,6 +305,11 @@ def main() -> int:
                          "freshest first. Combine with no FEN to watch the latest net from the "
                          "engine's current start position: `watch_game.py --latest --device mps`.")
     ap.add_argument("--sims", type=int, default=200)
+    ap.add_argument("--gumbel", action="store_true",
+                    help="use Gumbel AlphaZero search (Sequential Halving + improved-policy "
+                         "interior selection) instead of PUCT+Dirichlet — the low-sim path")
+    ap.add_argument("--considered", type=int, default=16,
+                    help="Gumbel only: m root actions to search (Gumbel-Top-k); ignored for PUCT")
     ap.add_argument("--explore", type=float, default=0.30,
                     help="root Dirichlet exploration-noise fraction (default 0.30 = 30 pct); the "
                          "played move stays argmax of visits. 0 = pure greedy/deterministic.")
@@ -325,7 +330,7 @@ def main() -> int:
 
     import torch
     from chessckers_engine.checkpoints import load_scorer
-    from chessckers_engine.mcts_puct import run_mcts
+    from chessckers_engine.mcts_puct import run_gumbel_mcts, run_mcts
     from chessckers_engine.render_board import render_board
     from chessckers_engine.selfplay_az import _outcome_from_state
     from chessckers_engine.variant_py import PyVariantClient
@@ -389,12 +394,19 @@ def main() -> int:
             break
         if args.clear:
             _clear_screen()
-        result = run_mcts(
-            state, client, model,
-            n_sims=args.sims, c_puct=1.5,
-            dirichlet_alpha=alpha,      # root exploration noise...
-            dirichlet_eps=args.explore,  # ...at --explore fraction (30%)
-        )
+        if args.gumbel:
+            result = run_gumbel_mcts(
+                state, client, model,
+                n_sims=args.sims, max_considered=args.considered,
+                deterministic=(args.explore <= 0.0),  # --explore 0 → noiseless argmax
+            )
+        else:
+            result = run_mcts(
+                state, client, model,
+                n_sims=args.sims, c_puct=1.5,
+                dirichlet_alpha=alpha,      # root exploration noise...
+                dirichlet_eps=args.explore,  # ...at --explore fraction (30%)
+            )
         _print_net_eval(model, state["fen"], state["turn"], args.device)  # raw net WDL + moves-left
         _print_analysis(state["turn"], result, args.sims)  # top-3 lines for this position
         chosen = result.chosen
