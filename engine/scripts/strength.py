@@ -46,6 +46,11 @@ def main() -> int:
                     help="server SQLite db (default: <server>/chessckers.db)")
     ap.add_argument("--last", type=int, default=25,
                     help="show the last N gate matches (0 = all)")
+    ap.add_argument("--since-net", type=int, default=None,
+                    help="only matches whose candidate network_number >= this (default: "
+                         "auto-detect the current run's start = the most recent bootstrap-promoted net)")
+    ap.add_argument("--all", action="store_true",
+                    help="show matches across ALL runs (disable current-run scoping)")
     args = ap.parse_args()
 
     if not os.path.exists(args.db):
@@ -66,6 +71,26 @@ def main() -> int:
               "(run just started, or auto-promote / bootstrap only).")
         return 0
 
+    # Scope to the CURRENT run. A buffer-preserving scale-up (e.g. run 11: c48/b5 -> c64/b6)
+    # reuses training_run 1 and only resets best_network_id, so the DB still holds the PRIOR
+    # run's nets + matches. The current run starts at the most recent BOOTSTRAP-promoted net —
+    # one that was "best" but never a match candidate (best=0 -> set directly, no gate match).
+    # Auto-detect that boundary so strength doesn't conflate the old c48 run with the new c64 one.
+    run_start = args.since_net
+    if not args.all:
+        if run_start is None:
+            cand_ids = {r["candidate_id"] for r in rows}
+            boots = [i for i in ({r["current_best_id"] for r in rows} - cand_ids) if i in num]
+            if boots:
+                run_start = num[max(boots, key=lambda i: num[i])]
+        if run_start is not None:
+            rows = [r for r in rows if num.get(r["candidate_id"], -1) >= run_start]
+        if not rows:
+            print(f"cc strength: no completed gate matches yet for the current run "
+                  f"(since net #{run_start}) — the new net's first gate match may still be "
+                  f"running. Use --all (or --since-net N) to see prior runs.")
+            return 0
+
     # cumulative Elo over PROMOTED matches = running strength of the best net above
     # net 1 (each promoted calcElo is the new best's edge over the prior best).
     cum, cum_at = 0.0, []
@@ -80,7 +105,9 @@ def main() -> int:
     shown = rows[start:]
     promoted = sum(1 for r in rows if r["passed"])
 
-    print(f"\n  in-fleet gate: {len(rows)} matches, {promoted} promoted "
+    scope = "ALL runs" if args.all else (f"current run (since net #{run_start})"
+                                         if run_start is not None else "all matches")
+    print(f"\n  in-fleet gate [{scope}]: {len(rows)} matches, {promoted} promoted "
           f"(showing last {len(shown)}) — each net vs the then-current best")
     print(f"  {'cand':>5} {'vs best':>8}  {'W-L-D':>9}  {'Elo':>5}   verdict  {'cumElo':>7}")
     print("  " + "─" * 50)
