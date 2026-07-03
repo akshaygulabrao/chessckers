@@ -134,7 +134,7 @@ Key invariant: for every Black square, `stacks[sq]`'s top piece matches the bitb
 - **Gate match: 128 visits/move** (`matchParams --visits=128`), `calcElo > −20` promotion threshold (`serverconfig.json matches.threshold`).
 - **Gate size = 40 games, not 8.** `serverconfig.json matches.games` is `8`, but `createMatch` in `main.go` does `gameCap *= 5` for `targetSlice == 0` (all small-fleet matches run at slice 0), so the effective candidate-vs-best match is **8 × 5 = 40 games**.
 
-Current run's net arch / start FEN / optimizer live in the per-run ledger under `engine/docs/runs/` (e.g. run 10 = v5 SE-ResNet c48/b5 ~364K params, Adam 1e-3, full official start) — read the newest `runN.md`, not memory, for what's live.
+Current run's net arch / start FEN / optimizer live in the per-run ledger under `engine/docs/runs/` (e.g. run 11 = v5 SE-ResNet c64/b6 ~630K params, Adam 1e-3, full official start, training on run 10's kept replay buffer) — read the newest `runN.md`, not memory, for what's live.
 
 ### FEN Extension
 
