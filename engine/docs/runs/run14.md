@@ -72,6 +72,47 @@ starting position — all 24 towers, full chess — what does the net learn, and
   validated (matches `STARTING_FEN`, 20 legal). Launching via `cc fresh-run
   --run-name=V5_fullstart_c64b6 --arch=v5 --c-filters=64 --n-blocks=6 --se-ratio=8
   --base=/workspace/run13_seed/weights.pt`.
+- `07-04` **Diagnosed the gate freeze** (best stuck at net #4; 70+ straight rejects, plateau ≈ −350 Elo;
+  matches 1–8 were parity, slide 09:56→12:06 on 07-03, plateau since). Two interlocking causes:
+  1. **wm:2 ply-0 sign bug in the fork's search (confirmed empirically).** lc0's backup/readout assumes
+     strict move alternation (`eval->q = -eval->q`, `v = -v` per ply); the opening double-move's
+     same-mover edge breaks it at the `{wm:2}` root. Recorded ply-0 `root_q` is the near-exact
+     **negation** of ply-1's (200-game scan: mean −0.79 vs +0.85, 0/200 same-sign, |q0+q1|≈0.05), and
+     ply-0 PUCT **anti-optimizes White's first sub-move** (child Q sign-flipped at selection) — the
+     seed's prior loves e2e4, yet #4-as-White opens b2b4-junk in every match game. Every game's ply-0
+     value+policy targets are poisoned, every opening trajectory starts with an anti-chosen sub-move,
+     and the observed 40/60 W/B balance (and "is the full start Black-won?") is contaminated. Same bug
+     was live in run 10 (same start). PyVariant handles the same-mover edge correctly
+     (`_child_q_from`), so Python analysis tools don't reproduce it.
+  2. **Frozen-generator distillation spiral.** #4 (EMA ≈ 86% run-13 seed, published 1.5h in) froze as
+     best → clients play only #4 (7325/7631 games) → the trainer distills its Dirichlet+temp-1.0
+     flattened visits (opening targets 2.86 nats entropy, top-1 0.21) and its miscalibrated,
+     never-recalibrating `root_q` (+0.85 at ply 1 vs 40% actual White wins; imported at weight 0.5 via
+     `--value-q-ratio`) → published nets get **flat opening priors** (max prior 0.08 vs seed's sharp
+     0.13) and **incoherent opening value** (start eval −0.55; taught −0.79 at ply 0 vs +0.85 at ply 1)
+     → each publish genuinely weaker: candidate-as-**Black** vs the constant #4-as-White fell
+     **72% → 18%** wins (cleanest regression proof — no double-move on the candidate's side).
+     The EMA (~8h horizon at the ingest-throttled ~2 steps/min) masked the raw-net regression through
+     matches ~1–8, then the published nets converged onto the drifted raw net → plateau ≈ −350, far
+     below the −20 gate bar → generator never unfreezes. Trainer metrics stayed healthy throughout
+     (policy 2.6 / vsign 0.77): it fits its objective fine; the objective is the problem.
+  Side-finding: `gauntlet.py play_game` never passes `temperature` to `pick_puct` (added for exactly
+  that purpose), so "6 games/opp" = 2 distinct deterministic games per opponent — its "no regression"
+  verdict here was vacuous.
+- `07-04` **wm:2 bug FIXED + relaunch (attempt 2).** Fork commit `45349d9` fixes the same-mover root in
+  the classic search: root-boundary corrections only (backup hop into the root keeps sign; picker /
+  best-child / temperature / stats / eval reads flip visited root-children Q once), gated on
+  `root_same_mover_children_` (root `white_moves_left == 2`); descendant frames untouched, so tree
+  reuse needs no handoff — mirrors PyVariant `_child_q_from`. **Validated locally before deploy**: Mac
+  blas/metal build, 4 selfplay games from the official start → decoded chunks show `q(ply0) ≈ q(ply1)`
+  same-sign **4/4** (broken baseline: **0/200**), |q0−q1| ≈ 0.02-0.06; White won 4/4 with a correctly
+  optimized first sub-move (old fleet balance was 40/60 Black — expect the balance read to shift).
+  Relaunching the SAME experiment (warm from run-13 seed, fresh buffer, same c64/b6 Adam 1e-3 config —
+  one variable changed vs attempt 1: the engine fix) as `RUN_NAME=V5_fullstart_c64b6_wm2fix` via
+  `cc fresh-run --base=/workspace/run13_seed/weights.pt`. Attempt-1 DB/games/nets wiped by reset_fleet
+  (diagnosis preserved above; seed survives outside the wiped dirs). Watch for: gate freeze recurrence
+  (frozen generator + lenient −20 bar — candidate-as-Black win% vs constant best is the clean tracker),
+  and ply-0 q0≈q1 on fleet chunks as the deploy check.
 
 ## Result
 
