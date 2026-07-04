@@ -113,6 +113,15 @@ starting position — all 24 towers, full chess — what does the net learn, and
   (diagnosis preserved above; seed survives outside the wiped dirs). Watch for: gate freeze recurrence
   (frozen generator + lenient −20 bar — candidate-as-Black win% vs constant best is the clean tracker),
   and ply-0 q0≈q1 on fleet chunks as the deploy check.
+- `07-04` **Attempt 2 LIVE + deploy verified.** fresh-run completed (provision → fork build w/ fix →
+  client build → reset → launch); trainer warm-loaded the seed (`BASE=run13_seed c=64 b=6 se=8`),
+  net #1 (seed) bootstrap-promoted, client at parallelism 32, `@reboot` cron updated to the new
+  RUN_NAME. **First 4 fleet chunks: q(ply0) ≈ q(ply1), same-sign 4/4** (+0.84 vs +0.86; attempt-1
+  baseline was 0/200) from the official start FEN, and White's double-moves now include the seed's
+  top-prior e2e4 (2 of first 4 games) + b1c3/d2d4 development — the ply-0 anti-optimization is gone
+  in production. Note: the seed's search says White ≈ +0.84 from the start; with White's first move
+  no longer sabotaged, expect the W/B balance to differ sharply from attempt-1's 40/60 — do not
+  compare balance across attempts.
 
 ## Result
 
