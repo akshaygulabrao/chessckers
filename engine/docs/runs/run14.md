@@ -20,7 +20,7 @@
 | Gate | fresh — DB bootstrapped `training_run #1 "V5_fullstart_c64b6"`; first published net bootstrap-promotes as best. 40-game candidate-vs-best on the new lineage. |
 | Fleet box | vast id `42618148` (RTX 3060) — server `:39411`→`localhost:10100` (same box as runs 11–13) |
 | Started | 2026-07-02 |
-| Status | **active** — launching 2026-07-02 via `cc fresh-run` (warm from run 13, c64/b6, full official start). |
+| Status | **superseded → [run 15](run15.md)** — both attempts froze in the generator death spiral (see Result). |
 
 ## Hypothesis
 
@@ -122,9 +122,22 @@ starting position — all 24 towers, full chess — what does the net learn, and
   in production. Note: the seed's search says White ≈ +0.84 from the start; with White's first move
   no longer sabotaged, expect the W/B balance to differ sharply from attempt-1's 40/60 — do not
   compare balance across attempts.
+- `07-05` **Attempt 2 froze identically.** Gate locked on **#3** (2 early promotions, then #4→#44 all
+  rejected, −241…−800; last: #44 vs #3 4-36-0 = −382) while trainer metrics stayed healthy (policy
+  ~2.57, vsign ~0.7) — the wm2 fix was live and verified (q0≈q1) but did not cure the spiral. 44 nets,
+  4325 games, step ~2292 at shutdown. Stopped, backed up, superseded → [run 15](run15.md).
 
 ## Result
 
-<active — leave empty. End-state TBD: from the official full start, does the run-13-seeded c64/b6 net
-settle into a coherent, decisive balance (and which side), and how does it compare to run 10's c48/b5
-full-start net? Link successor run when pivoted.>
+**Dead — frozen-generator distillation death spiral, twice; superseded → [run 15](run15.md) (Gumbel
+Stage-1 improved-policy target + pure-z value).** Attempt 2, with the wm2 search fix live and verified
+in production chunks, re-froze exactly like attempt 1: best locked at #3, 41+ consecutive rejects.
+Verified mechanism (full detail in the `chessckers-run14-gate-freeze-lessons` memory): the run-13 seed
+is OOD-overconfident on the full start (value ≈ +0.86 everywhere vs ~40/60 actual) → blind value breaks
+the AZ improvement operator → visit targets ≈ prior+noise, and `VALUE_Q_RATIO=0.5` imports the teacher's
+outcome-decoupled q into half of every value target. Dose-response of the final student vs the frozen
+best: **−203 Elo @ visits=1, −269 @ 128, −511 @ 800** — more search makes it *worse* (the value head is
+the amplifier). Every plumbing layer was exonerated by direct test (encoders, `.bin` export, gate
+honesty, rules parity, wm2 fix). Chosen fix → run 15: train the policy on the Gumbel improved-policy
+target and the value on pure z. Final net + DB backed up to
+`~/chessckers-backups/run14-fullstart-c64b6-20260705/`.
