@@ -22,6 +22,8 @@ scripts to run on it.
   cc play [play args]           # play a human-vs-net game against the latest fleet net
   cc lengths [--window=50]      # average game length over training (survival→mate curve)
   cc fresh-run [--run-name=X] [--arch=v5] [--parallelism=32] [--base=<box-net.pt>]
+               [--c-filters=N] [--n-blocks=N] [--se-ratio=N]
+               [--policy-target=visits|improved] [--value-q-ratio=R]
                               # provision + launch a fresh training run from scratch
 
 cc games — render the network's actual self-play games (newest by default):
@@ -256,6 +258,9 @@ def cmd_fresh_run(args):
     c_filters = ""
     n_blocks = ""
     se_ratio = ""
+    # Training-target knobs: empty = defer to launch_trainer.sh defaults (visits / 0.5).
+    policy_target = ""
+    value_q_ratio = ""
     for a in args:
         if a.startswith("--run-name="):
             run_name = a.split("=", 1)[1]
@@ -271,10 +276,16 @@ def cmd_fresh_run(args):
             n_blocks = a.split("=", 1)[1]
         elif a.startswith("--se-ratio="):
             se_ratio = a.split("=", 1)[1]
+        elif a.startswith("--policy-target="):
+            policy_target = a.split("=", 1)[1]
+        elif a.startswith("--value-q-ratio="):
+            value_q_ratio = a.split("=", 1)[1]
 
     dims = f" c{c_filters}/b{n_blocks}" if (c_filters or n_blocks) else ""
+    tgt = f"  target={policy_target}" if policy_target else ""
+    qr = f"  qratio={value_q_ratio}" if value_q_ratio else ""
     print(
-        f"=== fresh-run: box={host}:{port}  run={run_name}  arch={arch}{dims}  p={parallelism}"
+        f"=== fresh-run: box={host}:{port}  run={run_name}  arch={arch}{dims}{tgt}{qr}  p={parallelism}"
         f"  init={'warm:' + base if base else 'cold'} ==="
     )
 
@@ -354,10 +365,12 @@ def cmd_fresh_run(args):
     # Warm-start: pass BASE so launch_trainer.sh feeds the trainer a seed net
     # (--base) instead of cold random init. Empty = cold (the default).
     base_env = f"BASE={base} " if base else ""
-    # Arch-dim env (only for the ones set) so a scaled net (c64/b6) is built to match --base.
-    arch_env = "".join(
+    # Trainer knob env (only for the ones set): arch dims so a scaled net (c64/b6) is
+    # built to match --base, plus the policy-target / value-q-ratio training knobs.
+    knob_env = "".join(
         f"{k}={v} " for k, v in (
             ("C_FILTERS", c_filters), ("N_BLOCKS", n_blocks), ("SE_RATIO", se_ratio),
+            ("POLICY_TARGET", policy_target), ("VALUE_Q_RATIO", value_q_ratio),
         ) if v
     )
     sh_ok(
@@ -367,7 +380,7 @@ def cmd_fresh_run(args):
         f"'cd {SERVER_DIR} && PATH=/usr/local/go/bin:$PATH RUN_NAME={run_name} scripts/launch_server.sh 2>&1 | tee -a server.log' C-m && "
         f"tmux new-window -t cc -n trainer -c {SERVER_DIR} && sleep 0.5 && "
         f"tmux send-keys -t cc:trainer "
-        f"'cd {SERVER_DIR} && sleep 6 && {base_env}{arch_env}ENGINE_DIR={ENGINE_DIR} SERVER=http://localhost:10100 ARCH_VERSION={arch} scripts/launch_trainer.sh 2>&1 | tee -a trainer.log' C-m"
+        f"'cd {SERVER_DIR} && sleep 6 && {base_env}{knob_env}ENGINE_DIR={ENGINE_DIR} SERVER=http://localhost:10100 ARCH_VERSION={arch} scripts/launch_trainer.sh 2>&1 | tee -a trainer.log' C-m"
     )
 
     # 6. Launch client in tmux 'cc-client'.
@@ -384,7 +397,7 @@ def cmd_fresh_run(args):
     # kills tmux but keeps disk state) self-heals instead of silently dying.
     print("\n--- installing @reboot auto-restart cron ---")
     cron_line = (
-        f"@reboot RUN_NAME={run_name} ARCH_VERSION={arch} {arch_env}PARALLELISM={parallelism} "
+        f"@reboot RUN_NAME={run_name} ARCH_VERSION={arch} {knob_env}PARALLELISM={parallelism} "
         f"{SERVER_DIR}/scripts/restart_fleet.sh --boot >> /workspace/restart_fleet.log 2>&1")
     sh_ok(
         f"chmod +x {SERVER_DIR}/scripts/restart_fleet.sh; "
@@ -467,14 +480,27 @@ def cmd_restart_trainer(args):
 
     Optional positional arg = the Adam LR. It is exported as the LR *env var*
     because launch_trainer.sh reads ${LR}; positional args to that script are
-    ignored, so `cc restart-trainer 0.001` used to be a silent no-op."""
+    ignored, so `cc restart-trainer 0.001` used to be a silent no-op.
+
+    The run's knob env (ARCH_VERSION, C_FILTERS/N_BLOCKS/SE_RATIO, POLICY_TARGET,
+    VALUE_Q_RATIO) is derived from the @reboot cron line fresh-run installed — the
+    persisted source of truth for the live run — so a bare restart can't revert the
+    trainer to launch_trainer.sh defaults (a mismatched net shape SIGTRAPs the
+    warm-resume; a default policy target silently flips the Gumbel A/B arm)."""
     box = resolve()
     _ssh_out(box, f"rm -f {SERVER_DIR}/trainer/run1/STOP")
+    cron = _ssh_out(box, "crontab -l 2>/dev/null | grep restart_fleet.sh | tail -1")
+    keep = ("ARCH_VERSION", "C_FILTERS", "N_BLOCKS", "SE_RATIO",
+            "POLICY_TARGET", "VALUE_Q_RATIO")
+    knob_env = " ".join(
+        t for t in cron.split() if "=" in t and t.split("=", 1)[0] in keep)
+    if "ARCH_VERSION=" not in knob_env:
+        knob_env = f"ARCH_VERSION=v4 {knob_env}".strip()  # pre-cron boxes: old behavior
     lr_env = f"LR={args[0]} " if args else ""
     remote = (
         f"tmux send-keys -t cc:trainer C-c && sleep 0.3 && "
         f"tmux send-keys -t cc:trainer "
-        f"'{lr_env}ENGINE_DIR={ENGINE_DIR} SERVER=http://localhost:10100 ARCH_VERSION=v4 "
+        f"'{lr_env}{knob_env} ENGINE_DIR={ENGINE_DIR} SERVER=http://localhost:10100 "
         f"bash {SERVER_DIR}/scripts/launch_trainer.sh 2>&1 | tee -a {SERVER_DIR}/trainer.log' C-m"
     )
     return subprocess.call(_ssh(box) + [remote])
