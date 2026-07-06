@@ -26,7 +26,7 @@
 | Key branches | `ctl/pre-gumbel-run16` in all three repos: fork @ `45349d9` (wm2 fix tip, pre-Gumbel), engine `5615196` (trainer/analysis rewound to `635c871`; cc/ops/display tooling kept), server `dcbe1df` (bridge + launch_trainer rewound to `0869a18`; restart_fleet/fleet_status kept — its `POLICY_TARGET` env is inert against the pre-Gumbel launch script, verified) |
 | Fleet box | vast `42618148` (RTX 3060) |
 | Started | 2026-07-06 |
-| Status | **active** |
+| Status | **aborted pre-verdict → superseded by [run 17](run17.md)** |
 
 ## Hypothesis
 
@@ -70,5 +70,9 @@ source. Expected readouts:
 
 ## Result
 
-<active — leave empty. Primary read: does the gate freeze + slide recur with zero Gumbel code, and at
-what rate vs runs 14/15 at matched reject counts? Link successor when pivoted.>
+**Aborted 2026-07-06 before any gate match completed** (95 games, 1 net, step 48 — no verdict data;
+nothing worth backing up beyond the already-backed-up seed). Superseded by [run 17](run17.md) (user
+pivot: cold init + gate removed, attacking the two suspected root causes directly). The question this
+control was built for — does the freeze/slide recur under (warm seed, gate, visits, q=0) with zero
+Gumbel code — **remains open** and is fully reproducible: branches `ctl/pre-gumbel-run16` (all three
+repos) + the launch command in the Log above.
