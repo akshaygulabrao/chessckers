@@ -80,6 +80,21 @@ monotone reject wall (−300ish) while trainer metrics look healthy — recogniz
   GPU ~73%, 13 chunks in the first ~10 min; `@reboot` cron carries
   `POLICY_TARGET=improved VALUE_Q_RATIO=0`.
 
+- `07-06` **Gate stall diagnosed + threshold soak.** Best froze at #5 (21:46) — #6–#9 rejected at
+  −108/−53/−70/−89 (shallow, non-monotonic; cf. run 14 at the same point: −108/−158/−147/−108→−241).
+  Forensics: candidate-as-Black flat (9→13→12→12), vsign ~0.87, |root_q| median 0.86→0.68 (seed
+  optimism decaying under pure z), improved-target argmax agreement with visits RISING 46%→63% —
+  the improvement operator works; the blocker is the gate fixed point (the postmortem's un-pulled
+  remedy). NOT the run-14 slide. Note: root_q-vs-z sign agreement 74%→41% is the outcome
+  distribution shifting Black-ward (White wins 67%→25% in sampled cohorts) under a lagging,
+  still-White-optimistic value head — calibration lag, not a new sign bug (wm2 q0≈q1 100%).
+  **Intervention (00:52 UTC):** box-side `serverconfig.json matches.threshold` −20 → **−100** +
+  state-preserving server restart (soak; local config stays −20 so future runs revert). Revert to
+  −20 once promotions flow and cumElo rises (or two consecutive candidates score ≥ −20). Tripwire
+  by design: a real slide (< −100) still freezes the gate. First post-soak decision: #10 at −127
+  (below the soak bar → still reject; next matches decide stall-vs-slide). `cc status`/`cc strength`
+  now display the run identity (this session's display patch).
+
 ## Result
 
 <active — leave empty. Primary read: does the gate keep promoting past the ~#4 freeze point, and does

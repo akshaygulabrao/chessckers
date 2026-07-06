@@ -105,9 +105,22 @@ def main() -> int:
     shown = rows[start:]
     promoted = sum(1 for r in rows if r["passed"])
 
+    # Fetch run identity for display in the header
+    _run_label = ""
+    try:
+        _rcon = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+        _run_row = _rcon.execute(
+            "SELECT id, description FROM training_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        _rcon.close()
+        if _run_row:
+            _run_label = f" — run #{_run_row[0]} \"{_run_row[1]}\""
+    except Exception:  # noqa: BLE001
+        pass
+
     scope = "ALL runs" if args.all else (f"current run (since net #{run_start})"
                                          if run_start is not None else "all matches")
-    print(f"\n  in-fleet gate [{scope}]: {len(rows)} matches, {promoted} promoted "
+    print(f"\n  in-fleet gate{_run_label} [{scope}]: {len(rows)} matches, {promoted} promoted "
           f"(showing last {len(shown)}) — each net vs the then-current best")
     print(f"  {'cand':>5} {'vs best':>8}  {'W-L-D':>9}  {'Elo':>5}   verdict  {'cumElo':>7}")
     print("  " + "─" * 50)
