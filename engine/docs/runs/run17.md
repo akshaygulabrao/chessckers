@@ -23,7 +23,7 @@
 | Rules | v6 bottom-*d* charge |
 | Replay buffer | unchanged (window ramp 400→4000 @α0.75, RF=8) — buffer redesign (mixed sampling / outcome cap / target averaging / RF cut) **deliberately deferred** so the two changes stay readable |
 | Key branches | same `ctl/pre-gumbel-run16` control trees (fork `45349d9`, engine `5615196`+docs, server `dcbe1df` + this gate-config commit) |
-| Fleet box | vast `42618148` (RTX 3060) |
+| Fleet box | vast `44017141` (RTX 3060, KR) — box 2; the original launch box `42618148` went away same-day pre-games |
 | Started | 2026-07-06 |
 | Status | **active** |
 
@@ -57,6 +57,23 @@ no transplanted value head, does the classic AZ loop bootstrap on the full start
   --run-name=V5_fullstart_c64b6_cold_nogate --arch=v5 --c-filters=64 --n-blocks=6 --se-ratio=8
   --value-q-ratio=0` (no `--base` ⇒ cold). Known benign: a cold deterministic init can trip the
   upload SHA-dedup 400 once ("Network already exists") — non-fatal.
+- `07-06` **Box replaced → relaunched on vast `44017141`** (original box `42618148` gone before any
+  games). Same `cc fresh-run` command, same trees. Two durable fixes landed in
+  `lczero-server/scripts/provision_server_vast.sh` while re-provisioning: (1) engine rsync now
+  `--exclude 'weights/'` (1.0 GB of Mac-side A/B nets was silently shipped every provision); (2) the
+  engine venv is no longer `uv sync` — the lock resolves PyPI torch cu13x wheels (CPU-only on this
+  12.8-driver host) and uv's download also wedged outright on this box; the venv is now
+  `--system-site-packages` over the template's `/venv/main` torch (2.11.0+cu128, cuda=True verified)
+  + pip for the four small pure-python deps. Run-13 seed also shipped to
+  `/workspace/run13_seed/weights.pt` so the `cc anchor` seed13 anchor resolves.
+- `07-06` **LIVE + verified** (11:31 box time): server/bridge/trainer UP; DB run #1
+  `V5_fullstart_c64b6_cold_nogate`; box gate thr **−9999** confirmed; trainer argv `--arch-version v5
+  --c-filters 64 --n-blocks 6 --se-ratio 8 --value-q-ratio 0.0` with **no `--base`** (cold); 0
+  `improved_policy` hits in box fork src + engine trainer; cold net #1 uploaded + bootstrap-promoted
+  (no dedup 400 — fresh DB); client engines up with CUDA trunk. First chunk verified: raw ccz1 JSON
+  has **0 `improved_policy`**, start FEN = official full start `{wm:2}`, value targets pure ±1 z, and
+  wm2 same-mover sign intact (ply0 q=−0.028 = ply1 q=−0.028, flip at ply2) — cold-net q ≈ 0 as
+  expected. First game: Black win in 23 plies.
 
 ## Result
 
