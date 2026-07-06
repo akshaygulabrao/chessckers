@@ -94,8 +94,54 @@ monotone reject wall (−300ish) while trainer metrics look healthy — recogniz
   by design: a real slide (< −100) still freezes the gate. First post-soak decision: #10 at −127
   (below the soak bar → still reject; next matches decide stall-vs-slide). `cc status`/`cc strength`
   now display the run identity (this session's display patch).
+- `07-06` **Slide confirmed — soak inert.** Six post-soak rejects, every decision logging `thr=-100`:
+  −147/−191/−215/−127/−269/−301. Zero promotions; best still #5. The color split is the tell:
+  candidate-as-White flat at baseline (2–5/20 all run) while **candidate-as-Black collapsed**
+  (12–13/20 → 4 → 2). Trainer metrics healthy throughout (policy 2.1–2.3, vsign 0.87) — again.
+- `07-06` **Search-bug audit** (user hypothesis: "it consistently loses ⇒ search bug"). Three-way test:
+  (1) **Local dose-response, #16 vs #5**: **−98 Elo at visits=1** (pure policy — the weights themselves
+  degraded; run-14's equivalent was −203) → −215 at visits=128 (search *amplifies*; reproduces the
+  fleet's −301 within noise). (2) **Code audit**: `improved_policy` exonerated on mechanics — legal
+  moves/visits/improved all fill from one `node->Edges()` loop, parallel-array encode → positional
+  decode → identical slot-fill as visits; POV-correct at every Black ply (wm2 flip can't fire there);
+  no ply-0 double-flip; chains serialized with waypoints, no dedup on the fleet path. (3) **Chunk
+  asymmetry**: no Black-target anomaly — Black plies agree with visits MORE than White (64% vs 58%
+  late), chain plies best of all (76%), 0% of plies park improved mass on unvisited moves. Verdict:
+  not a sign/alignment bug.
+- `07-06` **Root cause: `c_scale=1` over-sharpens the improved target at fleet visits.**
+  σ = (c_visit + maxN)·c_scale·minmax(Q̂) ≈ **850** at 800 visits ⇒ the target is a one-hot on
+  argmax-completedQ whether sibling-Q spread is signal or noise (min-max amplifies any spread to full
+  range; the prior only tie-breaks). While the generator's value discriminated (nets 2–5) the one-hot
+  pointed at real improvements → +44/+53. Once #5 froze at its own equilibrium, its Q-spread became
+  noise → targets = confidently-crowned noise → students distill BELOW the teacher (−98 @v1, falling),
+  and their pure-z value (learned from 75%-Black outcomes) diverges from #5's, misleading their own
+  search at gate time (−98 → −301). The port notes pre-flagged exactly this ("improved target
+  near-one-hot at fleet visits; c_scale is the softening knob"); the mctx reference value is **0.1**.
+- `07-06` **HALTED** (user decision, 04:54 UTC) at 17 nets / 1,679 games / step 874 (~9.3h runtime).
+  Fleet stopped, `@reboot` cron removed, box state preserved; DB + final trainer net + best #5 `.bin`
+  backed up to `~/chessckers-backups/run15-gumbelS1-20260706/`. Box `serverconfig.json` still carries
+  the −100 soak (moot while halted; the next `cc fresh-run` re-rsyncs the local −20 config).
 
 ## Result
 
-<active — leave empty. Primary read: does the gate keep promoting past the ~#4 freeze point, and does
-candidate-as-Black win% vs the early best trend up? Link successor run when pivoted.>
+**Halted 2026-07-06 — the Gumbel Stage-1 target works while the generator's value discriminates, but
+`c_scale=1` turns it into a noise-crowning one-hot once the generator freezes.** What worked: the first
+net-positive promotions ever recorded on the full start (+44/+53; run 14 peaked at +17), wm2 fix held
+(q0≈q1 100% across every sample), pure-z visibly un-blinded the value head (|q| 0.86 → 0.68), and the
+emission/decode mechanics survived a full adversarial audit. What failed: the gate froze at #5 (a strong
+local optimum), and with a frozen generator the over-sharp improved target (σ≈850 ⇒ one-hot on
+argmax-completedQ, min-max noise amplification) degraded students below their teacher — −98 Elo at
+visits=1, amplified to ~−300 by their own diverged value heads at 128 visits, with the collapse
+concentrated on the Black side. Distinct from run 14's mechanism (q-ratio value poison + pinned-blind
+teacher): run 15's failure is target *sharpness* × generator *freeze*.
+
+**Run-16 requirements banked from this diagnosis:**
+1. **`c_scale = 0.1`** (mctx reference) from the start — soft targets fall back toward the prior exactly
+   when sibling-Q spread is noise; consider plumbing it as an option rather than a constant.
+2. **Freeze protection** — the gate fixed point is the recurring disease (runs 14, 15): either an
+   auto-promote/play-latest soak mode, or a freeze alarm (N consecutive rejects) with a scripted response.
+3. **Opening diversity** (randomized opening plies / small FEN book) so outcomes stay mixed and the value
+   head keeps move-level signal as one side approaches dominance — single-start pure-z starves otherwise.
+4. Keep: improved policy target + pure-z value (both validated here), wm2 fix, c64/b6 arch.
+
+Backups: `~/chessckers-backups/run15-gumbelS1-20260706/` (DB, final trainer net, best #5 `.bin`).
