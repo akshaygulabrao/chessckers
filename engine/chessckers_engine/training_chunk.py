@@ -55,7 +55,6 @@ def encode_chunk(examples: list[AZExample]) -> bytes:
                 "fen": e.fen,
                 "legal_moves": e.legal_moves,
                 "visit_distribution": e.visit_distribution,
-                "improved_policy": e.improved_policy,
                 "wdl_target": e.wdl_target,
                 "search_wdl": e.search_wdl,
                 "moves_left_target": e.moves_left_target,
@@ -89,7 +88,6 @@ def decode_chunk(data: bytes) -> list[AZExample]:
                 wdl_target=x["wdl_target"],
                 moves_left_target=x["moves_left_target"],
                 search_wdl=x.get("search_wdl"),  # optional: absent in pre-Lever-3 / scalar-only chunks
-                improved_policy=x.get("improved_policy"),  # optional: absent in pre-Gumbel chunks → use visits
             )
             for x in payload["examples"]
         ]
