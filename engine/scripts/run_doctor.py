@@ -9,10 +9,12 @@ trend over the whole run.
   cc doctor                         # full report
   cc doctor --csv run_metrics.csv   # also append one metrics row (use in a loop = sampler)
   cc doctor --block 2000            # trend bucket size
+  cc doctor --rate-window 60        # minutes to average steps/s + games/s over
 """
 import argparse, glob, json, os, re, subprocess, time
 
 SERVER = "/workspace/chessckers/lczero-server"
+LEDGER = "/workspace/chessckers/engine/docs/runs"  # synced repo ledger — human run numbers
 PROCS = {"cc-server": "server", "trainer_bridge": "bridge", "train_continuous": "trainer",
          "selfplay": "selfplay", "lc0-client": "client"}
 
@@ -25,6 +27,51 @@ def latest_run(root):
     runs = sorted(glob.glob(os.path.join(root, "trainer", "run*")),
                   key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0))
     return os.path.basename(runs[-1]) if runs else "run1"
+
+
+def run_label(root):
+    """Human run identity. The on-disk dir is always run1 (lc0 TrainingRun id, resets
+    with the DB every fresh run) — the real identity is the ledger number (newest
+    docs/runs/runN.md) + the RUN_NAME the server was bootstrapped with (DB description)."""
+    name = None
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{root}/chessckers.db?mode=ro", uri=True, timeout=2)
+        row = con.execute("select description from training_runs order by id desc limit 1").fetchone()
+        con.close()
+        name = row[0] if row else None
+    except Exception:
+        pass
+    nums = [int(m.group(1)) for p in glob.glob(f"{LEDGER}/run[0-9]*.md")
+            if (m := re.match(r"run(\d+)\.md$", os.path.basename(p)))]
+    return " — ".join(x for x in [f"run{max(nums)}" if nums else None, name] if x)
+
+
+def window_rates(metrics_f, minutes):
+    """steps/s + games/s averaged over the last `minutes` of train_metrics.jsonl.
+    The train_stats.json heartbeat is a 60s point-sample: games arrive in chunk
+    bursts minutes apart and the replay throttle stalls steps between them, so
+    the instantaneous rates read 0.0 nearly always. Returns (sps, gps, span_min)."""
+    try:
+        with open(metrics_f) as f:
+            lines = f.readlines()[-720:]
+    except OSError:
+        return None
+    cut = time.time() - minutes * 60
+    rows = []
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        if r.get("updated", 0) >= cut:
+            rows.append(r)
+    if len(rows) < 2 or rows[-1]["updated"] <= rows[0]["updated"]:
+        return None
+    dt = rows[-1]["updated"] - rows[0]["updated"]
+    return (max(0, rows[-1]["steps"] - rows[0]["steps"]) / dt,
+            max(0, rows[-1]["games_seen"] - rows[0]["games_seen"]) / dt,
+            dt / 60)
 
 
 def proc_state():
@@ -55,22 +102,29 @@ def main():
     ap.add_argument("--run", default=None)
     ap.add_argument("--block", type=int, default=2000)
     ap.add_argument("--csv", default=None, help="append one metrics row here (sampler mode)")
+    ap.add_argument("--rate-window", type=int, default=30,
+                    help="minutes to average steps/s + games/s over (train_metrics.jsonl)")
     a = ap.parse_args()
     run = a.run or latest_run(a.root)
     pgn_dir = f"{a.root}/pgns/{run}"
     stats_f = f"{a.root}/trainer/{run}/train_stats.json"
+    label = run_label(a.root)
 
     up = proc_state()
     st = json.load(open(stats_f)) if os.path.exists(stats_f) else {}
+    rates = window_rates(f"{a.root}/trainer/{run}/train_metrics.jsonl", a.rate_window)
     age = newest_age_min(pgn_dir)
     rows = trend(pgn_dir, a.block)
 
-    print(f"== run {run} ==")
+    print(f"== {label}  (dir {run}) ==" if label else f"== run {run} ==")
     print("procs:   " + "  ".join(f"{lbl}{'✓' if up[lbl] else '✗'}" for lbl in PROCS.values()))
     if st:
         stale = time.time() - st.get("updated", 0)
-        print(f"trainer: step {st.get('steps')}  {st.get('steps_per_s')}/s  "
-              f"{st.get('games_per_s')} games/s  lr={st.get('lr')}  "
+        if rates:
+            rate_s = f"{rates[0]:.2f} steps/s  {rates[1]*3600:.1f} games/h [{rates[2]:.0f}m avg]"
+        else:
+            rate_s = f"{st.get('steps_per_s')}/s  {st.get('games_per_s')} games/s"
+        print(f"trainer: step {st.get('steps')}  {rate_s}  lr={st.get('lr')}  "
               f"vsign={st.get('value_sign_agree')} ptop1={st.get('policy_top1_agree')}  "
               f"(stats {stale/60:.0f}m old)")
     print(f"games:   {int(sum(r[1] for r in rows))} scored  |  newest "
@@ -87,8 +141,9 @@ def main():
         with open(a.csv, "a") as f:
             if new:
                 f.write("ts,step,games_seen,games_per_s,lr,vsign,ptop1,W,B,draw\n")
+            gps = round(rates[1], 4) if rates else st.get('games_per_s', '')
             f.write(f"{int(time.time())},{st.get('steps','')},{st.get('games_seen','')},"
-                    f"{st.get('games_per_s','')},{st.get('lr','')},{st.get('value_sign_agree','')},"
+                    f"{gps},{st.get('lr','')},{st.get('value_sign_agree','')},"
                     f"{st.get('policy_top1_agree','')},{last[2]},{last[3]},{last[4]}\n")
         print(f"(appended metrics row to {a.csv})")
 
