@@ -75,7 +75,38 @@ no transplanted value head, does the classic AZ loop bootstrap on the full start
   wm2 same-mover sign intact (ply0 q=−0.028 = ply1 q=−0.028, flip at ply2) — cold-net q ≈ 0 as
   expected. First game: Black win in 23 plies.
 
+- `07-08` **Driver bug found + FIXED (fork `ee64b19`): selfplay `blacks_move` per-ply toggle desyncs
+  at the {wm:2} double-move.** From ply 1, every move of a TWO-player game is chosen by the *other*
+  player's engine (`idx = blacks_move ? 1 : 0` routes to the opponent's tree/net/params), so every
+  full-start match result — this run's whole promote-always series, and the run-10/14/15 gates — was
+  engine-attribution-**inverted**. This run's cumElo −829 ⇒ true ≈ **+829**: the run is climbing, in
+  agreement with the python anchor trajectory (+191 → +301 → +436 vs random-init at nets ~16/~33/~59;
+  crossed search:3 between nets 16–33). Forensics that localized it: same-net v800-vs-v1 "lost" 96/100
+  (= the 800-visit side actually WON 96/100 once unswapped), net59-vs-net1 "+2−397" (= net59 really
+  ≈ +880 over cold init), eval parity python↔CUDA exact on W/B/midgame positions, null self-match
+  exactly 200-200, match colors 20/20, upload sign-chain clean. Training selfplay (single net both
+  slots) is unaffected — data/targets were always fine. Run-14's dose-response and "gate honest"
+  exoneration are void (same buggy driver locally); the recurring "gate freeze" = the gate rejecting
+  candidates *because they were winning*. Fix: recompute `blacks_move` from the position each Play
+  iteration (toggle deleted). **Deploy pending:** box 44017141 went host-offline (vast
+  `actual_status: offline`) right at deploy time — @reboot autorestart is armed on it; when it
+  returns: stop client → rsync fork → `ninja akshay-chessckers-0` → relaunch → verification battery
+  (same-net v800-vs-v1 ⇒ expect ~95% P1; net59-vs-net1 ⇒ strongly positive; null ⇒ 50/50). Post-fix,
+  `cc strength` rows are honest going forward (pre-fix rows read negated); the −20 gate is safe to
+  restore.
+
 ## Result
 
-<active — leave empty. Primary read: cumElo trend of the promote-always series over ≥15–20 nets +
-game-quality probes. Link successor when pivoted.>
+**Answered its question — and exposed the real disease.** (1) The classic AZ loop DOES bootstrap
+cold on the full start: python-anchor trajectory +191 → +301 → +436 vs random-init at nets ~16/33/59
+(~5.9k games), crossing the depth-3 search bot between nets 16–33; policy prior alone beats the cold
+init ~90% (visits=1, unswapped). No dip, no collapse, no value blindness — trainer-side healthy on
+Adam 1e-3, pure z, visits target. (2) The promote-always measurement series read **cumElo −829**, and
+forensics on that contradiction found the `blacks_move` driver bug (see 07-08 Log entry): every
+full-start two-player result was engine-attribution-inverted — true chain ≈ **+829**. The run-14/15
+"gate freeze disease" and dose-response postmortems are voided by the same bug (the gate was
+rejecting candidates because they were winning). (3) Failure-read watchlist from the Hypothesis
+never triggered in reality — "sustained cumElo decline" was the instrument, not the run.
+
+**Continued as [run 18](run18.md)** — same training state, warm, one change: fork `ee64b19` fixes
+the driver so matches are honest. Pre-fix match rows for this run (nets #2–~64) read NEGATED.
