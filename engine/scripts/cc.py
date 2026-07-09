@@ -13,6 +13,7 @@ scripts to run on it.
   cc plot [args]                # plot the run metrics time-series
   cc ladder [args]              # round-robin champion nets -> terminal Elo + score matrix
   cc gauntlet [args]            # current net vs ALL previous snapshots -> strength + regression curve
+  cc anchor [args]              # current net vs FIXED anchors (random/search bot/seed13) -> absolute strength trajectory
   cc strength [args]           # strength TABLE from the in-fleet gate matches (fast; no games played)
   cc games [opts] [watch args]  # pull a RECORDED fleet self-play game + render it
   cc verify-chunks [opts]       # scan recent chunks for oracle-illegal moves (fork-vs-PyVariant parity)
@@ -592,6 +593,8 @@ def main():
         return _run_on_box("ladder.py", args)
     elif cmd == "gauntlet":
         return _run_on_box("gauntlet.py", args)
+    elif cmd == "anchor":
+        return _run_on_box("anchor_gauntlet.py", args)
     elif cmd == "strength":
         # Read the in-fleet GATE's match results (fast read-only DB query, NO games
         # played). The gate already plays each net vs best with the fast C++ engine.

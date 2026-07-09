@@ -27,6 +27,7 @@ Then, from **any directory**:
 | `cc plot` | terminal sparklines of the run's curves | box |
 | `cc ladder [opts]` | **round-robin champion nets → terminal Elo + score matrix** | box |
 | `cc gauntlet [opts]` | **current net vs ALL previous snapshots** → strength + regression curve | box |
+| `cc anchor [opts]` | **current net vs FIXED anchors** (random init / alpha-beta bot / run-13 seed) → absolute strength trajectory | box |
 | `cc games [opts]` | **pull a RECORDED self-play game off the box + render its real moves** | box→local |
 | `cc watch [opts]` | pull the latest fleet net + watch it self-play live | box→local |
 | `cc restart-trainer [LR]` | **hardened clean warm-restart** (snapshot-guarded; optionally change LR) | box |
@@ -173,6 +174,25 @@ cc gauntlet --all                      # vs EVERY snapshot (hours)
 (Slow: pure-Python PyVariant MCTS is CPU-bound and shares the box with the live
 fleet — background a big run, or keep `--sims`/`--games`/`--n` modest.)
 
+**Current vs fixed anchors** — `cc anchor` is the absolute-scale complement: ladder
+and gauntlet compare against the run's own MOVING snapshots (chained Elo accumulates
+noise ≈ ±55·√N over N matches, so a 20-net cumElo curve can't distinguish real +100
+from a random walk). `cc anchor` plays the current net vs anchors that NEVER change
+— `random` (seed-0 init of the current arch), `search:D` (net-free alpha-beta bot),
+`seed13` (the run-13 warm-start seed, cross-run comparable), or any `.pt` — and
+appends a JSONL row per invocation (`<run-dir>/anchor_gauntlet.jsonl`), building the
+run's strength trajectory. Games are diversified by opening temperature (both
+gauntlet and anchor default `--temperature 1.0 --temp-plies 20`; without it, repeat
+games from the fixed start are identical and the verdict is vacuous). Keep
+`--games`/`--sims` fixed across invocations so rows are comparable; the printed 95%
+CI is the real precision (20 games ≈ ±150 Elo).
+
+```
+cc anchor                              # current vs random + search:3 + seed13
+cc anchor --games 40                   # tighter error bars
+cc anchor --current trainer/run1/iter-async-000123.pt   # measure any snapshot
+```
+
 ## 4. Playing the net
 
 Play a human-vs-net game from any FEN — you pick from a numbered legal-move menu
@@ -202,6 +222,7 @@ undoes your last move and `q` quits. To watch the net play ITSELF instead, use
 | `backrank_check_trend.py` | box | back-rank-check learning trend |
 | `ladder.py` | box | round-robin / vs-best Elo + score matrix over sampled nets |
 | `gauntlet.py` | box | **current net vs all previous snapshots** — strength + regression curve |
+| `anchor_gauntlet.py` | box | **current net vs fixed anchors** — absolute strength trajectory (JSONL history) |
 | `play_net.py` | local | **human-vs-net** play from any FEN (numbered move menu) |
 | `../lczero-server/scripts/new_run.sh` | box | guarded fresh-run setup (sets start FEN) |
 

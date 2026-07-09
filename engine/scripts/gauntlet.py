@@ -16,6 +16,13 @@ turns out stronger than current.
   cc gauntlet a.pt b.pt                 # current vs explicit nets
 options: --run-dir DIR  --current PATH  --n N  --all  --games G  --sims S
          --c-puct 1.5  --max-plies 160  --start-fen FEN  --device auto|cuda|mps|cpu  --seed 0
+         --temperature 1.0  --temp-plies 20
+
+Games are diversified by sampling moves from the visit distribution at
+--temperature for the first --temp-plies plies (then argmax) — without it, every
+"game" between the same two nets from the fixed start is the SAME deterministic
+game, and the verdict is vacuous (the run-14 postmortem's gauntlet bug).
+--temperature 0 restores the old deterministic behavior.
 
 SLOW: pure-Python PyVariant MCTS is CPU-bound (~tens of evals/s) and shares the box
 with the live fleet, so even modest runs take many minutes — background it, or cut
@@ -84,16 +91,19 @@ def pick_opponents(run_dir, n, use_all, explicit, current_path):
     return paths
 
 
-def play_game(white_model, black_model, client, pick, sims, cpuct, max_plies, start_fen) -> tuple[str, bool]:
+def play_game(white_model, black_model, client, pick, sims, cpuct, max_plies, start_fen,
+              temperature=0.0, temp_plies=0) -> tuple[str, bool]:
     """One game from start_fen; returns ('white'|'black'|'draw', truncated), where
     truncated=True means it hit the ply cap with no win condition (so the 'draw' is
-    a timeout, not a real draw)."""
+    a timeout, not a real draw). For the first temp_plies plies moves are SAMPLED
+    from visits at `temperature` (game diversity); after that, argmax."""
     from chessckers_engine.selfplay_az import _outcome_from_state
     state = client.new_game(fen=start_fen)
     ply = 0
     while not state.get("status") and ply < max_plies:
         model = white_model if state["turn"] == "white" else black_model
-        chosen = pick(state, client, model, n_sims=sims, c_puct=cpuct)
+        temp = temperature if ply < temp_plies else 0.0
+        chosen = pick(state, client, model, n_sims=sims, c_puct=cpuct, temperature=temp)
         if chosen is None:
             break
         state = client.make_move(state["fen"], chosen["uci"])
@@ -147,6 +157,10 @@ def main() -> int:
     ap.add_argument("--c-puct", type=float, default=1.5)
     ap.add_argument("--max-plies", type=int, default=160, help="ply cap; games past it score as draws (weak old nets rarely finish)")
     ap.add_argument("--start-fen", default=DEFAULT_START_FEN, help="start FEN (default: the training start)")
+    ap.add_argument("--temperature", type=float, default=1.0,
+                    help="visit-sampling temperature for the opening plies (0 = deterministic argmax, the old vacuous behavior)")
+    ap.add_argument("--temp-plies", type=int, default=20,
+                    help="plies of temperature before argmax kicks in (fleet matches use tempdecay 10 moves = 20 plies)")
     ap.add_argument("--device", default="auto", help="auto|cuda|mps|cpu")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-curve", action="store_true", help="omit the strength sparkline; show only the table")
@@ -171,7 +185,8 @@ def main() -> int:
 
     cur_label = _label(current)
     print(f"gauntlet: current '{cur_label}' vs {len(opps)} snapshots on {dev} | "
-          f"{args.games} games/opp | {args.sims} sims\n  current: {current}", flush=True)
+          f"{args.games} games/opp | {args.sims} sims | temp {args.temperature} for {args.temp_plies} plies"
+          f"\n  current: {current}", flush=True)
 
     cur_model = load_scorer(current).to(dev).eval()
     client = PyVariantClient()
@@ -187,7 +202,8 @@ def main() -> int:
             cur_white = gi % 2 == 0
             wm, bm = (cur_model, opp_model) if cur_white else (opp_model, cur_model)
             out, trunc = play_game(wm, bm, client, pick_puct, args.sims, args.c_puct,
-                                   args.max_plies, args.start_fen)
+                                   args.max_plies, args.start_fen,
+                                   temperature=args.temperature, temp_plies=args.temp_plies)
             n_trunc += trunc
             if out == "draw":
                 d += 1
