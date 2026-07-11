@@ -133,6 +133,7 @@ Key invariant: for every Black square, `stacks[sq]`'s top piece matches the bitb
 - **Self-play: 800 visits/move** (`trainParams --visits=800`), with Dirichlet exploration `--noise-epsilon=0.25 --noise-alpha=0.3 --temperature=1.0 --tempdecay-moves=15`. (A deferred idea to drop to 100 for throughput lives in `engine/docs/runs/deferred-low-visits.md`; never run.)
 - **Gate match: 128 visits/move** (`matchParams --visits=128`), `calcElo > −20` promotion threshold (`serverconfig.json matches.threshold`).
 - **Gate size = 40 games, not 8.** `serverconfig.json matches.games` is `8`, but `createMatch` in `main.go` does `gameCap *= 5` for `targetSlice == 0` (all small-fleet matches run at slice 0), so the effective candidate-vs-best match is **8 × 5 = 40 games**.
+- **League self-play** (landed 2026-07-11, committed `league.enabled=true` → auto-on when run 19 provisions): `serverconfig.json league` block — a per-game fraction of training games plays current-best vs a log-spaced pool of past champions (anti rock-paper-scissors; sampling happens inside the engine's selfplay tournament). Design/ops/deploy-order warning in `engine/docs/runs/league-selfplay.md`; opponent attribution in `training_games.opponent_network_id`.
 
 Current run's net arch / start FEN / optimizer live in the per-run ledger under `engine/docs/runs/` (e.g. run 11 = v5 SE-ResNet c64/b6 ~630K params, Adam 1e-3, full official start, training on run 10's kept replay buffer) — read the newest `runN.md`, not memory, for what's live.
 
