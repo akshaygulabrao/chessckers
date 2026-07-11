@@ -69,6 +69,13 @@ scale; try fraction 0.1 or revisit pool spacing before abandoning.
   seed13 survived the wipe at `/workspace/run13_seed/`; cold net #1 published, client
   playing on CUDA. League correctly dormant (pool empty) until the 2nd promotion —
   first league games should show in `cc status` (`league:` line) within ~1-2h.
+- `07-11` **Anchor gauntlet automated on the box** (run 18 had no in-run rows because
+  invocation was manual): 8-hourly cron `15 */8 * * *` runs
+  `.venv/bin/python scripts/anchor_gauntlet.py` (flock-guarded; defaults 20g/100 sims =
+  comparable with the run-18 endpoint row) → appends to `trainer/run1/anchor_gauntlet.jsonl`,
+  log `/workspace/anchor_cron.log`. Mac-independent; survives fresh-run's cron rewrite
+  (that only filters `restart_fleet.sh` lines). t≈0 baseline row kicked immediately via
+  the exact cron command (validates the cron env too).
 
 ## Result
 
