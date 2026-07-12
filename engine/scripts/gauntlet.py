@@ -54,6 +54,7 @@ _SERVER_DIR = next(
 )
 _DEFAULT_RUN_DIR = os.path.join(_SERVER_DIR, "trainer", "run1")
 sys.path.insert(0, _HERE)  # so `import watch_game` resolves regardless of cwd
+import _run_ident  # noqa: E402  (RUN_NAME for the header)
 from watch_game import DEFAULT_START_FEN  # noqa: E402  (the training start FEN, read from the fork)
 
 
@@ -184,7 +185,8 @@ def main() -> int:
     opps = pick_opponents(args.run_dir, args.n, args.all, args.nets, current)
 
     cur_label = _label(current)
-    print(f"gauntlet: current '{cur_label}' vs {len(opps)} snapshots on {dev} | "
+    rn = _run_ident.run_name()
+    print(f"gauntlet{f' [{rn}]' if rn else ''}: current '{cur_label}' vs {len(opps)} snapshots on {dev} | "
           f"{args.games} games/opp | {args.sims} sims | temp {args.temperature} for {args.temp_plies} plies"
           f"\n  current: {current}", flush=True)
 

@@ -35,6 +35,7 @@ _SERVER_DIR = next(
 )
 _DEFAULT_RUN_DIR = os.path.join(_SERVER_DIR, "trainer", "run1")
 sys.path.insert(0, _HERE)  # so `import watch_game` resolves regardless of cwd
+import _run_ident  # noqa: E402  (RUN_NAME for the header)
 from watch_game import DEFAULT_START_FEN  # noqa: E402  (the training start; reads the fork's board.cc)
 
 
@@ -196,7 +197,8 @@ def main() -> int:
 
     nets = discover_nets(args.run_dir, args.n, args.nets)
     labels = [lbl for lbl, _ in nets]
-    print(f"ladder: {len(nets)} nets on {dev} | {args.games} games/pair | {args.sims} sims | "
+    rn = _run_ident.run_name()
+    print(f"ladder{f' [{rn}]' if rn else ''}: {len(nets)} nets on {dev} | {args.games} games/pair | {args.sims} sims | "
           f"{'vs-best' if args.vs_best else 'round-robin'}\n  nets: {', '.join(labels)}")
     models = [load_scorer(p).to(dev).eval() for _, p in nets]
     client = PyVariantClient()

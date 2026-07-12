@@ -9,7 +9,7 @@
 
 | Field | Value |
 |---|---|
-| `RUN_NAME` (DB) | `V5_fullstart_c64b6_league` (training-run id 1, dir `run1`) |
+| `RUN_NAME` (DB) | `run19_V5_fullstart_c64b6_league` (training-run id 1, dir `run1`; renamed from `V5_fullstart_c64b6_league` on 07-11) |
 | Start FEN | official full start (`STARTING_FEN`, `{wm:2}`) |
 | Arch | SE-ResNet gather head, c64/b6 ~630K, tag `v5` (= run 18) |
 | Optimizer | Adam, lr=1e-3 (= run 18) |
@@ -76,6 +76,11 @@ scale; try fraction 0.1 or revisit pool spacing before abandoning.
   log `/workspace/anchor_cron.log`. Mac-independent; survives fresh-run's cron rewrite
   (that only filters `restart_fleet.sh` lines). t≈0 baseline row kicked immediately via
   the exact cron command (validates the cron env too).
+- `07-11` Run renamed in DB+cron to carry the ledger handle
+  (`run19_V5_fullstart_c64b6_league`); cc commands now lead with RUN_NAME
+  (strength/status reordered, gauntlet/ladder/anchor gained identity headers, anchor
+  JSONL rows gain a `"run"` field); `runNN_` prefix adopted as the naming convention
+  (documented in scripts/README.md).
 
 ## Result
 

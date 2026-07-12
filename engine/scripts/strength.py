@@ -114,7 +114,7 @@ def main() -> int:
         ).fetchone()
         _rcon.close()
         if _run_row:
-            _run_label = f" — run #{_run_row[0]} \"{_run_row[1]}\""
+            _run_label = f" — {_run_row[1]} (db run {_run_row[0]})"
     except Exception:  # noqa: BLE001
         pass
 

@@ -76,6 +76,11 @@ cc fresh-run                          # defaults: V5_e8d8, v5 arch, 32 paralleli
 cc fresh-run --run-name=V5_exp2 --arch=v5 --parallelism=64
 ```
 
+**RUN_NAME convention:** start it with the ledger handle (`runNN_`), e.g.
+`run19_V5_fullstart_c64b6_league`. The DB training-run id is always 1 (every
+fresh run wipes the DB) and means nothing across runs — the RUN_NAME is the
+identity every cc command displays.
+
 **Manual steps** (what `cc fresh-run` automates):
 
 ```bash

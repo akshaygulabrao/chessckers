@@ -60,6 +60,7 @@ _SERVER_DIR = next(
 )
 _DEFAULT_RUN_DIR = os.path.join(_SERVER_DIR, "trainer", "run1")
 sys.path.insert(0, _HERE)  # so `import watch_game` resolves regardless of cwd
+import _run_ident  # noqa: E402  (RUN_NAME for the header + JSONL rows)
 from watch_game import DEFAULT_START_FEN  # noqa: E402  (the training start FEN, read from the fork)
 
 # Well-known homes of the run-13 warm-start seed (box, Mac backup).
@@ -368,7 +369,8 @@ def main() -> int:
     cur_label = _label(current)
     anchors = resolve_anchors(args.anchors, current, dev, args)
 
-    print(f"anchor gauntlet: '{cur_label}' vs {len(anchors)} fixed anchors on {dev} | "
+    rn = _run_ident.run_name()
+    print(f"anchor gauntlet{f' [{rn}]' if rn else ''}: '{cur_label}' vs {len(anchors)} fixed anchors on {dev} | "
           f"{args.games} games/anchor | {args.sims} sims | temp {args.temperature} for {args.temp_plies} plies"
           f"\n  net: {current}", flush=True)
 
@@ -416,6 +418,7 @@ def main() -> int:
     if out_path:
         row = {
             "ts": int(time.time()),
+            "run": rn,
             "current": cur_label,
             "current_path": os.path.abspath(current),
             "games": args.games, "sims": args.sims,
