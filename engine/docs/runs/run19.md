@@ -22,7 +22,7 @@
 | Key trees | fork `4332013` (= run 18's `ee64b19` + league sampling); server `56a368e` (league pool + attribution + −20 gate); client `93e0951` (league plumbing) |
 | Fleet box | vast `44287736` (RTX 3060 datacenter — same box as run 18) |
 | Started | 2026-07-11 |
-| Status | active |
+| Status | **concluded 2026-07-14** (archived; superseded by run 20) |
 
 ## Hypothesis
 
@@ -136,9 +136,48 @@ scale; try fraction 0.1 or revisit pool spacing before abandoning.
   `champ_ladder.py` (DB promotion history → gunzip networks/<sha> → ladder), `ladder.py`
   now takes raw .bin nets in --engine mode, `cc champs` dispatches it.
 
-- `07-13` **Monitoring stack deployed mid-run.** Anchor budget reallocated (8-hourly cron confirmed real, no change needed). Plateau alarm added to anchor cron (writes `/workspace/chessckers/ALERTS.log`; NTFY_TOPIC opt-in on the box for push notifications). `cc doctor` slope diagnostic extended. Daily champs audit cron (`install_monitor_crons.sh`) deployed to the box via `cc ssh bash …` — appends `champs_audit.jsonl` nightly at 04:45 (12g/pair). Off-box `cc backup` added: pulls anchor_gauntlet.jsonl, champs_audit.jsonl, chessckers.db, ALERTS.log, last-2000-lines of server/trainer logs to `telemetry/run19_V5_fullstart_c64b6_league/`; auto-triggered in the background after `cc status`/`cc doctor` when >6h stale. `cc compare` adds cross-run sparkline + seed13 alignment table. Run 19's gate deliberately untouched — the monitoring is read-only this run. Gate regression panel (comparing gate Elo series vs anchor Elo for run 18 vs run 19) lands with run 20.
+- `07-13` **Monitoring stack deployed mid-run** (scripts synced; all read-only for run 19 —
+  the gate untouched). Anchor cron gains: budget reallocation off saturated anchors
+  (score ≥0.9 ×3 rows → 6 tripwire games, surplus → the discriminative anchor: random 6,
+  seed13 34), auto-pin of a new anchor rung at full saturation, and a **plateau alarm**
+  (3 rows/≥16h/<+40 Elo → `/workspace/chessckers/ALERTS.log`, `NTFY_TOPIC` opt-in push)
+  with a gate stall-floor screen appended for context. `cc doctor` gains the strength-trend
+  section (Elo±CI, slope/24h, PLATEAU/STALL-FLOOR flags). `cc backup` pulls jsonl/db/logs
+  to Mac `telemetry/<run>/` (auto-throttled after status/doctor); `cc compare` overlays
+  runs (sparklines + seed13 alignment). Verified live: plateau fires (−20 Elo/16h), gate
+  screen fires (13/15, mean +31), best_net 116. The daily champs-audit cron
+  (`install_monitor_crons.sh`, 04:45 → `champs_audit.jsonl`) was prepared but **not
+  installed** (box-crontab edit needs the operator; runs via `./run.sh`). Gate regression
+  panel (candidate must also not regress vs log-spaced past champions) implemented in
+  lczero-server — lands with run 20's provision, not deployed to run 19.
+- `07-14` **Floor guard added to the plateau detector before run-20 provision:** a cold
+  net scores 0.0 vs seed13 for the first day → three floored rows (Δ=0 over ≥16h) would
+  false-fire the alarm; `plateau_check` now returns unmeasurable (no alarm) when all
+  window rows have score ≤ 0.05. Backtested on run 19's real jsonl: floored prefix →
+  None, live plateau → still fires. (First finding of the plateau-detection workstream;
+  detector tuning continues offline against this run's archived series.)
+- `07-14` **Run concluded, fleet clean-stopped, full state archived** to
+  `~/chessckers-backups/run19-fullstart-c64b6-league-20260714/` (db + 115-row matches CSV
+  + networks/ 282M + games/ 362M + trainer/run1 2.0G + server/trainer/anchor-cron logs +
+  crontab + serverconfig). Trees pinned for the handoff: engine `558cc44` (monitoring) +
+  `0062d33` (docs), server `46b3831` (regression panel). LR was deliberately **never
+  dropped** — the intact plateau is the ground-truth fixture for detector development.
 
 ## Result
 
-<active — leave empty. Primary read: anchor trajectory + gate series vs run 18's backed-up
-control curves; league mix visible in `cc status` (`league:` line) once the pool exists.>
+**League: works as designed; no RPS. Run: real early progress, then a genuine plateau —
+concluded in it, by choice.** Endpoint 116 nets / 11,610 games / 115 gate matches
+(92 promoted), best #116 (promoted on a 19-21 losing record — the stall floor in one
+line); league mix verified at 21% of training games. Anchors: seed13 from −800 (floor)
+to ≈ −130±20 by net ~90, then FLAT ~36h; search:3 ~+250-300; random saturated. The
+anti-RPS bet passed its falsifiable reads: anchor climb at least as fast as run 18
+(seed13 −168 by net #73 vs run 18's −89 at endpoint #122), and **no cycle signature**
+in either the checkpoint ladder or the champion audit. What the run exposed instead:
+the **gate promotes noise during a plateau** (last ~17 promotions span 81 Elo
+head-to-head with best nominally LAST and rejects interleaved; ~+700 gate Elo claimed
+vs ≈0 measured) — motivating run 20's regression panel — and the value head stayed
+healthy throughout (800v beats 128v +241; best beats iter-200 71-29), so the plateau
+is optimization- or data-side, not capacity collapse. Plateau cause **deliberately left
+undiagnosed** (no LR drop): the archived series is the detector-development testbed.
+Handoff to run 20: regression panel (server `46b3831`), monitoring/alarm stack + floor
+guard (engine `558cc44`+), pre-committed decision rules in `_TEMPLATE.md`.
