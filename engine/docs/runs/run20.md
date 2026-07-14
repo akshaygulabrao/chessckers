@@ -56,6 +56,13 @@ freeze (many consecutive panel rejections while anchors still climb) → panel t
   `~/chessckers-backups/run19-fullstart-c64b6-league-20260714/`; fleet clean-stopped.
 - `07-14` `cc fresh-run --run-name=run20_V5_fullstart_c64b6_panel --arch=v5
   --c-filters=64 --n-blocks=6 --se-ratio=8 --value-q-ratio=0 --parallelism=32` (cold).
+- `07-14` **PFSP league weighting landed in-tree** (engine/client/server; design in
+  `league-selfplay.md`): pool sampling weighted by live per-opponent win rate,
+  `f_hard=(1−wr)²` + 20% uniform floor, probs cached per (best, pool). **OFF for run
+  20** — the box serverconfig predates `league.pfsp`; auto-on at next provision. New
+  `training_games.result`/`learner_is_black` columns start populating whenever the
+  new client deploys (deploy engine BEFORE client — old engines fatal on
+  `--league-probs`).
 - `07-14` **LIVE + verified** (07:39 box time): server/bridge/trainer/client UP, header
   `run20_V5_fullstart_c64b6_panel | gate thr -20`; box serverconfig carries
   `panel {enabled, 2, 4, -50}`; net #1 bootstrap-promoted via the legacy path (correct —

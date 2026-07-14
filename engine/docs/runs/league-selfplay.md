@@ -53,11 +53,41 @@ thousands of clients and degenerates on ours; left untouched/off.)
 - **Trainer**: untouched. League chunks are byte-identical ccz1; the bridge feeds by
   sequence number, lineage-agnostic.
 
+## PFSP opponent weighting (landed 2026-07-14)
+
+Uniform pool sampling spends most league games on opponents the learner already
+crushes. PFSP (prioritized fictitious self-play, the AlphaStar league weighting)
+reweights per-opponent sampling by live win rate: **f_hard(wr) = (1−wr)²** on a
+Laplace-smoothed (toward 0.5) win rate, mixed with a **20% uniform floor** so every
+opponent keeps getting measured. An opponent that starts *beating* the champion — the
+RPS signature — is sampled hardest until the hole closes; a fresh pool entrant (no
+data) samples like a 50% opponent.
+
+Data path: the client now forwards the gameready `result`/`player1` tokens at
+`upload_game` → new `training_games` columns `result` (0 unknown / 1 whitewon /
+2 blackwon / 3 draw) + `learner_is_black` (gorm AutoMigrate adds them on server
+restart). `leaguePfspProbs()` in `main.go` aggregates the last **48h** of
+result-bearing league games (all learners in the window, not just the current best —
+they're the last few champions, the right prior for a freshly promoted net) and emits
+`leagueProbs` in `/next_game`, aligned with `leaguePool`. The client passes
+`--league-probs=…`; the engine (new selfplay option, validated against the pool size,
+normalized internally) replaces the uniform draw with an inverse-CDF sample.
+
+**Stability:** probs are **cached per (best network, pool)** and recomputed only when
+that key changes — i.e. at promotion, when the client restarts the engine anyway. Zero
+extra engine restarts; `/next_game` stays byte-stable between promotions. Each
+recompute logs `[league] pfsp probs (best id=N): <sha> n=… pts=… p=…` — the
+verification line.
+
 ## Config (`lczero-server/serverconfig.json`)
 
 ```json
-"league": { "enabled": true, "fraction": 0.2, "poolSize": 8 }
+"league": { "enabled": true, "fraction": 0.2, "poolSize": 8, "pfsp": true }
 ```
+
+`pfsp` is committed `true` (like `enabled` was): **run 20's box config predates the
+key → PFSP is off there**; it auto-enables at the next provision. Don't rsync
+serverconfig onto the run-20 box unless you mean to turn it on mid-run.
 
 Enabled from t=0 of a fresh run is safe: the pool is empty until the 2nd promotion, so games
 are pure self-play and league phases in by itself. To toggle mid-run: edit the on-box
@@ -69,9 +99,11 @@ champions are reconstructed from passed matches only.
 ## ⚠ Deploy order
 
 **Never run a new client against an old engine binary** — the client passes
-`--league-weights`, an old engine prints "Unknown command line flag", and the client's
-stdout scanner `log.Fatal`s. Deploy engine before (or with) client. Old-client/new-server
-and new-client/old-server are both safe (unknown JSON fields ignored / fields absent).
+`--league-weights` (and, when the server sends probs, `--league-probs`), an old engine
+prints "Unknown command line flag", and the client's stdout scanner `log.Fatal`s.
+Deploy engine before (or with) client. Old-client/new-server and new-client/old-server
+are both safe (unknown JSON fields ignored / fields absent; old servers also ignore the
+new `result`/`player1` upload fields).
 Also: two-net league games require the `ee64b19` blacks_move fix (already on the run-18
 lineage) — without it, `{wm:2}` double-moves route plies to the wrong net's search.
 
@@ -102,12 +134,11 @@ Notes: ccz1 chunks carry no top-level `outcome` key (result is baked into per-ex
 
 ## Follow-ons (deliberately not built)
 
-- **PFSP** — weight pool sampling by live per-opponent win-rate instead of uniform
-  (the `opponent_network_id` column + game results provide the data).
+- ~~**PFSP**~~ — landed 2026-07-14, see section above.
 - **Learner-only plies** — filter league-game records to the learner's side (declined for
   v1; a ~2-line conditional at the `game.cc` record-append site if ever wanted).
-- **Regression-panel gate** — candidate must not regress vs a frozen panel (the scoreboard
-  side of the RPS fix; `main.go` TODO comment).
+- ~~**Regression-panel gate**~~ — landed as run 20's gate regression panel (server
+  `46b3831`; binding, 2 log-spaced legs × 20g, thr −50).
 - Backend-dedup quirk (pre-existing): `ChesskersBackend` never sets its configuration hash,
   so `IsSameConfiguration` dedup never fires and every player/pool slot loads its own net
   copy. Harmless at current net sizes; fix in the fork if VRAM ever pinches.
