@@ -35,6 +35,16 @@ Append-only, dated. One bullet per notable event (launch, revert, measurement, p
 
 - `MM-DD` ...
 
+## Decision rules (pre-committed)
+
+Pre-decide triggers so mid-run judgment calls don't drift. Fill before launch; amend only with a dated Log entry.
+
+- **LR drop** — trigger: discriminative anchor (`seed13`) gains < +40 Elo over 3 consecutive anchor rows (~24h) with ingest healthy (trainer step-rate normal, buffer not starved). Confirm headroom via a deep-vs-shallow visits match (800v vs 128v, ≥ 40g; real search-scaling ⇒ headroom exists). If confirmed: `cc restart-trainer <LR × 0.3>`.
+- **Plateau definition** — `seed13` flat ± noise (95% CI overlaps zero gain) for ≥ 3 rows AND `cc champs` round-robin spans < 100 Elo across the same stretch. Both instruments must agree; either alone is insufficient.
+- **RPS check cadence** — daily `cc champs` audit (via `install_monitor_crons.sh`). A>B>C>A cycles beyond 1σ multiple-comparison noise over ≥ 3 consecutive audits = RPS signature → investigate league fraction or pool spacing.
+- **Anchor rotation** — pin a new rung (e.g. the current best at saturation) when `seed13` saturates and loses discriminative power. Note the new anchor in the Log with the row index where it was added.
+- **Abandon / pivot** — anchor trajectory clearly slower than the paired control run for ≥ 48h with plateau confirmed → write a Result entry and open a new run doc.
+
 ## Result
 
 <Final outcome once the run ends: did it converge? best net path? why pivoted/reverted?

@@ -81,6 +81,62 @@ scale; try fraction 0.1 or revisit pool spacing before abandoning.
   (strength/status reordered, gauntlet/ladder/anchor gained identity headers, anchor
   JSONL rows gain a `"run"` field); `runNN_` prefix adopted as the naming convention
   (documented in scripts/README.md).
+- `07-12` First fork-played `cc ladder` (7 nets, 4 games/pair, 128v temp 1.0): range 815,
+  surface read "iter-200 net beats best" — **refuted as noise**. 24 games/net ⇒ ±140 Elo
+  95% CI (a 3-1 pair is p=0.31 between equal nets); only the >300-Elo gap to nets 1/67/133
+  is meaningful, and the matrix has no A>B>C>A cycles (no RPS signature). The anchor cron
+  settles it: net #43 ≈ iter 198 landed 07-12 16:24 at search:3 **−89** / seed13 **−636**;
+  by net #73 (iter ~336) the rows read search:3 **+241** / seed13 **−168** — still climbing
+  steeply through the exact stretch the ladder scored as decline. Pace vs controls: run 17
+  net ~59 read seed13 −338, run 18 needed net #122 for −89; run 19 is at −168 by net #73.
+  League verified live (`league:` 39/202 last hour ≈19%; DB: 20% of training_games across
+  the champion pool). **Gate-Elo calibration:** `cc strength` cum (+2106) is inflated by
+  construction — 40-game matches give σ≈55 Elo, so at thr −20 a *stalled* trainer still
+  promotes ~64% of candidates at E[calcElo|promoted]≈+32 (last 25 matches: 80%, mean +43 —
+  barely above the stall floor). De-inflated ~÷2.7 it matches the ladder's net1→best
+  ~750-800. Read anchors for truth, gate cum as bookkeeping; ladder ordering claims need
+  `--games ≥ 12`.
+- `07-13` **Deeper-search discriminator — "does best lose to its own deeper search?" YES:**
+  pinned best snapshot (≈ iter 340 / net ~#74) vs itself, 800v vs 128v, 40 games via the
+  fork's own selfplay mode (`--player1.visits=800 --player2.visits=128 --no-share-trees`,
+  matchParams temps, colors alternating): deep side **32-8-0 (80%, +241 Elo, LOS 99.99%)**
+  — as White 19-1, as Black 13-7, 0 draws. ≈ **+91 Elo per visit-doubling**, healthy
+  AZ search scaling ⇒ the value head does real search-amplifiable work; rules out both
+  "policy-only memorization" and run-17-style "search anti-uses value" for the current
+  stack, and corroborates the anchor-verified progress. Ops residue: first attempt over
+  UCI (ladder gained `path@VISITS` per-net visits) died ~35×/40 mid-game at 800v — fine
+  at 128v (yesterday's 84-game ladder was clean), isolated 800-node searches pass, cause
+  unknown; `engine_uci.py` now saves engine stderr to `/tmp/uci-<net>.<visits>v.err`
+  (was DEVNULL) so the next crash names itself. **Selfplay mode is the robust
+  asymmetric-visits match harness; treat ladder-over-UCI ≥800v as flaky until diagnosed.**
+- `07-13` **Head-to-head closes the "iter-200 beats best" question: best wins 71-29**
+  (100 games @128v both sides, fork selfplay mode, matchParams temps, alternating colors;
+  **+156 Elo, LOS 100%**; W 39-11, B 32-18, 0 draws). The 07-12 ladder's 3-1 for net 200
+  (+71 Elo) was a 4-game artifact — a ~227-Elo swing under proper sampling, right in line
+  with the ±140/net CI math. All three instruments now agree run 19's progress is real
+  and correctly ordered: anchors climb through the whole 200→best stretch; best@800 beats
+  best@128 32-8; best beats iter-200 71-29. **No RPS signature anywhere.** What survives
+  of the 07-12 worry: gate cum-Elo is inflated (÷~2.7) and nets must never be ordered on
+  ≤4-game pairs.
+- `07-13` **Gate audit via `cc champs` (new tool): the gate's OWN champions, head-to-head.**
+  Unlike `cc ladder` (trainer iter-checkpoints), this ladders the server's promoted .bin
+  nets: field = best(#112) + log-spaced past champs {c93,c102,c106,c110,c111} + the 3
+  newest rejects {r94,r107,r108}; fork @128v matchParams temps, 12g/pair, 432 games, 0
+  crashes. **The last ~17 promotions (#93→#112) are FLAT: the whole field spans 81 Elo**
+  (1σ ≈ ±36/net at 96 games) — best finishes nominally LAST (45%, −32), c102 nominally
+  first (+49, a 1.8σ gap), and the rejects sit in the same band (46-48%). Gate verdicts in
+  this stretch are coin-flips promoting at the σ≈55 stall floor: ~+700 cum Elo claimed
+  over the span, ≈0 measured. The anchor cron independently agrees: seed13 flat at
+  −147±40 for the last 4 rows (~24h) after the 07-12 climb; search:3 noisy-flat ~+250
+  (python-MCTS anchors + fork ladder concur → no run-17-style harness split). This
+  REFINES, not contradicts, the entries above: early-run progress (iter-200→best 71-29,
+  800v>128v) is real — the plateau is the newest stretch only. Single-pair reversals
+  (c111 10-2 over best) are within 36-pairing multiple-comparison noise; re-match at
+  40-100g in fork-selfplay mode before reading them as gate contradictions. Tooling:
+  `champ_ladder.py` (DB promotion history → gunzip networks/<sha> → ladder), `ladder.py`
+  now takes raw .bin nets in --engine mode, `cc champs` dispatches it.
+
+- `07-13` **Monitoring stack deployed mid-run.** Anchor budget reallocated (8-hourly cron confirmed real, no change needed). Plateau alarm added to anchor cron (writes `/workspace/chessckers/ALERTS.log`; NTFY_TOPIC opt-in on the box for push notifications). `cc doctor` slope diagnostic extended. Daily champs audit cron (`install_monitor_crons.sh`) deployed to the box via `cc ssh bash …` — appends `champs_audit.jsonl` nightly at 04:45 (12g/pair). Off-box `cc backup` added: pulls anchor_gauntlet.jsonl, champs_audit.jsonl, chessckers.db, ALERTS.log, last-2000-lines of server/trainer logs to `telemetry/run19_V5_fullstart_c64b6_league/`; auto-triggered in the background after `cc status`/`cc doctor` when >6h stale. `cc compare` adds cross-run sparkline + seed13 alignment table. Run 19's gate deliberately untouched — the monitoring is read-only this run. Gate regression panel (comparing gate Elo series vs anchor Elo for run 18 vs run 19) lands with run 20.
 
 ## Result
 

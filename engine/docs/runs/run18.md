@@ -17,7 +17,7 @@
 | Optimizer | Adam, lr=1e-3 (unchanged — exonerated by run 17) |
 | Policy / value targets | `visits` / pure z (`VALUE_Q_RATIO=0`) — unchanged |
 | **Init** | **COLD random init** — originally planned as a warm continuation of run 17, but the KR box (44017141) flapped offline twice post-deploy and was destroyed before a state backup landed; run-17's DB/nets/buffer/anchor-JSONL died with it (its measured numbers survive in run17.md). Net effect: run 18 is the CLEAN experiment — run 17's exact config, fixed driver, from game 0. |
-| **Gate** | **promote-always** (threshold −9999, set post-provision); matches = pure measurement series — **honest from the very first gate row** (no negated era in this DB) |
+| **Gate** | promote-always (−9999) for matches 1–25 → **−20 lenient regression gate restored 07-09** (active from match #26). Matches stayed **honest from the very first gate row** (no negated era in this DB); the promote-always series' 13/15-recent-candidates-clear-−20 rate is what justified re-enabling the gate (see 07-09 Log). |
 | Rules | v6 bottom-*d* charge |
 | Replay buffer | unchanged (window ramp 400→4000 @α0.75, RF=8) |
 | Key trees | fork **`ee64b19`** (= run-17's `45349d9` + `blacks_move` fix); engine `5615196`+docs; server `dcbe1df` — otherwise identical to run 17 |
@@ -88,6 +88,32 @@ With attribution honest, the measurement layer should finally agree with the tra
   "harness split" is dead, C++ now agrees with the python anchors; (3) same-net null **51.6%**
   (+206 −193 =1, Elo +11, W-by-color ~77% both slots — symmetry preserved). Instrument certified;
   `cc strength` rows are trustworthy from cand ≥ #90.
+
+- `07-09 19:04 UTC` **Gate restored: promote-always (−9999) → −20 lenient regression gate.** With the
+  `blacks_move` driver fixed, the run-14/15 "gate freeze death spiral" is understood to have been the
+  attribution artifact, so real gating is safe again. Checked against run 18's OWN promote-always
+  series before flipping: of the last 15 recorded 40-game candidate-vs-best matches, **13 clear −20**
+  (would promote), only 2 dip below (−34.9 @match16, −52.5 @match20) — no consecutive-reject spiral,
+  generator still discriminating (recent +168 / +117 / +107). Change: box
+  `serverconfig.json matches.threshold` −9999 → −20 (backup `serverconfig.json.bak-gate-restore`),
+  then restarted **only** `cc:server` (Ctrl-C + re-exec the existing binary in its pane — no rebuild;
+  config is read once at startup per `config.go:37`; trainer pane + client untouched, replay buffer
+  preserved). Verified: `cc status` reads `gate thr -20`, server UP + serving `:10100`, games flowing
+  (latest 23s ago), single clean `cc-server` proc. **Boundary:** matches 1–25 (all promoted under
+  −9999) are the honest measurement that justified this; the in-flight match #26 (cand vs best #26) is
+  the first −20-gated decision. Promotion test = `calcElo > −20` (`main.go:768`); 40-game matches
+  (games 8 ×5 at slice 0). Rollback: restore the backup + restart `cc:server`.
+
+- `07-11` **Concluded + frozen** at 124 nets / 12,449 games / 123 matches (best #122; last
+  gate row #124: 18-22-0 → −35 **REJECT** — the restored −20 gate demonstrably filtering).
+  **Endpoint anchors** (net #122, 20g/anchor @100 sims, first anchor rows of the run):
+  random **20-0-0 (+800)**, search:3 **18-2-0 (+512)**, seed13 **5-5-10 (38%, −89
+  [−241, +64])** — vs run 17's net-~59 seed13 read of −338; 7/60 games hit the 160-ply cap
+  (scored draw). Full state backed up to
+  `~/chessckers-backups/run18-fullstart-c64b6-fixed-20260711/` (db, matches_final.csv,
+  networks, pgns, trainer/run1, server/trainer/client logs, anchor_gauntlet.jsonl, both
+  serverconfigs). Fleet wiped → **run 19** (league self-play, same box) launched; see
+  [run19.md](run19.md).
 
 ## Result
 
