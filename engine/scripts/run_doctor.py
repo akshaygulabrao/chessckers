@@ -3,15 +3,16 @@
 
 Runs ON the box (via `cc doctor`). Consolidates everything I used to poke for by
 hand: process liveness, trainer step/rate/lr + agreement signals, game count +
-TRUE newest-game age (mtime, not the lexicographic-buggy field), and the W/B/draw
-trend over the whole run.
+TRUE newest-game age (mtime, not the lexicographic-buggy field), the W/B/draw
+trend over the whole run, and the anchor-gauntlet strength trend (last Elo ± CI,
+Elo/24h slope, saturation/PLATEAU flags, ALERTS.log tail, gate stall screen).
 
   cc doctor                         # full report
   cc doctor --csv run_metrics.csv   # also append one metrics row (use in a loop = sampler)
   cc doctor --block 2000            # trend bucket size
   cc doctor --rate-window 60        # minutes to average steps/s + games/s over
 """
-import argparse, glob, json, os, re, subprocess, time
+import argparse, glob, json, os, re, subprocess, sys, time
 
 SERVER = "/workspace/chessckers/lczero-server"
 LEDGER = "/workspace/chessckers/engine/docs/runs"  # synced repo ledger — human run numbers
@@ -96,6 +97,54 @@ def trend(pgn_dir, block):
     return sorted(rows, key=lambda r: r[0])
 
 
+def strength_trend(root, run):
+    """Anchor-gauntlet strength trend: per anchor the last Elo ± CI, the Elo/24h
+    slope over its last 3 rows, saturation + PLATEAU flags (rules imported from
+    anchor_gauntlet.py so this report can never drift from the alarm), then the
+    ALERTS.log tail and the gate stall-floor screen. Read-only, fully non-fatal."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import anchor_gauntlet as ag
+        rows = ag.load_history(f"{root}/trainer/{run}/anchor_gauntlet.jsonl")
+        if not rows:
+            print("anchors: no anchor data")
+        else:
+            newest = rows[-1]
+            names = [a.get("anchor") for a in newest.get("anchors", []) if a.get("anchor")]
+            sat = ag.saturated_anchors(rows, names)
+            bn = newest.get("best_net")
+            print(f"anchors: {len(rows)} rows, newest {(time.time() - newest.get('ts', 0))/3600:.1f}h ago"
+                  f"  current={newest.get('current')}"
+                  + (f"  best_net=#{bn}" if bn is not None else ""))
+            for name in names:
+                series = ag.anchor_series(rows, name)
+                last = series[-1]
+                ci = (last.get("elo_hi", 0) - last.get("elo_lo", 0)) / 2
+                s3 = series[-3:]
+                slope = ((s3[-1].get("elo", 0) - s3[0].get("elo", 0))
+                         / (s3[-1]["ts"] - s3[0]["ts"]) * 86400
+                         if len(s3) >= 2 and s3[-1]["ts"] > s3[0]["ts"] else None)
+                pc = ag.plateau_check(rows, name)
+                # a saturated anchor is flat because it's CAPPED, not stalled — no PLATEAU
+                flags = ("  saturated" if name in sat
+                         else "  \033[33mPLATEAU\033[0m" if pc and pc[0] else "")
+                print(f"   {name:>10}  elo {last.get('elo', 0):>+7.1f} ±{ci:<4.0f} "
+                      f"slope {f'{slope:+.0f}/24h' if slope is not None else 'n/a':>9}{flags}")
+        alerts = os.path.abspath(os.path.join(root, "..", "ALERTS.log"))
+        if os.path.exists(alerts):
+            tail = open(alerts).readlines()[-5:]
+            print(f"alerts ({alerts}, last {len(tail)}):")
+            for ln in tail:
+                print(f"   {ln.rstrip()}")
+        screen = ag.gate_stall_screen(f"{root}/chessckers.db")
+        if screen is None:
+            print("gate screen: n/a (<10 done matches or no db)")
+        else:
+            print(f"gate screen: {'STALL-FLOOR' if screen[0] else 'ok'} ({screen[1]})")
+    except Exception as e:
+        print(f"anchors: no anchor data ({e})")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=SERVER)
@@ -134,6 +183,7 @@ def main():
         print("trend (block start | n | W% B% draw%):")
         for r in rows[::max(1, len(rows) // 14)] + ([rows[-1]] if len(rows) > 1 else []):
             print(f"   #{int(r[0]):>7}  n={int(r[1]):<5} W{r[2]:5.1f}  B{r[3]:5.1f}  d{r[4]:5.1f}")
+    strength_trend(a.root, run)
 
     if a.csv:
         new = not os.path.exists(a.csv)

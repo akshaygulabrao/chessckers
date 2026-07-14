@@ -21,13 +21,24 @@ Run it every ~10 published nets with the SAME --games/--sims/--temperature, and
 the appended JSONL history (--out, on by default) becomes the run's strength
 trajectory. Each row records the operating point so mixed histories are auditable.
 
+The history WATCHES ITSELF (the 8-hourly cron must fire alarms, not grow a file
+nobody reads): each row records the fleet's best net number (best_net, from the
+server DB); an anchor scoring ≥0.9 in the last 3 rows is SATURATED → it drops to
+a --saturated-games tripwire budget and its saved games reallocate onto the last
+unsaturated anchor, the discriminative rung (--no-realloc disables); when the
+last rung itself saturates, the CURRENT net is pinned as a new anchor
+'pin:net<N>' (state: anchor_pins.json next to the jsonl) for future invocations;
+and a plateau on the discriminative anchor (<+40 Elo across 3 rows spanning
+≥16h) appends an alert to <server>/../ALERTS.log — with a gate stall-floor
+screen for context — and pushes via ntfy.sh when NTFY_TOPIC is set.
+
   cc anchor                                    # current vs random + search:3 + seed13
   cc anchor --games 40                         # tighter error bars
   cc anchor --current trainer/run1/iter-async-000123.pt   # any snapshot
 options: --run-dir DIR  --current PATH  --anchors LIST  --games G  --sims S
          --temperature 1.0  --temp-plies 20  --search-time 1.0  --c-puct 1.5
          --max-plies 160  --start-fen FEN  --device auto|cuda|mps|cpu  --seed 0
-         --out FILE ('' to disable)
+         --out FILE ('' to disable)  --saturated-games 6  --no-realloc
 
 Games are diversified by visit-sampling at --temperature for the first
 --temp-plies plies (both nets; the search bot is deterministic, so diversity
@@ -44,6 +55,9 @@ import json
 import math
 import os
 import re
+import shutil
+import sqlite3
+import subprocess
 import sys
 import time
 
@@ -98,6 +112,232 @@ def _wilson(score: float, n: int, z: float = 1.96) -> tuple[float, float]:
     center = (score + z * z / (2 * n)) / denom
     half = z * math.sqrt(score * (1.0 - score) / n + z * z / (4.0 * n * n)) / denom
     return max(0.0, center - half), min(1.0, center + half)
+
+
+# ----------------------------------------------------------------------------- monitoring
+#
+# The jsonl history watches itself: saturation → tripwire budgets + pin rotation,
+# plateau on the discriminative anchor → ALERTS.log. Pure/testable helpers, shared
+# with run_doctor's strength-trend section so the report can never drift from the
+# alarm. EVERY path here is non-fatal — monitoring must never break the measurement.
+
+SATURATION_SCORE = 0.9    # score ≥ this in each of the last SATURATION_ROWS rows → saturated
+SATURATION_ROWS = 3
+PLATEAU_MIN_ROWS = 3      # plateau alarm: the anchor's last N rows ...
+PLATEAU_MIN_HOURS = 16.0  # ... spanning at least this many hours ...
+PLATEAU_MIN_GAIN = 40.0   # ... gained less than this much Elo → fire
+FLOOR_SCORE = 0.05        # score ≤ this in ALL those rows → anchor FLOORED (net too weak
+                          # to measure against it yet — e.g. seed13 on a cold run's day 1);
+                          # a floored anchor is unmeasurable, not plateaued: no alarm
+_DB_PATH = os.path.join(_SERVER_DIR, "chessckers.db")
+# <server>/../ALERTS.log = /workspace/chessckers/ALERTS.log on the box; works on the Mac too.
+_ALERTS_PATH = os.path.abspath(os.path.join(_SERVER_DIR, "..", "ALERTS.log"))
+
+
+def load_history(path: str) -> list[dict]:
+    """Parse the appended JSONL history (oldest→newest). Non-fatal: a missing file
+    or corrupt lines just mean fewer rows."""
+    rows: list[dict] = []
+    try:
+        with open(path) as f:
+            for ln in f:
+                try:
+                    rows.append(json.loads(ln))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return rows
+
+
+def anchor_series(rows: list[dict], name: str) -> list[dict]:
+    """This anchor's per-row entries (oldest→newest), each with the row's 'ts' attached."""
+    out = []
+    for row in rows:
+        for a in row.get("anchors", []):
+            if a.get("anchor") == name:
+                out.append({**a, "ts": row.get("ts", 0)})
+                break
+    return out
+
+
+def saturated_anchors(rows: list[dict], names: list[str]) -> set[str]:
+    """Anchors that scored ≥ SATURATION_SCORE in ALL of the file's last SATURATION_ROWS
+    rows. An anchor missing from any of those rows (e.g. a fresh pin) is NOT saturated;
+    with fewer than SATURATION_ROWS rows nothing is."""
+    last = rows[-SATURATION_ROWS:]
+    if len(last) < SATURATION_ROWS:
+        return set()
+    sat = set()
+    for name in names:
+        scores = [a.get("score") for row in last for a in row.get("anchors", [])
+                  if a.get("anchor") == name]
+        if len(scores) == SATURATION_ROWS and all(s is not None and s >= SATURATION_SCORE
+                                                  for s in scores):
+            sat.add(name)
+    return sat
+
+
+def plan_budgets(names: list[str], saturated: set[str], games: int,
+                 saturated_games: int) -> tuple[dict[str, int], list[str]]:
+    """Per-anchor game budgets: each saturated anchor drops to the tripwire budget and
+    the saved games move onto the LAST unsaturated anchor (the discriminative rung), so
+    the total stays ≈ the same while the CI shrinks where the signal is. Returns
+    (budgets, log lines)."""
+    budgets = {n: games for n in names}
+    log: list[str] = []
+    tripwire = max(0, min(saturated_games, games))
+    saved = 0
+    for n in names:
+        if n in saturated:
+            budgets[n] = tripwire
+            saved += games - tripwire
+    if not saved:
+        return budgets, log
+    unsat = [n for n in names if n not in saturated]
+    if unsat:
+        budgets[unsat[-1]] += saved
+        log.append(f"budget: {', '.join(n for n in names if n in saturated)} saturated "
+                   f"(score ≥ {SATURATION_SCORE} in last {SATURATION_ROWS} rows) → "
+                   f"{tripwire} tripwire games each; +{saved} games reallocated → "
+                   f"{unsat[-1]} ({budgets[unsat[-1]]} games)")
+    else:
+        log.append(f"budget: ALL anchors saturated → {tripwire} tripwire games each "
+                   f"({saved} games saved; no unsaturated anchor to reallocate onto)")
+    return budgets, log
+
+
+def plateau_check(rows: list[dict], name: str) -> tuple[bool, float, float] | None:
+    """The plateau condition on `name`'s Elo series: over the anchor's last
+    PLATEAU_MIN_ROWS rows, returns (fired, delta_elo, span_hours) — fired when the
+    span is ≥ PLATEAU_MIN_HOURS and the Elo gain is < PLATEAU_MIN_GAIN. None when
+    the anchor has fewer than PLATEAU_MIN_ROWS rows."""
+    series = anchor_series(rows, name)[-PLATEAU_MIN_ROWS:]
+    if len(series) < PLATEAU_MIN_ROWS:
+        return None
+    if all(float(s.get("score", 0.0)) <= FLOOR_SCORE for s in series):
+        return None  # floored: the net can't score against this anchor yet — unmeasurable
+    hours = (series[-1]["ts"] - series[0]["ts"]) / 3600.0
+    delta = float(series[-1].get("elo", 0.0)) - float(series[0].get("elo", 0.0))
+    return (hours >= PLATEAU_MIN_HOURS and delta < PLATEAU_MIN_GAIN), delta, hours
+
+
+def best_net_number(db: str = "") -> int | None:
+    """networks.network_number of training_runs.best_network_id (newest run) — the
+    fleet-visible number of the crowned champion. None on ANY failure (no db, empty
+    stub, no best yet)."""
+    try:
+        con = sqlite3.connect(f"file:{db or _DB_PATH}?mode=ro", uri=True, timeout=2)
+        row = con.execute(
+            "SELECT n.network_number FROM training_runs t "
+            "JOIN networks n ON n.id = t.best_network_id "
+            "ORDER BY t.id DESC LIMIT 1").fetchone()
+        con.close()
+        return int(row[0]) if row and row[0] is not None else None
+    except Exception:  # noqa: BLE001 — identity is decoration, never fatal
+        return None
+
+
+def gate_stall_screen(db: str = "", last: int = 15, need: int = 10) -> tuple[bool, str] | None:
+    """Screen the last `last` done gate matches for the stall-floor signature: the
+    lenient gate still promoting at a healthy-looking rate but each promotion tiny —
+    the cum-Elo ratchet idling, not climbing (see the gate-elo-inflation math).
+    Returns (stalled, 'pass N/M, mean +X') or None (<`need` matches / no db)."""
+    try:
+        con = sqlite3.connect(f"file:{db or _DB_PATH}?mode=ro", uri=True, timeout=2)
+        rows = con.execute(
+            "SELECT wins, losses, draws, passed FROM matches "
+            "WHERE done = 1 AND test_only = 0 AND deleted_at IS NULL "
+            "ORDER BY id DESC LIMIT ?", (last,)).fetchall()
+        con.close()
+    except Exception:  # noqa: BLE001
+        return None
+    if len(rows) < need:
+        return None
+    npass = sum(1 for r in rows if r[3])
+    rate = npass / len(rows)
+    elos = [_elo((w + 0.5 * d) / (w + l + d)) for w, l, d, p in rows if p and (w + l + d)]
+    mean = sum(elos) / len(elos) if elos else 0.0
+    stalled = 0.55 <= rate <= 0.95 and mean <= 45.0
+    return stalled, f"pass {npass}/{len(rows)}, mean {mean:+.0f}"
+
+
+def _pins_state_path(out_dir: str) -> str:
+    return os.path.join(out_dir, "anchor_pins.json")
+
+
+def load_pins(out_dir: str) -> list[dict]:
+    """Pinned rotation anchors registered next to the jsonl: [{name, path, ...}],
+    oldest first (so the NEWEST pin lands last in the anchor list)."""
+    try:
+        with open(_pins_state_path(out_dir)) as f:
+            return list(json.load(f).get("pins", []))
+    except Exception:  # noqa: BLE001 — no/corrupt state = no pins
+        return []
+
+
+def rotate_pin(current_path: str, out_dir: str, best_net: int | None) -> dict | None:
+    """Pin the CURRENT net as a new fixed rung: copy the .pt (+ its .arch.json
+    sidecar — load_scorer needs it to rebuild the exact arch) to a stable path next
+    to the jsonl and register it in anchor_pins.json, so subsequent invocations
+    include anchor 'pin:net<N>'. Returns the pin dict, or None (already pinned /
+    copy failed — non-fatal either way)."""
+    tag = str(best_net) if best_net is not None else time.strftime("%Y%m%d%H%M")
+    name = f"pin:net{tag}"
+    pins = load_pins(out_dir)
+    if any(p.get("name") == name for p in pins):
+        print(f"  saturation rotation: '{name}' already pinned — skipping (net unchanged?)")
+        return None
+    dst = os.path.join(out_dir, f"pinned-anchor-net{tag}.pt")
+    try:
+        shutil.copy2(current_path, dst)
+        arch = current_path + ".arch.json"
+        if os.path.exists(arch):
+            shutil.copy2(arch, dst + ".arch.json")
+        pins.append({"name": name, "path": os.path.abspath(dst), "ts": int(time.time()),
+                     "best_net": best_net, "src": os.path.abspath(current_path)})
+        with open(_pins_state_path(out_dir), "w") as f:
+            json.dump({"pins": pins}, f, indent=1)
+    except Exception as e:  # noqa: BLE001 — rotation failing must not break the gauntlet
+        print(f"  ⚠ saturation rotation FAILED (non-fatal): {e}")
+        return None
+    print(f"\033[35m  ★ SATURATION ROTATION: anchor pool exhausted → pinned the current net "
+          f"as '{name}'\n    {dst} (+ sidecar) — subsequent gauntlets measure against it\033[0m",
+          flush=True)
+    return pins[-1]
+
+
+def plateau_alert_line(anchor: str, delta: float, hours: float, run: str,
+                       best_net: int | None, db: str = "") -> str:
+    """The ALERTS.log line for a fired plateau, with the gate stall-floor screen
+    appended as context when it corroborates."""
+    line = (f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} [plateau] {anchor} {delta:+.0f} Elo "
+            f"over last {PLATEAU_MIN_ROWS} rows (~{hours:.0f}h) run={run or '?'} "
+            f"best_net={best_net if best_net is not None else '?'} "
+            f"— LR-drop trigger per run policy")
+    screen = gate_stall_screen(db)
+    if screen and screen[0]:
+        line += f" | gate≈stall-floor ({screen[1]})"
+    return line
+
+
+def emit_alert(line: str, alerts_path: str = "") -> None:
+    """Append to ALERTS.log and best-effort push via ntfy.sh when NTFY_TOPIC is set.
+    Never fatal."""
+    path = alerts_path or _ALERTS_PATH
+    try:
+        with open(path, "a") as f:
+            f.write(line + "\n")
+        print(f"\033[31m  ⚠ ALERT appended → {path}\n    {line}\033[0m", flush=True)
+    except OSError as e:
+        print(f"  ⚠ alert write FAILED (non-fatal): {e}\n    {line}")
+    topic = os.environ.get("NTFY_TOPIC")
+    if topic:
+        try:
+            subprocess.run(["curl", "-s", "-m", "5", f"https://ntfy.sh/{topic}", "-d", line],
+                           capture_output=True, timeout=10, check=False)
+        except Exception:  # noqa: BLE001 — the push is best-effort
+            pass
 
 
 # ----------------------------------------------------------------------------- players
@@ -290,9 +530,11 @@ def play_game(white, black, client, max_plies, start_fen) -> tuple[str, bool]:
     return _outcome_from_state(state), truncated
 
 
-def resolve_anchors(specs, current_path, dev, args):
-    """Build the anchor player list from comma-separated specs. Unresolvable
-    anchors (e.g. seed13 with no seed on disk) are skipped with a warning."""
+def resolve_anchors(specs, current_path, dev, args, pins=()):
+    """Build the anchor player list from comma-separated specs, then append the
+    registered pin rotations (so the newest pin is the LAST, discriminative rung).
+    Unresolvable anchors (e.g. seed13 with no seed on disk, a deleted pin) are
+    skipped with a warning."""
     import torch
     from chessckers_engine.checkpoints import load_scorer
     from chessckers_engine.model import build_model
@@ -327,6 +569,11 @@ def resolve_anchors(specs, current_path, dev, args):
         else:
             raise SystemExit(f"anchor_gauntlet: unknown anchor spec '{spec}' "
                              f"(expected random | search[:D] | seed13 | <path>.pt)")
+    for pin in pins:
+        try:
+            players.append(net_player(pin["name"], load_scorer(pin["path"])))
+        except Exception as e:  # noqa: BLE001 — a bad pin must not break the gauntlet
+            print(f"  ⚠ pinned anchor '{pin.get('name')}' skipped: {e}")
     if not players:
         raise SystemExit("anchor_gauntlet: no usable anchors")
     return players
@@ -351,6 +598,11 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None,
                     help="append one JSONL history row (default <run-dir>/anchor_gauntlet.jsonl; '' disables)")
+    ap.add_argument("--saturated-games", type=int, default=6,
+                    help="tripwire budget for a SATURATED anchor (score ≥ 0.9 in the last 3 "
+                         "jsonl rows); the saved games reallocate onto the last unsaturated anchor")
+    ap.add_argument("--no-realloc", action="store_true",
+                    help="disable saturation budget reallocation (every anchor plays --games)")
     args = ap.parse_args()
 
     import torch
@@ -367,12 +619,34 @@ def main() -> int:
     if not os.path.exists(current):
         raise SystemExit(f"anchor_gauntlet: net not found: {current} (pass --current)")
     cur_label = _label(current)
-    anchors = resolve_anchors(args.anchors, current, dev, args)
+
+    out_path = args.out if args.out is not None else os.path.join(args.run_dir, "anchor_gauntlet.jsonl")
+    out_dir = os.path.dirname(os.path.abspath(out_path)) if out_path else args.run_dir
+    best_net = best_net_number()  # (a) fleet net identity for the row; None = unknown, field absent
+    pins = load_pins(out_dir) if out_path else []
+    anchors = resolve_anchors(args.anchors, current, dev, args, pins=pins)
+    names = [a.name for a in anchors]
+
+    history = load_history(out_path) if out_path else []
+    sat = saturated_anchors(history, names)
+    # (c) rotation: the last (discriminative) rung — or everything — saturated → pin the
+    # current net as a NEW rung for future invocations (playing it now would be the net
+    # vs a copy of itself, 50% by construction, so this invocation doesn't include it).
+    if out_path and (names[-1] in sat or all(n in sat for n in names)):
+        rotate_pin(current, out_dir, best_net)
+    # (b) budgets: saturated anchors → tripwire games, savings onto the discriminator.
+    if args.no_realloc:
+        budgets = {n: args.games for n in names}
+    else:
+        budgets, blog = plan_budgets(names, sat, args.games, args.saturated_games)
+        for ln in blog:
+            print(f"  {ln}", flush=True)
 
     rn = _run_ident.run_name()
     print(f"anchor gauntlet{f' [{rn}]' if rn else ''}: '{cur_label}' vs {len(anchors)} fixed anchors on {dev} | "
           f"{args.games} games/anchor | {args.sims} sims | temp {args.temperature} for {args.temp_plies} plies"
-          f"\n  net: {current}", flush=True)
+          f"\n  net: {current}"
+          + (f"  |  fleet best: net #{best_net}" if best_net is not None else ""), flush=True)
 
     cur_model = load_scorer(current).to(dev).eval()
     cur_player_name = cur_label
@@ -384,7 +658,7 @@ def main() -> int:
         cur_player = NetPlayer(cur_player_name, cur_model, args.sims, args.c_puct,
                                args.temperature, args.temp_plies)
         w = d = l = 0
-        for gi in range(args.games):
+        for gi in range(budgets.get(anchor.name, args.games)):
             cur_white = gi % 2 == 0
             pw, pb = (cur_player, anchor) if cur_white else (anchor, cur_player)
             out, trunc = play_game(pw, pb, client, args.max_plies, args.start_fen)
@@ -414,7 +688,6 @@ def main() -> int:
         print(f"  \033[33m⚠ {n_trunc}/{total_g} games ({frac:.0f}%) hit the {args.max_plies}-ply cap "
               f"→ scored DRAW.\033[0m")
 
-    out_path = args.out if args.out is not None else os.path.join(args.run_dir, "anchor_gauntlet.jsonl")
     if out_path:
         row = {
             "ts": int(time.time()),
@@ -429,11 +702,36 @@ def main() -> int:
                  "elo": round(_elo(sc), 1),
                  "elo_lo": round(_elo(lo), 1), "elo_hi": round(_elo(hi), 1)}
                 for lbl, w, d, l, sc, lo, hi in rows
+                if w + d + l > 0  # a 0-game anchor would poison the score history
             ],
         }
+        if best_net is not None:
+            row["best_net"] = best_net
         with open(out_path, "a") as f:
             f.write(json.dumps(row) + "\n")
         print(f"  appended history row → {out_path}")
+
+        # (d) plateau alarm on the discriminative anchor, recomputed WITH the new row
+        # (an anchor that just saturated stops being the one we alarm on). Non-fatal.
+        try:
+            hist = load_history(out_path)
+            sat = saturated_anchors(hist, names)
+            disc = next((n for n in reversed(names) if n not in sat), None)
+            if disc is None and (pins := load_pins(out_dir)):
+                disc = pins[-1]["name"]  # newest pin: no history yet → no alarm, by design
+            if disc is None:
+                print("  plateau check: no discriminative anchor (all saturated, no pin)")
+            else:
+                check = plateau_check(hist, disc)
+                if check is None:
+                    print(f"  plateau check [{disc}]: <{PLATEAU_MIN_ROWS} rows — skipped")
+                elif not check[0]:
+                    print(f"  plateau check [{disc}]: {check[1]:+.0f} Elo over last "
+                          f"{PLATEAU_MIN_ROWS} rows (~{check[2]:.0f}h) — ok")
+                else:
+                    emit_alert(plateau_alert_line(disc, check[1], check[2], rn, best_net))
+        except Exception as e:  # noqa: BLE001 — monitoring never breaks the measurement
+            print(f"  ⚠ plateau check FAILED (non-fatal): {e}")
     return 0
 
 

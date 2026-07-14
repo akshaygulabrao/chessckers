@@ -32,6 +32,9 @@ Then, from **any directory**:
 | `cc watch [opts]` | pull the latest fleet net + watch it self-play live | box→local |
 | `cc restart-trainer [LR]` | **hardened clean warm-restart** (snapshot-guarded; optionally change LR) | box |
 | `cc play [opts]` | **play a human-vs-net game** against the latest fleet net | box→local |
+| `cc champs [opts]` | **audit the gate's actual promoted champions + rejected candidates** (server `.bin` nets via DB; 12+ games/pair for ordering claims) — contrast with `cc ladder` (trainer checkpoints) | box |
+| `cc backup` | **pull irreplaceable telemetry off the box** to `telemetry/<run>/` under the repo root | box→local |
+| `cc compare [file.jsonl ...]` | **compare anchor runs** — sparklines + seed13 alignment table across runs (`cc backup` refreshes the data) | local |
 | `cc fresh-run [opts]` | **provision + launch a complete training run from scratch** | box |
 | `cc launch` | print the fresh-run runbook (manual steps) | local |
 
@@ -198,7 +201,93 @@ cc anchor --games 40                   # tighter error bars
 cc anchor --current trainer/run1/iter-async-000123.pt   # measure any snapshot
 ```
 
-## 4. Playing the net
+## 4. Off-box telemetry + run comparison
+
+### `cc backup` — pull irreplaceable telemetry
+
+Files that live **only on the ephemeral box** and can't be reconstructed:
+
+```
+cc backup
+```
+
+Pulls to `telemetry/<RUN_NAME>/` under the repo root (created automatically; flat,
+no dated subdirs — overwrite is fine because the jsonl/db are append-only):
+
+| File | Notes |
+|---|---|
+| `anchor_gauntlet.jsonl` | strength time-series of record |
+| `champs_audit.jsonl` | gate-champion Elo series (skipped if not yet written) |
+| `chessckers.db` | full gate history (matches, promotions, rejections) |
+| `ALERTS.log` | plateau alarms from the anchor cron |
+| `server.log` | last 2000 lines |
+| `trainer.log` | last 2000 lines |
+
+`telemetry/` is in `.gitignore` (binary DB + large jsonls don't belong in the tree).
+
+**Auto-trigger:** `cc status` and `cc doctor` silently spawn a background backup if
+the last one is >6h old (marker file `telemetry/.last-backup`). Never blocks the
+command; never fatal.
+
+### `cc champs` — gate's real champions + rejected candidates
+
+Unlike `cc ladder` (trainer iter-checkpoints played by Python MCTS or the fork),
+`cc champs` queries the server DB for the promotion history, gunzips the `.bin` nets
+from `networks/`, and runs them through a round-robin with the fork at the gate's
+operating point (128v). This is the GATE'S own perspective — who actually got
+promoted, who was rejected, and whether the champion pool has a strength order.
+
+Minimum 12 games/pair for any ordering claim (4 games ≈ ±140 Elo 95% CI;
+12 ≈ ±80). The daily cron audit (`install_monitor_crons.sh`) runs at 12g/pair.
+
+```bash
+cc champs                     # log-spaced champions + 3 newest rejects, 12g/pair
+cc champs --games 24          # tighter error bars
+```
+
+### `cc compare` — cross-run anchor comparison
+
+```bash
+cc compare                                        # all telemetry/*/anchor_gauntlet.jsonl
+cc compare telemetry/run19/anchor_gauntlet.jsonl  # explicit file(s)
+```
+
+For each run + anchor, prints a sparkline of Elo over rows with first/last Elo and
+slope (Elo/24h over the last 3 rows, assuming the default 8-hourly cron cadence).
+Then an alignment table for the discriminative anchor `seed13`: rows = row index,
+columns = runs — so two runs can be eyeballed at matched progress.
+
+Robust to missing fields and short files (short series → partial table).
+
+### Anchor cron + ALERTS.log + NTFY_TOPIC
+
+The anchor cron (`15 */8 * * *` on the box, installed by `cc fresh-run`) runs
+`anchor_gauntlet.py` every 8 hours and appends a JSONL row to
+`trainer/run1/anchor_gauntlet.jsonl`. If the discriminative anchor (`seed13`) shows
+no improvement over consecutive rows, it writes an alarm line to
+`/workspace/chessckers/ALERTS.log`.
+
+**Push notifications (opt-in):** set `NTFY_TOPIC=<your-topic>` in the box env
+(e.g. add to `/etc/environment` or the cron environment) to forward alarm lines to
+`https://ntfy.sh/<your-topic>`. The cron reads this variable at runtime; no code
+changes needed.
+
+### `install_monitor_crons.sh` — deploy monitoring crons to the box
+
+```bash
+cc ssh bash /workspace/chessckers/engine/scripts/install_monitor_crons.sh
+```
+
+Adds to root's crontab (idempotent — grep-guarded, no duplicates):
+
+- **04:45 daily — champs audit:**
+  `champ_ladder.py --games 12 --jsonl trainer/run1/champs_audit.jsonl`
+  → appends a JSONL row to `champs_audit.jsonl`, log at `/workspace/champs_cron.log`.
+
+The anchor 8-hourly cron is installed by `cc fresh-run`; this script adds the
+slower daily audit that is too expensive for the 8-hourly cadence.
+
+## 5. Playing the net
 
 Play a human-vs-net game from any FEN — you pick from a numbered legal-move menu
 (no hand-typing cadence/deploy UCI), the net replies via MCTS, and the board +
@@ -214,7 +303,7 @@ cc play --color black                # play the LIVE fleet champion (pulls its n
 undoes your last move and `q` quits. To watch the net play ITSELF instead, use
 `watch_game.py` / `cc watch`.
 
-## Script index
+## 6. Script index
 
 | Script | Where | Purpose |
 |---|---|---|
@@ -229,9 +318,11 @@ undoes your last move and `q` quits. To watch the net play ITSELF instead, use
 | `gauntlet.py` | box | **current net vs all previous snapshots** — strength + regression curve |
 | `anchor_gauntlet.py` | box | **current net vs fixed anchors** — absolute strength trajectory (JSONL history) |
 | `play_net.py` | local | **human-vs-net** play from any FEN (numbered move menu) |
+| `champ_ladder.py` | box | ladder the gate's promoted champions + rejects (server `.bin` nets from DB) |
+| `install_monitor_crons.sh` | box | idempotent: add daily champs audit cron to root's crontab |
 | `../lczero-server/scripts/new_run.sh` | box | guarded fresh-run setup (sets start FEN) |
 
-## Gotchas (hard-won)
+## 7. Gotchas (hard-won)
 
 - **Endpoint changes on instance recreate** — always go through `cc` (or
   `vastai show instances`), never a hardcoded `ssh5.vast.ai:NNNNN`.

@@ -11,7 +11,8 @@ scripts to run on it.
   cc doctor [args]              # one-shot run health/convergence report
   cc status [args]              # fleet dashboard (live arena + gate decisions; runs fleet_status.py)
   cc plot [args]                # plot the run metrics time-series
-  cc ladder [args]              # round-robin champion nets -> terminal Elo + score matrix
+  cc ladder [args]              # round-robin champion nets (REAL lc0 fork; --mcts for Python) -> Elo + matrix
+  cc champs [args]              # ladder the gate's REAL champions + rejected candidates (server .bin nets)
   cc gauntlet [args]            # current net vs ALL previous snapshots -> strength + regression curve
   cc anchor [args]              # current net vs FIXED anchors (random/search bot/seed13) -> absolute strength trajectory
   cc strength [args]           # strength TABLE from the in-fleet gate matches (fast; no games played)
@@ -22,6 +23,8 @@ scripts to run on it.
   cc restart                    # relaunch the whole fleet (warm-resume) if down — idempotent
   cc play [play args]           # play a human-vs-net game against the latest fleet net
   cc lengths [--window=50]      # average game length over training (survival→mate curve)
+  cc backup                     # pull irreplaceable telemetry off the box to telemetry/<run>/
+  cc compare [file...]          # compare anchor_gauntlet.jsonl runs — sparklines + alignment table
   cc fresh-run [--run-name=X] [--arch=v5] [--parallelism=32] [--base=<box-net.pt>]
                [--c-filters=N] [--n-blocks=N] [--se-ratio=N]
                [--policy-target=visits|improved] [--value-q-ratio=R]
@@ -39,6 +42,7 @@ Run as `python scripts/cc.py <cmd>` or alias `cc` to it (see scripts/README.md).
 """
 
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -51,6 +55,7 @@ CACHE = os.path.expanduser("~/.cache/cc_box.json")
 CACHE_TTL = 600
 ENGINE_DIR = "/workspace/chessckers/engine"  # repo path ON THE BOX
 SERVER_DIR = "/workspace/chessckers/lczero-server"
+FORK_BINARY = "/workspace/chessckers/akshay-chessckers-0/build/release/akshay-chessckers-0"  # lc0 fork on the box
 LOCAL_ENGINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GAMES_CACHE = os.path.expanduser(
     "~/.cache/cc_games"
@@ -565,6 +570,253 @@ def cmd_verify_chunks(args):
     return subprocess.call([sys.executable, checker, *locals_])
 
 
+_TELEMETRY_ROOT = os.path.join(os.path.dirname(LOCAL_ENGINE), "telemetry")
+_BACKUP_MARKER = os.path.join(_TELEMETRY_ROOT, ".last-backup")
+_BACKUP_STALE_SECS = 6 * 3600
+
+
+def _backup_stale():
+    """True if no backup has run in the last 6 hours (or marker absent)."""
+    try:
+        return time.time() - os.path.getmtime(_BACKUP_MARKER) > _BACKUP_STALE_SECS
+    except OSError:
+        return True
+
+
+def _spawn_background_backup():
+    """Fire-and-forget backup subprocess — never fatal."""
+    try:
+        subprocess.Popen(
+            [sys.executable, __file__, "backup"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print("(telemetry backup started in background)")
+    except Exception:
+        pass
+
+
+def _run_label(box):
+    """Best-effort run label for the telemetry dir name (e.g. 'run19' or box id)."""
+    try:
+        cron = _ssh_out(box, "crontab -l 2>/dev/null | grep restart_fleet.sh | tail -1")
+        for tok in cron.split():
+            if tok.startswith("RUN_NAME="):
+                name = tok.split("=", 1)[1]
+                # strip leading runNN_ prefix if present, else use as-is
+                return name
+    except Exception:
+        pass
+    return f"box{box.get('id', 'unknown')}"
+
+
+def cmd_backup(args):
+    """Pull irreplaceable telemetry off the box to telemetry/<run>/ under the repo root.
+
+    Files pulled (overwritten — the jsonls/db are append-only so latest wins):
+      anchor_gauntlet.jsonl, champs_audit.jsonl (skipped if absent), chessckers.db,
+      ALERTS.log, server.log (last 2000 lines), trainer.log (last 2000 lines).
+    """
+    box = resolve()
+    label = _run_label(box)
+    dest = os.path.join(_TELEMETRY_ROOT, label)
+    os.makedirs(dest, exist_ok=True)
+
+    run1 = f"{SERVER_DIR}/trainer/run1"
+
+    def _pull_file(remote, local_name):
+        local = os.path.join(dest, local_name)
+        rc = _fetch(box, remote, local)
+        if rc != 0 and not os.path.exists(local):
+            print(f"  {local_name:<32} absent")
+        else:
+            size = os.path.getsize(local)
+            print(f"  {local_name:<32} {size:>10,} bytes")
+
+    def _pull_tail(remote, local_name, lines=2000):
+        """Pull the last N lines of a remote log via ssh_out, write locally."""
+        local = os.path.join(dest, local_name)
+        text = _ssh_out(box, f"tail -n {lines} {shlex.quote(remote)} 2>/dev/null")
+        if text:
+            with open(local, "w") as f:
+                f.write(text)
+            print(f"  {local_name:<32} {os.path.getsize(local):>10,} bytes  (last {lines} lines)")
+        else:
+            print(f"  {local_name:<32} absent")
+
+    print(f"backup → {dest}/")
+    _pull_file(f"{run1}/anchor_gauntlet.jsonl", "anchor_gauntlet.jsonl")
+    # champs_audit.jsonl may not exist yet — _fetch silently skips on failure
+    champs_remote = f"{run1}/champs_audit.jsonl"
+    champs_local = os.path.join(dest, "champs_audit.jsonl")
+    rc = _fetch(box, champs_remote, champs_local)
+    if rc != 0 and not os.path.exists(champs_local):
+        print(f"  {'champs_audit.jsonl':<32} absent (not yet written — ok)")
+    else:
+        print(f"  {'champs_audit.jsonl':<32} {os.path.getsize(champs_local):>10,} bytes")
+    _pull_file(f"{SERVER_DIR}/chessckers.db", "chessckers.db")
+    _pull_file("/workspace/chessckers/ALERTS.log", "ALERTS.log")
+    _pull_tail(f"{SERVER_DIR}/server.log", "server.log")
+    _pull_tail(f"{SERVER_DIR}/trainer.log", "trainer.log")
+
+    # update marker
+    os.makedirs(_TELEMETRY_ROOT, exist_ok=True)
+    with open(_BACKUP_MARKER, "w") as f:
+        f.write(str(time.time()))
+    return 0
+
+
+def _parse_jsonl(path):
+    """Parse a JSONL file, skipping blank/malformed lines. Returns list of dicts."""
+    rows = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except OSError:
+        pass
+    return rows
+
+
+def _sparkline(values):
+    """Unicode block sparkline for a sequence of floats (▁–▇)."""
+    blocks = "▁▂▃▄▅▆▇█"
+    if not values:
+        return ""
+    lo, hi = min(values), max(values)
+    span = hi - lo
+    return "".join(
+        blocks[min(7, int((v - lo) / (span + 1e-9) * 7))]
+        for v in values
+    )
+
+
+def _elo_slope(points, interval_h=8):
+    """Elo/24h slope over the last 3 rows. points = [(ts_or_None, elo)]; uses real
+    timestamps when present (the cron cadence varies), else assumes interval_h."""
+    tail = points[-3:]  # up to 3 points
+    if len(tail) < 2:
+        return None
+    rise = tail[-1][1] - tail[0][1]
+    ts0, ts1 = tail[0][0], tail[-1][0]
+    if ts0 and ts1 and ts1 > ts0:
+        hours = (ts1 - ts0) / 3600.0
+    else:
+        hours = (len(tail) - 1) * interval_h
+    return rise / hours * 24  # Elo per 24h
+
+
+def cmd_compare(args):
+    """Compare anchor_gauntlet.jsonl runs — sparklines + seed13 alignment table.
+
+    Usage:  cc compare [file.jsonl ...]
+      Default: every telemetry/*/anchor_gauntlet.jsonl (refresh with `cc backup`).
+      Each file is one run.  For each anchor, prints:
+        • a sparkline of Elo over rows, first/last Elo, slope Elo/24h (last 3 rows)
+      Then: a per-row alignment table for anchor "seed13" so two runs can be
+      compared at matched progress (rows share an index, not a timestamp).
+    """
+    import glob as _glob
+
+    # Collect files
+    if args:
+        files = args
+    else:
+        files = sorted(_glob.glob(os.path.join(_TELEMETRY_ROOT, "*/anchor_gauntlet.jsonl")))
+    if not files:
+        print("cc compare: no files found. Run `cc backup` first, or pass paths explicitly.")
+        return 1
+
+    # Load and parse each run
+    runs = []  # list of (label, rows)
+    for path in files:
+        rows = _parse_jsonl(path)
+        # derive a short label from the path (parent dir name)
+        parts = path.replace("\\", "/").split("/")
+        try:
+            label = parts[parts.index("telemetry") + 1]
+        except (ValueError, IndexError):
+            label = os.path.basename(os.path.dirname(path))
+        runs.append((label, rows))
+
+    if not runs:
+        print("cc compare: no data loaded.")
+        return 1
+
+    # ------------------------------------------------------------------ per-run blocks
+    for label, rows in runs:
+        print(f"\n=== {label} ({len(rows)} rows) ===")
+        if not rows:
+            print("  (no rows)")
+            continue
+
+        # Collect per-anchor series (jsonl rows carry the per-anchor list under "anchors")
+        anchors = {}
+        for row in rows:
+            for result in row.get("anchors", []):
+                anchor = result.get("anchor", "")
+                elo = result.get("elo")
+                if anchor and elo is not None:
+                    anchors.setdefault(anchor, []).append(
+                        (row.get("best_net"), elo, row.get("ts")))
+
+        for anchor, entries in sorted(anchors.items()):
+            elos = [e for _, e, _ in entries]
+            nets = [n for n, _, _ in entries]
+            spark = _sparkline(elos)
+            first_e, last_e = elos[0], elos[-1]
+            slope = _elo_slope([(t, e) for _, e, t in entries])
+            slope_str = f"{slope:+.0f} Elo/24h" if slope is not None else "n/a"
+            net_range = ""
+            non_null = [n for n in nets if n is not None]
+            if non_null:
+                net_range = f"  nets {non_null[0]}..{non_null[-1]}"
+            print(f"  {anchor:<12} {spark}  [{first_e:+.0f} → {last_e:+.0f}]  slope {slope_str}{net_range}")
+
+    # ------------------------------------------------------------------ seed13 alignment table
+    print("\n--- seed13 alignment table (row index vs run) ---")
+    # Gather per-run seed13 series
+    seed13_series = {}
+    for label, rows in runs:
+        elos = []
+        for row in rows:
+            for result in row.get("anchors", []):
+                if result.get("anchor") == "seed13":
+                    elo = result.get("elo")
+                    if elo is not None:
+                        elos.append((row.get("best_net"), elo))
+        seed13_series[label] = elos
+
+    max_rows = max((len(v) for v in seed13_series.values()), default=0)
+    if max_rows == 0:
+        print("  (no seed13 data)")
+        return 0
+
+    run_labels = [label for label, _ in runs]
+    col_w = max(12, max(len(l) for l in run_labels))
+    header = f"  {'row':>4}  " + "  ".join(f"{l:>{col_w}}" for l in run_labels)
+    print(header)
+    for i in range(max_rows):
+        cells = []
+        for label in run_labels:
+            series = seed13_series[label]
+            if i < len(series):
+                net, elo = series[i]
+                net_str = f"/{net}" if net else ""
+                cells.append(f"{elo:>+.0f}{net_str}"[:col_w].rjust(col_w))
+            else:
+                cells.append("-".rjust(col_w))
+        print(f"  {i:>4}  " + "  ".join(cells))
+
+    return 0
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -586,11 +838,25 @@ def main():
             sys.exit("usage: cc run <script.py> [args...]")
         return _run_on_box(args[0], args[1:])
     elif cmd == "doctor":
-        return _run_on_box("run_doctor.py", args)
+        rc = _run_on_box("run_doctor.py", args)
+        if _backup_stale():
+            _spawn_background_backup()
+        return rc
     elif cmd == "plot":
         return _run_on_box("plot_run.py", args)
     elif cmd == "ladder":
+        # Default to the REAL lc0 fork (always built on the box); `cc ladder --mcts`
+        # forces the Python PUCT reference. Inject an explicit binary path (not a
+        # bare --engine) so ladder.py's nargs='?' can't swallow a following net path.
+        if "--mcts" in args:
+            args = [a for a in args if a != "--mcts"]
+        elif "--engine" not in args:
+            args = ["--engine", FORK_BINARY, *args]
         return _run_on_box("ladder.py", args)
+    elif cmd == "champs":
+        # champ_ladder always runs the fork (server nets are .bin-only) and
+        # defaults the binary itself — no --engine injection needed here.
+        return _run_on_box("champ_ladder.py", args)
     elif cmd == "gauntlet":
         return _run_on_box("gauntlet.py", args)
     elif cmd == "anchor":
@@ -607,7 +873,10 @@ def main():
             f"cd {SERVER_DIR} && {ENGINE_DIR}/.venv/bin/python scripts/fleet_status.py "
             + " ".join(_q(a) for a in args)
         )
-        return subprocess.call(_ssh(box) + [remote])
+        rc = subprocess.call(_ssh(box) + [remote])
+        if _backup_stale():
+            _spawn_background_backup()
+        return rc
     elif cmd == "games":
         return cmd_games(args)
     elif cmd == "verify-chunks":
@@ -639,6 +908,10 @@ def main():
         print("# (Or just use `cc fresh-run`, which does all of the above in one command.)")
     elif cmd == "lengths":
         return _run_on_box("game_lengths.py", args)
+    elif cmd == "backup":
+        return cmd_backup(args)
+    elif cmd == "compare":
+        return cmd_compare(args)
     elif cmd == "fresh-run":
         return cmd_fresh_run(args)
     else:

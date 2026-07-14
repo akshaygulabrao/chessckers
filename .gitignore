@@ -19,3 +19,6 @@ reference/
 # Local Pi runtime state
 .atl/
 .pi/
+
+# Off-box telemetry pulls (cc backup)
+telemetry/
