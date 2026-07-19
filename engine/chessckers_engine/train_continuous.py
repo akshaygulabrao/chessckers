@@ -451,6 +451,12 @@ def main() -> int:
                         "(Lever 3). Needs chunks carrying search_wdl (lc0-fork data); examples without it "
                         "fall back to pure z. Composes with --value-discount, which shapes the z term only.")
     p.add_argument("--mlh-loss-weight", type=float, default=0.3)
+    p.add_argument("--policy-target", choices=["visits", "improved"],
+                   default=os.environ.get("CHESSCKERS_POLICY_TARGET", "visits"),
+                   help="policy training target: 'visits' (normalized visit counts, the AZ "
+                        "default) or 'improved' (the Gumbel improved policy softmax(logP+σQ) "
+                        "carried by lc0-fork chunks in the improved_policy field). 'improved' "
+                        "falls back to visits per-example when the field is absent (pre-Gumbel).")
     p.add_argument("--publish-seconds", type=float, default=45.0, help="how often to publish weights.pt to self-play")
     p.add_argument("--ckpt-seconds", type=float, default=300.0, help="how often to save an iter ckpt + log stats")
     p.add_argument("--log-seconds", type=float, default=30.0,
@@ -761,7 +767,8 @@ def main() -> int:
         log_due = (time.time() - last_loss_log) >= args.log_seconds
         diag: dict | None = {} if log_due else None
         p_loss, v_loss, ml_loss = _batch_loss(
-            model, batch, gamma=args.value_discount, q_ratio=args.value_q_ratio, diag=diag)
+            model, batch, gamma=args.value_discount, q_ratio=args.value_q_ratio,
+            improved_policy=(args.policy_target == "improved"), diag=diag)
         (p_loss + args.value_loss_weight * v_loss + args.mlh_loss_weight * ml_loss).backward()
         # Always measure the pre-clip grad norm (max_norm=inf computes it WITHOUT scaling
         # when clipping is disabled), so "is the LR too high?" is a logged number.

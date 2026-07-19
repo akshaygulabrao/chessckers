@@ -404,3 +404,68 @@ def test_best_child_keeps_max_visits_when_nothing_is_a_loss():
     }
     assert CERTAIN_LOSS_VALUE < -0.10  # sanity: none of these count as a loss
     assert _best_child(root).move_to_here["uci"] == "y"
+
+
+# ---- Gumbel AlphaZero search ----
+
+
+def _gumbel_setup():
+    """Real PyVariant client + a v2 net at the official start — exercises the
+    variant_py fast path the way self-play does."""
+    from chessckers_engine.model import build_model
+    from chessckers_engine.variant_py.client import PyVariantClient
+    from chessckers_engine.variant_py.state import STARTING_FEN
+
+    torch.manual_seed(0)
+    client = PyVariantClient()
+    state = client.new_game(STARTING_FEN)
+    model = build_model(version="v2").eval()
+    return client, state, model
+
+
+def test_gumbel_returns_legal_move_and_normalized_improved_policy():
+    from chessckers_engine.mcts_puct import run_gumbel_mcts
+
+    client, state, model = _gumbel_setup()
+    legal_ucis = {m["uci"] for m in state["legalMoves"]}
+    r = run_gumbel_mcts(state, client, model, n_sims=32, max_considered=8,
+                        rng=torch.Generator().manual_seed(1))
+    assert r.chosen is not None and r.chosen["uci"] in legal_ucis
+    assert r.improved_policy is not None
+    assert abs(sum(r.improved_policy.values()) - 1.0) < 1e-6
+    assert set(r.improved_policy) <= legal_ucis
+
+
+def test_gumbel_searches_only_the_considered_actions():
+    """Sequential Halving spends the budget on m Gumbel-Top-k candidates, so at
+    most `max_considered` root children have any visits."""
+    from chessckers_engine.mcts_puct import run_gumbel_mcts
+
+    client, state, model = _gumbel_setup()
+    m = 6
+    r = run_gumbel_mcts(state, client, model, n_sims=48, max_considered=m,
+                        rng=torch.Generator().manual_seed(2))
+    searched = [c for c in r.root.children.values() if c.visits > 0]
+    assert 0 < len(searched) <= m
+    assert len(r.root.children) > m  # there were more legal moves than we searched
+
+
+def test_gumbel_deterministic_mode_is_reproducible():
+    from chessckers_engine.mcts_puct import run_gumbel_mcts
+
+    client, state, model = _gumbel_setup()
+    a = run_gumbel_mcts(state, client, model, n_sims=32, max_considered=8, deterministic=True)
+    b = run_gumbel_mcts(state, client, model, n_sims=32, max_considered=8, deterministic=True)
+    assert a.chosen["uci"] == b.chosen["uci"]
+    assert a.improved_policy == b.improved_policy
+
+
+def test_gumbel_single_legal_move_returns_it():
+    from chessckers_engine.mcts_puct import run_gumbel_mcts
+
+    only = _move("ONLY")
+    state = {"fen": FEN_W, "legalMoves": [only]}
+    client = _StubClient({(FEN_W, "ONLY"): {"fen": FEN_B, "legalMoves": []}})
+    model = ChesskersScorer().eval()
+    r = run_gumbel_mcts(state, client, model, n_sims=8, max_considered=8)
+    assert r.chosen is only

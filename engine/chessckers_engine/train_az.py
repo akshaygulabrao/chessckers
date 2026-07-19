@@ -113,6 +113,7 @@ def _batch_loss(
     value_loss_fn: nn.Module | None = None,
     gamma: float = 1.0,
     q_ratio: float = 0.0,
+    improved_policy: bool = False,
     diag: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Mini-batched loss: trunk batched in one forward; WDL value head (cross-
@@ -149,7 +150,11 @@ def _batch_loss(
     for i, (mv, ex) in enumerate(zip(move_lists, batch)):
         padded[i, : counts[i]] = mv
         mask[i, : counts[i]] = True
-        target[i, : counts[i]] = torch.tensor(ex.visit_distribution, dtype=torch.float32)
+        # Gumbel: train the policy on the search's improved policy when requested and
+        # present; fall back to the visit distribution for pre-Gumbel examples.
+        pi = (ex.improved_policy if improved_policy and ex.improved_policy is not None
+              else ex.visit_distribution)
+        target[i, : counts[i]] = torch.tensor(pi, dtype=torch.float32)
     padded, mask, target = padded.to(device), mask.to(device), target.to(device)
 
     # One trunk pass → policy logits + WDL value logits + moves-left preds. The

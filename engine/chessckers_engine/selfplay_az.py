@@ -98,6 +98,7 @@ class AZExample:
     wdl_target: list[float]          # [P(win), P(draw), P(loss)] from STM POV — one-hot of the game outcome
     moves_left_target: float         # plies remaining from this position to game end
     search_wdl: list[float] | None = None  # search root value [w,d,l], STM POV (Lever 3); None = not recorded
+    improved_policy: list[float] | None = None  # Gumbel target softmax(logP+σQ), aligned w/ legal_moves; None = not recorded → use visit_distribution
 
 
 def _outcome_from_state(state: dict[str, Any]) -> str:

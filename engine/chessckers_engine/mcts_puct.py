@@ -418,6 +418,10 @@ class MctsResult:
     chosen: LegalMove | None
     visit_distribution: dict[str, int]  # uci -> visit count
     root: PuctNode
+    # Gumbel search only: the improved-policy target softmax(logits + σ(completedQ))
+    # over root children (uci -> prob). None for the PUCT path, whose training
+    # target is the visit distribution above.
+    improved_policy: dict[str, float] | None = None
 
 
 def _apply_dirichlet_noise(
@@ -455,6 +459,231 @@ def _apply_dirichlet_noise(
     noise = sample.tolist()
     for i, child in enumerate(root.children.values()):
         child.prior = float((1.0 - eps) * child.prior + eps * noise[i])
+
+
+# ---------------------------------------------------------------------------
+# Gumbel AlphaZero  (Danihelka et al. 2022, "Policy improvement by planning
+# with Gumbel"; ref impl: DeepMind mctx). Two departures from the PUCT search
+# above:
+#   * ROOT: draw one Gumbel per legal move, take the top-m actions by
+#     (gumbel + logit) — the Gumbel-Top-k trick = sampling m moves without
+#     replacement — then spend the visit budget on just those m via SEQUENTIAL
+#     HALVING. This alone guarantees a policy improvement even at a handful of
+#     sims, and needs no Dirichlet noise and no c_puct.
+#   * INTERIOR: deterministic selection toward the "improved policy"
+#     softmax(logit + σ(completedQ)); pick the child whose visit share most lags
+#     its improved-policy mass. Matches visits to the target instead of PUCT's
+#     optimism.
+# The self-play POLICY TARGET becomes this improved policy, not the visit counts.
+# σ(q) = (c_visit + max_child_visits) · c_scale · q̂, with q̂ the min-max
+# normalized completed-Q (mctx `qtransform_completed_by_mix_value`).
+# ---------------------------------------------------------------------------
+
+GUMBEL_C_VISIT = 50.0
+GUMBEL_C_SCALE = 1.0
+GUMBEL_MAX_CONSIDERED = 16
+
+
+def _child_q_from(parent: PuctNode, child: PuctNode) -> float | None:
+    """Child's Q from the PARENT's perspective ([-1, 1]), or None if unvisited.
+    Negamax across the edge, except the same-mover double-move edge keeps sign."""
+    if child.visits == 0:
+        return None
+    return child.q if _node_mover(child) == _node_mover(parent) else -child.q
+
+
+def _v_mix(node: PuctNode) -> float:
+    """Completed value at `node` (node-mover POV): the node's own value blended
+    with the visit-weighted, prior-reweighted Q of its VISITED children. Used to
+    complete the Q of not-yet-visited children (Appendix, Eq. for v_mix)."""
+    visited = [c for c in node.children.values() if c.visits > 0]
+    v_node = node.q
+    if not visited:
+        return v_node
+    sum_prior = sum(c.prior for c in visited)
+    if sum_prior <= 0.0:
+        return v_node
+    sum_n = sum(c.visits for c in visited)
+    weighted_q = sum(c.prior * _child_q_from(node, c) for c in visited)  # type: ignore[misc]
+    return (v_node + sum_n * (weighted_q / sum_prior)) / (1 + sum_n)
+
+
+def _completed_q_normalized(node: PuctNode) -> tuple[list[PuctNode], list[float], int]:
+    """(children, min-max-normalized completed-Q in [0,1], max_child_visits).
+    Unvisited children take the v_mix completion; normalization makes the σ scale
+    position-independent."""
+    children = list(node.children.values())
+    vmix = _v_mix(node)
+    comp = [(_child_q_from(node, c) if c.visits > 0 else vmix) for c in children]
+    lo, hi = min(comp), max(comp)  # type: ignore[type-var]
+    rng = hi - lo
+    norm = [((x - lo) / rng if rng > 1e-8 else 0.5) for x in comp]  # type: ignore[operator]
+    max_visit = max((c.visits for c in children), default=0)
+    return children, norm, max_visit
+
+
+def _sigma(q_norm: float, max_visit: int) -> float:
+    return (GUMBEL_C_VISIT + max_visit) * GUMBEL_C_SCALE * q_norm
+
+
+def _improved_policy(node: PuctNode) -> dict[str, float]:
+    """softmax(log prior + σ(completedQ)) over `node`'s children → {uci: prob} —
+    the Gumbel policy-improvement target; also drives interior selection. log(prior)
+    stands in for the raw policy logits (softmax is shift-invariant, so the missing
+    constant is irrelevant)."""
+    children, norm, max_visit = _completed_q_normalized(node)
+    scores = [math.log(max(c.prior, 1e-9)) + _sigma(norm[i], max_visit)
+              for i, c in enumerate(children)]
+    top = max(scores)
+    exps = [math.exp(s - top) for s in scores]
+    z = sum(exps)
+    return {c.move_to_here["uci"]: exps[i] / z for i, c in enumerate(children)}
+
+
+def _select_child_gumbel(parent: PuctNode) -> PuctNode:
+    """Interior selection: pick the child whose visit share most lags its
+    improved-policy probability — argmax_a  π'(a) − N(a)/(1 + Σ_b N(b))."""
+    improved = _improved_policy(parent)
+    sum_n = sum(c.visits for c in parent.children.values())
+    return max(
+        parent.children.values(),
+        key=lambda c: improved[c.move_to_here["uci"]] - c.visits / (1 + sum_n),
+    )
+
+
+def _select_to_leaf_gumbel(start_path: list[PuctNode]) -> tuple[list[PuctNode], PuctNode]:
+    """Descend from the last node of `start_path` via interior selection to a leaf.
+    `start_path` is [root, forced_root_child] so Sequential Halving can pin the
+    root action while the rest of the descent stays improved-policy-driven."""
+    path = list(start_path)
+    node = path[-1]
+    while node.expanded and not node.is_terminal and node.children:
+        node = _select_child_gumbel(node)
+        path.append(node)
+    return path, node
+
+
+def _simulate_gumbel(root: PuctNode, forced_child: PuctNode, client: _Mover,
+                     model: ChesskersScorer, get_legal) -> None:
+    """One simulation whose FIRST edge is fixed to `forced_child`; below the root,
+    interior improved-policy selection drives to a leaf, which is expanded/evaluated
+    and backed up (same leaf handling as `_simulate`)."""
+    path, node = _select_to_leaf_gumbel([root, forced_child])
+    if node.is_terminal:
+        value = _terminal_value(node)
+    elif not node.expanded:
+        legal = get_legal(node)
+        value, priors = _eval_and_priors(model, _node_fen(node, client), legal, state=node.state)
+        if legal:
+            _expand_with_priors(node, legal, priors, client)
+    else:
+        value, _ = _eval_and_priors(model, _node_fen(node, client), [], state=node.state)
+    _backup(path, value)
+
+
+def _sample_gumbel(children: list[PuctNode], rng: torch.Generator | None) -> dict[str, float]:
+    """One Gumbel(0,1) per child, keyed by uci: g = −log(−log U), U~Uniform(0,1)."""
+    n = len(children)
+    u = torch.rand(n, generator=rng).clamp_(1e-12, 1.0 - 1e-12)
+    g = (-(-u.log()).log()).tolist()
+    return {c.move_to_here["uci"]: g[i] for i, c in enumerate(children)}
+
+
+def run_gumbel_mcts(
+    state: GameState,
+    client: _Mover,
+    model: ChesskersScorer,
+    n_sims: int = 32,
+    max_considered: int = GUMBEL_MAX_CONSIDERED,
+    deterministic: bool = False,
+    rng: torch.Generator | None = None,
+) -> MctsResult:
+    """Gumbel AlphaZero search (Sequential Halving at the root, improved-policy
+    interior selection). Returns the Sequential-Halving winner as `chosen`, the
+    improved policy as `improved_policy` (the self-play target), and the visit
+    distribution for inspection.
+
+    `max_considered`: m, the number of root actions Gumbel-sampled to search.
+    `deterministic`: zero the Gumbel draws → the search becomes a noiseless
+    argmax(logit + σQ) — use for eval; leave False for self-play exploration.
+    """
+    legal = state.get("legalMoves") or []
+    if not legal:
+        return MctsResult(chosen=None, visit_distribution={},
+                          root=PuctNode(fen=state["fen"], move_to_here=None))
+
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+
+    root = PuctNode(fen=state["fen"], move_to_here=None, legal_moves=legal)
+    if hasattr(client, "parse"):
+        try:
+            root.state = client.parse(state["fen"])
+        except Exception:  # noqa: BLE001
+            pass
+    legal_cache: dict[str, list[LegalMove]] = {state["fen"]: legal}
+
+    def get_legal(node: PuctNode) -> list[LegalMove]:
+        if node.legal_moves is not None:
+            return node.legal_moves
+        cached = legal_cache.get(node.fen)
+        if cached is not None:
+            node.legal_moves = cached
+            return cached
+        try:
+            s = client.new_game(node.fen)  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001
+            log.debug("get_legal: new_game raised for fen=%s: %s", node.fen, e)
+            return []
+        moves = s.get("legalMoves") or []
+        legal_cache[node.fen] = moves
+        node.legal_moves = moves
+        return moves
+
+    try:
+        # Expand the root (1 eval; backs up the root value used by v_mix).
+        _simulate(root, client, model, 0.0, get_legal)
+        if not root.children:
+            return MctsResult(chosen=legal[0], visit_distribution={legal[0]["uci"]: 0}, root=root)
+
+        children = list(root.children.values())
+        gumbel = ({c.move_to_here["uci"]: 0.0 for c in children} if deterministic
+                  else _sample_gumbel(children, rng))
+        logit = {c.move_to_here["uci"]: math.log(max(c.prior, 1e-9)) for c in children}
+
+        # Gumbel-Top-k: the m root actions to actually search.
+        m = min(max_considered, len(children))
+        cands = sorted(children,
+                       key=lambda c: gumbel[c.move_to_here["uci"]] + logit[c.move_to_here["uci"]],
+                       reverse=True)[:m]
+
+        # Sequential Halving: spread ~n_sims over ⌈log2 m⌉ phases, halving the
+        # surviving set each phase; rank by gumbel + logit + σ(completedQ).
+        num_phases = max(1, math.ceil(math.log2(m))) if m > 1 else 1
+        while len(cands) > 1:
+            per = max(1, n_sims // (num_phases * len(cands)))
+            for c in cands:
+                for _ in range(per):
+                    _simulate_gumbel(root, c, client, model, get_legal)
+            _, norm, max_visit = _completed_q_normalized(root)
+            norm_by_uci = {children[i].move_to_here["uci"]: norm[i] for i in range(len(children))}
+            cands.sort(
+                key=lambda c: (gumbel[c.move_to_here["uci"]] + logit[c.move_to_here["uci"]]
+                               + _sigma(norm_by_uci[c.move_to_here["uci"]], max_visit)),
+                reverse=True,
+            )
+            cands = cands[: max(1, len(cands) // 2)]
+
+        chosen = cands[0]
+        improved = _improved_policy(root)
+        visit_dist = {uci: c.visits for uci, c in root.children.items()}
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+    return MctsResult(chosen=chosen.move_to_here, visit_distribution=visit_dist,
+                      root=root, improved_policy=improved)
 
 
 def run_mcts(
