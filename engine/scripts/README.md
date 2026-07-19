@@ -157,7 +157,9 @@ cc run backrank_check_trend.py ../lczero-server/pgns/run1 300 10 # is Black lear
 against each other and prints a pairwise score matrix + a Bradley-Terry Elo ranking
 + a chronological Elo curve — the oracle-free answer to "is the best actually beating
 its past selves?", and it surfaces the non-transitivity (A>B>C>A) the probe-suite
-curve can't. Runs on the box (nets + GPU are there).
+curve can't. Runs on the box (nets + GPU are there). Engine-mode games (the default
+via `cc ladder`) run in the fork's own selfplay tournament harness — the gate
+operating point; `--harness uci` is the legacy stateless driver (diagnostics only).
 
 ```bash
 cc ladder                              # ~6 snapshots sampled from the run dir, round-robin
@@ -233,17 +235,34 @@ command; never fatal.
 
 Unlike `cc ladder` (trainer iter-checkpoints played by Python MCTS or the fork),
 `cc champs` queries the server DB for the promotion history, gunzips the `.bin` nets
-from `networks/`, and runs them through a round-robin with the fork at the gate's
-operating point (128v). This is the GATE'S own perspective — who actually got
-promoted, who was rejected, and whether the champion pool has a strength order.
+from `networks/`, and runs them through a round-robin played in the fork's own
+selfplay **tournament mode** at the gate's operating point (128v, matchParams temps,
+per-player tree reuse) — since 07-17 literally the promotion-match harness. This is
+the GATE'S own perspective — who actually got promoted, who was rejected, and whether
+the champion pool has a strength order. (Stateless UCI driving — a different,
+White-collapsing operating point, run22.md 07-16 — survives as `--harness uci` for
+diagnostics only.)
 
-Minimum 12 games/pair for any ordering claim (4 games ≈ ±140 Elo 95% CI;
-12 ≈ ±80). The daily cron audit (`install_monitor_crons.sh`) runs at 12g/pair.
+Default 40 games/pair — the 40-game promotion-match convention (run ≤21 gate,
+run 22 panel legs), ≈ ±40 Elo/net 95% CI on a full 9-net field, enough to order
+the ~80-Elo fields the audit actually sees.
+(4 games ≈ ±140 Elo 95% CI; 12 ≈ ±80 — run 22's 12g audit came back scrambled:
+84-Elo spread with best ranked 6/8, all inside noise.) The daily cron audit
+(`install_monitor_crons.sh`) inherits the default; each pair's games run
+concurrently inside one engine process (`--parallelism`, default 32), ≈3–4h for
+the full 9-net×40g field under fleet contention (~10s/game wall measured 07-17).
 
 ```bash
-cc champs                     # log-spaced champions + 3 newest rejects, 12g/pair
-cc champs --games 24          # tighter error bars
+cc champs                     # log-spaced champions + 3 newest rejects, 40g/pair
+cc champs --games 12          # quick look (noisy: ~±80 Elo/net 95% CI)
+cc champs --pin 2 --list      # register net #2 as a PERMANENT pinned rung (pN) and exit
 ```
+
+Pins (`--pin N`, 2026-07-18): a frozen copy of net #N (`networks/pins/p<N>.bin` +
+`pins.json`, run-scoped) that every later audit of the run auto-includes — fixed
+rungs making best-vs-pN an ABSOLUTE trajectory. This replaced the retired 8-hourly
+python anchor-gauntlet **cron** (run 22 pins #2, the first promoted champion);
+`cc anchor` itself remains for on-demand absolute measurements vs random/search/seed.
 
 ### `cc compare` — cross-run anchor comparison
 
@@ -281,8 +300,10 @@ cc ssh bash /workspace/chessckers/engine/scripts/install_monitor_crons.sh
 Adds to root's crontab (idempotent — grep-guarded, no duplicates):
 
 - **04:45 daily — champs audit:**
-  `champ_ladder.py --games 12 --jsonl trainer/run1/champs_audit.jsonl`
+  `champ_ladder.py --jsonl trainer/run1/champs_audit.jsonl`
   → appends a JSONL row to `champs_audit.jsonl`, log at `/workspace/champs_cron.log`.
+  Games/pair = the script's default (40); pin a smaller `--games` in the cron line
+  if late-run game lengths make the nightly window too long.
 
 The anchor 8-hourly cron is installed by `cc fresh-run`; this script adds the
 slower daily audit that is too expensive for the 8-hourly cadence.
@@ -290,18 +311,24 @@ slower daily audit that is too expensive for the 8-hourly cadence.
 ## 5. Playing the net
 
 Play a human-vs-net game from any FEN — you pick from a numbered legal-move menu
-(no hand-typing cadence/deploy UCI), the net replies via MCTS, and the board +
-WDL eval render each ply:
+(no hand-typing cadence/deploy UCI), the net replies via the REAL lc0 fork
+(default whenever a fork build is found; the .pt auto-exports to .bin), driven
+with full game history so it keeps its tree between moves — the production
+operating point (since 07-17; the old stateless driving was White-collapsing).
+`--mcts` forces the Python PUCT opponent, which also renders WDL eval + top
+lines each ply:
 
 ```bash
-cc play --color black                # play the LIVE fleet champion (pulls its net)
-.venv/bin/python scripts/play_net.py --color white --sims 200 --device mps
+cc play --color black                # play the LIVE fleet net (pulls it, fork @128v)
+.venv/bin/python scripts/play_net.py --color white --visits 128
 .venv/bin/python scripts/play_net.py "<FEN>" --weights X.pt --color black
+.venv/bin/python scripts/play_net.py --mcts --sims 200 --device mps  # legacy opponent
 ```
 
 `--color` is the side YOU play (default black = the towers); at your turn `u`
-undoes your last move and `q` quits. To watch the net play ITSELF instead, use
-`watch_game.py` / `cc watch`.
+undoes your last move and `q` quits. Don't raise `--visits` to 800 — the fork's
+UCI mode hard-crashes there (run22.md). To watch the net play ITSELF instead,
+use `watch_game.py` / `cc watch`.
 
 ## 6. Script index
 

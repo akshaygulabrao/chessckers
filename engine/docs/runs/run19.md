@@ -162,6 +162,63 @@ scale; try fraction 0.1 or revisit pool spacing before abandoning.
   crontab + serverconfig). Trees pinned for the handoff: engine `558cc44` (monitoring) +
   `0062d33` (docs), server `46b3831` (regression panel). LR was deliberately **never
   dropped** — the intact plateau is the ground-truth fixture for detector development.
+- `07-14` **Post-conclusion LR-drop probe (the deferred plateau diagnosis) — VERDICT:
+  the plateau is DATA-side, not optimizer-side.** Run 21 paused to free the box; the
+  archived endpoint state resumed standalone at `/workspace/lr_probe/` — Adam + step
+  clock from the intact `train_state.pkl` sidecar (step 7715; NB the archive's 383M
+  `replay_buffer.pkl` is a **truncated `.tmp`** — the shutdown snapshot rename never
+  completed — so the window was REBUILT by re-ingesting chunks `training.8776–11633.gz`
+  = the exact endpoint window: 2858 games / 224,425 pos vs the endpoint's 224,400).
+  `--replay-factor 0` (a frozen buffer deadlocks the ingest throttle), publish on
+  timer instead of games; everything else production-identical (batch 1024, EMA 0.999,
+  pure-z targets). LR **1e-3 → 3e-4** (the pre-committed drop), **+3017 steps**
+  (7715→10732, ~93 min standalone ≈ +39% of the run's total optimization). Result:
+  **loss on the frozen window fell hard — value 0.178→0.065 (−63%), policy
+  2.525→2.457 — so the 1e-3 loss level WAS an optimizer noise floor… and strength did
+  not move at all**: post-net vs endpoint best #116 (endpoint `weights.bin` is
+  byte-identical to promoted #116), @128v matchParams temps via `ladder.py
+  --engine`: 48–52 on the first 100g; **pooled over 300g: 136–164 (45.3%, −33±20
+  Elo 1σ — base better at ~95% LOS)**. Zero-to-*negative*: harder fitting of the
+  frozen window slightly hurt play, the sign memorization predicts.
+  Reading: the strength-relevant content of the plateau window was already fully
+  absorbed at 1e-3; the residual loss is value-head memorization of per-position
+  outcome noise (pure-z targets between near-equal nets ≈ coin flips) plus the
+  irreducible entropy of temp-1.0 visit targets. This **refutes "drop LR at plateau"
+  as a standalone fix** (and undercuts the LR-drop decision rule's premise: the
+  800v>128v headroom is real but does NOT transmit via more optimization on
+  equilibrium data) and **redirects at the data/targets**: league+PFSP (run 21's
+  bet, now better motivated), opening diversity, **value-from-Q / q+z blend** (the
+  run-14-shelved re-test — this probe is direct evidence pure-z is the memorizable
+  dead end at equilibrium), Gumbel c_scale=0.1 targets. Capacity is NOT indicted —
+  the net absorbed the window easily. Caveat: the probe isolates the
+  absorb-from-current-data channel; a production drop also changes future game
+  generation. Artifacts: box `/workspace/lr_probe/` (nets, trainer.log, match jsons),
+  mirrored into this run's archive dir.
+- `07-14` **Chunk forensics on the plateau data (games 11000–11199) — the full start is
+  BORN +0.50 for White; temperature exonerated as the decider.** q_white at ply 0 =
+  **+0.50 ± 0.01** across games (Dirichlet barely moves it); P(final winner == sign of
+  ply-0 q) = **82%, flat through ply 10** (equals the sample's 82.5% White win rate —
+  up from 57% at cold start: dominance grows as conversion improves). **78% of decisive
+  games never see the advantage change hands**; Black's ~18% comes from late cliff
+  reversals (median ply 49, only 7% inside the 15-move temp window, 52% single-ply
+  |Δq|≥0.4 — mid-game chain shots, not temp dice; per-ply volatility 0.059 in-window vs
+  0.045 after). ~38% of White wins are rank-8 king-runs. Reading: the plateau's data
+  pathology is a **single-narrative distribution** — every game is White converting a
+  born advantage or randomly failing to; balanced two-sided positions never appear in
+  training, yet seed13 beating these nets from the same start proves skill headroom
+  exists that this data can't teach. Lowering temperature would *worsen* the monoculture
+  (more reliable conversion, fewer Black wins). Points at **balanced-opening seeding**
+  (self-play starts sampled from a q∈[−0.2,+0.2] pool, refreshed per champion) or a
+  design-level start rebalance. Also measured and rejected: encoding blind spots (stack
+  depth channels + chain waypoint masks are faithful), per-side search asymmetry (Black
+  42.5 vs White 28 legal moves but equal visit concentration/entropy). Follow-up
+  forensics (Black-learnability question): W% by era ran 83% (0–2k) → **58% (2–4k,
+  Black's skills arriving)** → 70s → 78% (endpoint — White re-adapts for good); at the
+  plateau **Black converts 92% of its clearly-winning positions** (34/37 at q<−0.5,
+  median 18 plies) vs White 85% of q>+0.7 ones — Black's bottleneck is *access* (~19%
+  of games), not conversion, and its only supply is White blunders that training keeps
+  removing. **Improvement itself destroys the training signal from this start** — the
+  plateau is an attractor, not a stage.
 
 ## Result
 
@@ -179,5 +236,11 @@ vs ≈0 measured) — motivating run 20's regression panel — and the value hea
 healthy throughout (800v beats 128v +241; best beats iter-200 71-29), so the plateau
 is optimization- or data-side, not capacity collapse. Plateau cause **deliberately left
 undiagnosed** (no LR drop): the archived series is the detector-development testbed.
+*(Post-conclusion 07-14: diagnosed via the LR-drop probe — see the last Log bullet.
+Verdict: **data-side.** The 1e-3 loss level was a real optimizer noise floor — 3e-4 on
+the frozen endpoint window cut value loss 63% — but the fitted net played dead-even-to-
+slightly-worse vs best #116 (300g: 45.3%, −33±20 Elo), so the residual loss was
+strength-irrelevant (and mildly harmful) memorization; the equilibrium data itself is
+what's exhausted.)*
 Handoff to run 20: regression panel (server `46b3831`), monitoring/alarm stack + floor
 guard (engine `558cc44`+), pre-committed decision rules in `_TEMPLATE.md`.

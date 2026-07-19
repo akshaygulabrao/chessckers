@@ -16,7 +16,7 @@
 | Start FEN | official full start (`STARTING_FEN`, `{wm:2}`) (= runs 19/20) |
 | Arch | SE-ResNet gather head, c64/b6 ~630K, tag `v5` (= runs 18–20) |
 | Optimizer | Adam, lr=1e-3 (= run 20; LR-drop rule inherited below) |
-| Policy / value targets | `visits` / pure z (`VALUE_Q_RATIO=0`) (= runs 19/20) |
+| Policy / value targets | `visits` / **z↔q blend from 07-14 resume: `VALUE_Q_RATIO=0.5`** (was pure z for the first ~301 games — flipped when the run-19 LR-probe verdict indicted pure-z as the memorizable dead end) |
 | Init | COLD random init (= runs 18–20 pairing) |
 | Gate | −20 lenient gate + regression panel (= run 20: `panel {enabled, 2, 4×5=20, −50}`) |
 | **League** | enabled, fraction 0.2, poolSize 8 + **`pfsp: true`** — probs from last-48h league win rates, `f_hard` p=2, ε=0.2 floor, cached per (best, pool), shipped `/next_game leagueProbs` → client `--league-probs` → engine inverse-CDF |
@@ -25,7 +25,7 @@
 | Key trees | engine `b0bdef7`, server `9168d59`, fork `709d060`, client `1d56ccd` |
 | Fleet box | vast `44287736` (RTX 3060 — same box as runs 18–20) |
 | Started | 2026-07-14 |
-| Status | active |
+| Status | **concluded 2026-07-15** (superseded → run 22; archived `~/chessckers-backups/run21-fullstart-c64b6-pfsp-20260715/`) |
 
 ## Hypothesis
 
@@ -62,6 +62,31 @@ difference vs run 20's uniform league at matched net count.
   (cold). Provision rsyncs carry PFSP code + `serverconfig.json pfsp: true` → PFSP
   live from t=0 (dormant until the pool exists, ~2nd–3rd promotion; probs ~uniform
   until result-bearing league games accrue — by construction, never garbage).
+- `07-14` **Fleet stopped ~21:10 box time (~2.5h in, 224 games / 3 nets / step ~283)** —
+  operator call: divert the box to the **run-19 plateau LR-drop probe** (the
+  optimization-vs-data discriminator run 19 deliberately deferred; probe entry in
+  run19.md). Clean stop: client C-c → trainer STOP-file (flushed a *complete*
+  `replay_buffer.pkl`, 156MB — warm-resumable) → tmux sessions killed. All on-disk
+  state (db, games/, networks/, trainer/run1) left intact. Crontab backed up to
+  `/workspace/crontab.run21.bak` then cleared (anchor cron + champs-audit + @reboot
+  restart lines — **restore from the backup when resuming this run**).
+- `07-14` **Resumed ~23:38 with `VALUE_Q_RATIO` 0 → 0.5** (probe verdict: the plateau is
+  data/target-side and pure-z value targets are the memorizable dead end — run19.md
+  probe bullet). Pre-flight audit of the q plumbing on real run-19 chunks: **100% of
+  examples carry `search_wdl`**, sign(q)==sign(z) 94% overall / 100% in the last 20%
+  of plies, mean q +0.99 at near-terminal STM-won positions — no wm2-style inversion;
+  trainer blends `(1−r)·z + r·q` into the WDL CE target (`_value_target`), old chunks
+  fall back to pure z. Resume: crontab restored with the @reboot line updated to
+  `VALUE_Q_RATIO=0.5`; `restart_fleet.sh` relaunch; trainer warm-resumed (snapshot:
+  50,063 pos / 301 games, Adam at step 392) and verified running `--value-q-ratio 0.5`
+  + `--base weights.pt`; client back up and serving the queued gate match. **Run 21 now
+  carries THREE deltas vs run 19** (panel + PFSP + q-blend) — attribute strength deltas
+  vs run 19, and expect the trainer's value-loss level to re-baseline upward (CE vs a
+  soft target has an entropy floor; not a regression). Notes: `restart_fleet.sh`'s
+  `POLICY_TARGET=improved` default is a **dead knob** on current trees (nothing in
+  launch_trainer/bridge/train_continuous reads it — verified on the box) — ignore it in
+  the relaunch log line. EMA quirk inherited by every warm resume: the raw (non-EMA)
+  model is never persisted, so resume snaps raw := published EMA.
 
 ## Decision rules (pre-committed — inherited from run 20 + PFSP-specific)
 
@@ -81,8 +106,26 @@ difference vs run 20's uniform league at matched net count.
   run-20's #9/#8-style cycle recurring *despite* PFSP over ≥3 audits = escalate to
   matrix cross-table / Nash-pick design (deferred idea).
 
+## Log (conclusion)
+
+- `07-15` **Concluded ~00:25 (~13h wall, most of it paused) and archived** to
+  `~/chessckers-backups/run21-fullstart-c64b6-pfsp-20260715/` (296M: db + 11-row
+  matches CSV + networks/ + games/ + pgns/ + trainer/run1 incl. a **verified-complete**
+  `replay_buffer.pkl` (416 steps / 53,241 positions / 329 games) + all logs + crontab +
+  serverconfig). Endpoint: 7 networks, 329 games, 10 matches. Superseded by **run 22**
+  (same stack + intense gate 160g/40g-legs + EMA 0.99 + publish 200 — the
+  candidate-distinguishability fixes motivated by this day's diagnosis).
+
 ## Result
 
-<active — primary reads: anchor trajectory vs run 19/20 archived jsonls (`cc
-compare`), panel-rejection-streak length vs run 20, `[league] pfsp probs` shift
-after each panel rejection, champs-audit spread/cycles.>
+**Too short to read PFSP or the q-blend — run 21 was the vehicle for the diagnosis day,
+not a data point.** Timeline: ~2.5h cold pure-z era (224 games), paused ~21:10–23:38 for
+the run-19 LR-drop probe (verdict: plateau is data-side — run19.md), resumed 23:38 with
+`VALUE_Q_RATIO=0.5` (~28 more games, 3 gate matches, #5 promoted / #6 rejected −53),
+concluded 00:25 for run 22. What it contributed: (1) proved clean pause/resume with a
+complete snapshot; (2) end-to-end verified the q-blend plumbing in production (trainer
+running `--value-q-ratio 0.5` on real chunks after the sign audit); (3) its own gate
+log (#6 vs #5 −53 between near-clone candidates) became the motivating exhibit for run
+22's distinguishability fixes (EMA 0.999 → consecutive candidates ~88% identical at
+fleet step rates). PFSP itself never woke (pool of 1–2, no result-bearing league volume)
+— its first real read moves to run 22, which carries the identical league config.

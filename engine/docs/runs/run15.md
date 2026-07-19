@@ -145,3 +145,14 @@ teacher): run 15's failure is target *sharpness* × generator *freeze*.
 4. Keep: improved policy target + pure-z value (both validated here), wm2 fix, c64/b6 arch.
 
 Backups: `~/chessckers-backups/run15-gumbelS1-20260706/` (DB, final trainer net, best #5 `.bin`).
+
+**Retro-caveat (2026-07-19, added at the run-23 pivot):** every match-based number above — the
++44/+53 promotions, the freeze at #5, the −98 @v1 → −301 @gate distill-below-teacher read and its
+as-Black concentration — predates the `ee64b19` blacks_move fix, i.e. ran through the same selfplay
+color-attribution bug whose inversion voided run 14's match narrative (confirmed run 18). Treat
+their direction and magnitude as unverified; the run-14 postmortem lists "Gumbel target+c_scale"
+among ideas shelved on bad evidence. What survives harness-independently: the c_scale=1 one-hot
+arithmetic (σ≈850 at 800 visits), the emission/decode adversarial audit, and pure-z un-blinding the
+value head (|q| 0.86→0.68). **Run 23 (`run23.md`) is the clean re-test** — Stage-1 at c_scale=0.1,
+cold, on the verifiable e8/d8 start. A replay of the run-15 nets through the fixed tournament
+harness (backups above) remains possible but was superseded by the direct re-test decision.
