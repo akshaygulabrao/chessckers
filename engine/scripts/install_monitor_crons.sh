@@ -4,7 +4,9 @@
 # Run this ON THE BOX (deploy via `cc ssh bash /path/to/install_monitor_crons.sh`).
 set -e
 
-CHAMPS_LINE='45 4 * * * cd /workspace/chessckers/engine && flock -n /tmp/champs_audit.lock nice -n 10 .venv/bin/python scripts/champ_ladder.py --games 12 --jsonl /workspace/chessckers/lczero-server/trainer/run1/champs_audit.jsonl >> /workspace/champs_cron.log 2>&1'
+# Games/pair comes from champ_ladder.py's --games default (40). If late-run game
+# lengths blow the nightly window (04:45 + ~2-4h), pin a smaller --games here.
+CHAMPS_LINE='45 4 * * * cd /workspace/chessckers/engine && flock -n /tmp/champs_audit.lock nice -n 10 .venv/bin/python scripts/champ_ladder.py --jsonl /workspace/chessckers/lczero-server/trainer/run1/champs_audit.jsonl >> /workspace/champs_cron.log 2>&1'
 CHAMPS_GUARD='champ_ladder.py'
 
 install_line() {

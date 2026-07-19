@@ -6,11 +6,16 @@ then prints a pairwise score matrix, a Bradley-Terry Elo ranking, and a
 chronological Elo curve — all in the terminal. Runs on the box (nets + GPU are
 there): `cc ladder`.
 
-Two engines pick the moves (PyVariant is always the rules authority / result caller):
-  • default — the in-repo Python PUCT MCTS (`--sims`), the reference search.
-  • `--engine` — the REAL akshay-chessckers-0 lc0 fork over UCI (`--visits`, the
-    production search + net loader). Nets convert .pt→.bin on demand; games use the
-    fleet gate's operating point (128 visits, temp 1.0) so ladder Elo tracks gate play.
+Two engines pick the moves:
+  • default — the in-repo Python PUCT MCTS (`--sims`), the reference search;
+    PyVariant applies every move and calls the result.
+  • `--engine` — the REAL akshay-chessckers-0 lc0 fork (`--visits`). Games run in
+    the fork's own selfplay TOURNAMENT mode (`--player1/--player2 --no-share-trees`,
+    matchParams temps) — the gate/production operating point, in-process with
+    per-player tree reuse. This is the only harness whose Elo tracks gate play:
+    stateless UCI driving rebuilds the tree every move, a different operating point
+    that collapses White (run22.md 07-16/17). The legacy UCI driver remains as
+    `--harness uci` for diagnostics only. Nets convert .pt→.bin on demand.
 
   cc ladder                              # ~6 snapshots sampled from the run dir, round-robin (MCTS)
   cc ladder --engine                     # SAME, but games played by the real lc0 fork
@@ -20,7 +25,8 @@ Two engines pick the moves (PyVariant is always the rules authority / result cal
   cc ladder w.pt@800 w.pt@128 --games 40 # asymmetric visits: same net, deep-vs-shallow probe
 options: --run-dir DIR  --n N  --games G  --sims S  --c-puct 1.5  --max-plies 400
          --start-fen FEN  --device auto|cuda|mps|cpu  --seed 0  --vs-best
-         --engine [PATH]  --visits N  --temperature T  --json-out PATH
+         --engine [PATH]  --harness selfplay|uci  --parallelism N  --visits N
+         --temperature T  --json-out PATH
 """
 from __future__ import annotations
 
@@ -30,6 +36,8 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 
 # Default to the live fleet run dir. lczero-server is a SIBLING of engine on the
@@ -158,6 +166,15 @@ def play_game(white, black, client, max_plies, start_fen) -> str:
             break
         state = client.make_move(state["fen"], uci)
         ply += 1
+        # Tripwire for the 07-16 class of harness bug: if the FEN fullmove counter
+        # isn't advancing, engines driven statelessly see game-ply 0 every move —
+        # temperature never decays and the whole game runs full-noise. Fail loudly
+        # rather than measure garbage (see engine/docs/runs/run22.md 07-16).
+        if ply == 6 and int(state["fen"].split("]", 1)[1].split()[4]) < 2:
+            raise SystemExit(
+                "ladder: FEN fullmove counter frozen after 6 plies — engines see "
+                "game-ply 0 forever (temperature never decays; games run full-noise). "
+                "PyVariant FEN serialization has regressed; do not trust ladder Elo.")
     return _outcome_from_state(state)
 
 
@@ -169,6 +186,74 @@ def _temp_args(temperature: float) -> list[str]:
         return [f"--temperature={temperature}", "--tempdecay-moves=10",
                 "--temp-visit-offset=-0.8"]
     return []
+
+
+# ------------------------------------------------------------- selfplay harness
+#
+# The gate's own operating point: one engine process plays the whole pair as an
+# in-process tournament (each player reuses its own tree between its moves,
+# colors alternate per game, temperature per matchParams). We only parse the
+# engine's `tournamentstatus` stream — no PyVariant in the game loop.
+
+_TSTATUS_RE = re.compile(
+    r"tournamentstatus (?P<final>final )?"
+    r"P1: \+(?P<w>\d+) -(?P<l>\d+) =(?P<d>\d+) "
+    r".*?P1-W: \+(?P<ww>\d+) -(?P<wl>\d+) =(?P<wd>\d+) "
+    r"P1-B: \+(?P<bw>\d+) -(?P<bl>\d+) =(?P<bd>\d+)")
+
+
+def parse_tournamentstatus(line: str) -> dict | None:
+    """One engine `tournamentstatus` line -> P1's aggregate + per-color W/L/D
+    counts (`final`: was this the end-of-tournament line). None for other lines.
+    Keyed on the count triplets only: the engine omits the `Elo:` field entirely
+    at 100%/0% scores, so anchoring on it would drop exactly the lopsided pairs."""
+    m = _TSTATUS_RE.search(line)
+    if not m:
+        return None
+    st = {k: int(v) for k, v in m.groupdict().items() if k != "final"}
+    st["final"] = m.group("final") is not None
+    return st
+
+
+def play_pair_selfplay(bin_i: str, bin_j: str, vis_i: int | None, vis_j: int | None,
+                       args) -> dict:
+    """Play one PAIR (P1 = bin_i) via `selfplay --player1/--player2`; return the
+    last tournamentstatus. Games run concurrently inside the one process
+    (--parallelism), so a 40-game pair is minutes, not 40 serial games."""
+    cmd = [args.engine, "selfplay", "--backend=chessckers",
+           f"--parallelism={args.parallelism}", f"--games={args.games}",
+           f"--visits={args.visits}", *_temp_args(args.temperature),
+           f"--player1.weights={bin_i}", f"--player2.weights={bin_j}",
+           "--no-share-trees"]
+    if vis_i:
+        cmd.append(f"--player1.visits={vis_i}")
+    if vis_j:
+        cmd.append(f"--player2.visits={vis_j}")
+    watchdog = shutil.which("timeout")  # a hung engine must not wedge the cron (flock)
+    if watchdog:
+        cmd = [watchdog, str(args.games * 120 + 300), *cmd]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    last = None
+    try:
+        for line in proc.stdout:
+            st = parse_tournamentstatus(line)
+            if not st:
+                continue
+            last = st
+            n = st["w"] + st["l"] + st["d"]
+            if st["final"] or (n and n % 10 == 0):
+                print(f"    g{n:>3}: +{st['w']} -{st['l']} ={st['d']}", flush=True)
+    finally:
+        proc.stdout.close()
+        rc = proc.wait()
+    if last is None:
+        raise RuntimeError(f"no tournamentstatus from selfplay (exit {rc}): {' '.join(cmd)}")
+    if not last["final"]:
+        # Engine died/timed out mid-tournament; the completed games still count.
+        print(f"    ! engine exited before 'final' (rc {rc}) — scoring "
+              f"{last['w'] + last['l'] + last['d']} completed games", flush=True)
+    return last
 
 
 def _ensure_bin(pt_path: str) -> str:
@@ -304,8 +389,18 @@ def main() -> int:
     ap.add_argument("--vs-best", action="store_true",
                     help="play everyone vs the NEWEST net only (anchor ladder), not full round-robin")
     ap.add_argument("--engine", nargs="?", const=DEFAULT_BINARY, default="",
-                    help="drive games with the REAL lc0 fork over UCI instead of Python MCTS. "
+                    help="drive games with the REAL lc0 fork instead of Python MCTS. "
                          f"Bare --engine uses the box binary ({DEFAULT_BINARY}); or pass a path.")
+    ap.add_argument("--harness", choices=("selfplay", "uci"), default="selfplay",
+                    help="engine-mode driver. 'selfplay' (default) = the fork's own "
+                         "tournament mode, the gate/production operating point — the only "
+                         "harness whose Elo is trustworthy (run22.md 07-16/17). 'uci' = "
+                         "legacy stateless per-move driving (fresh tree every move, "
+                         "White-collapsing; diagnostics only). --start-fen/--max-plies/"
+                         "--seed only apply to the uci/mcts drivers.")
+    ap.add_argument("--parallelism", type=int, default=32,
+                    help="selfplay-harness concurrent games per pair (default 32 = the "
+                         "production client)")
     ap.add_argument("--visits", type=int, default=128,
                     help="engine nodes/move in --engine mode (default 128 = the fleet gate)")
     ap.add_argument("--temperature", type=float, default=1.0,
@@ -326,20 +421,48 @@ def main() -> int:
 
     nets = discover_nets(args.run_dir, args.n, args.nets)
     labels = [lbl for lbl, _, _ in nets]
+    selfplay = bool(args.engine) and args.harness == "selfplay"
+    if selfplay and args.start_fen != DEFAULT_START_FEN:
+        raise SystemExit("ladder: the selfplay harness plays the fork's built-in start "
+                         "FEN; a custom --start-fen needs --harness uci")
     rn = _run_ident.run_name()
-    mode = (f"ENGINE (lc0 fork) {args.visits}v temp {args.temperature}" if args.engine
-            else f"mcts {args.sims} sims on {dev}")
+    mode = (f"ENGINE (lc0 fork, {args.harness} harness) {args.visits}v temp {args.temperature}"
+            if args.engine else f"mcts {args.sims} sims on {dev}")
     print(f"ladder{f' [{rn}]' if rn else ''}: {len(nets)} nets | {args.games} games/pair | {mode} | "
           f"{'vs-best' if args.vs_best else 'round-robin'}\n  nets: {', '.join(labels)}")
-    players = build_players(nets, args, dev)
-    client = PyVariantClient()
 
     n = len(nets)
     score = [[0.0] * n for _ in range(n)]
     n_games = [[0] * n for _ in range(n)]
+    wdb = [0, 0, 0]  # games won by White / drawn / won by Black, colors aside
 
     pairs = [(i, n - 1) for i in range(n - 1)] if args.vs_best else \
             [(i, j) for i in range(n) for j in range(i + 1, n)]
+
+    if selfplay:
+        bins = [p if p.endswith(".bin") else _ensure_bin(p) for _, p, _ in nets]
+        for (i, j) in pairs:
+            print(f"  {labels[i]} vs {labels[j]}:", flush=True)
+            try:
+                st = play_pair_selfplay(bins[i], bins[j], nets[i][2], nets[j][2], args)
+            except (RuntimeError, OSError) as e:
+                print(f"    ! pair failed ({e}) — skipping", flush=True)
+                continue
+            g = st["w"] + st["l"] + st["d"]
+            score[i][j] += st["w"] + 0.5 * st["d"]
+            score[j][i] += st["l"] + 0.5 * st["d"]
+            n_games[i][j] += g
+            n_games[j][i] += g
+            wdb[0] += st["ww"] + st["bl"]  # White wins: P1-as-W wins + P1-as-B losses
+            wdb[1] += st["wd"] + st["bd"]
+            wdb[2] += st["wl"] + st["bw"]
+            print(f"  {labels[i]} vs {labels[j]}: {score[i][j]:.1f}-{score[j][i]:.1f}",
+                  flush=True)
+        elo = bradley_terry_elo(score, n_games)
+        return _finish(args, labels, score, n_games, elo, wdb)
+
+    players = build_players(nets, args, dev)
+    client = PyVariantClient()
     try:
         for (i, j) in pairs:
             for g in range(args.games):
@@ -357,6 +480,7 @@ def main() -> int:
                     players[wi].restart()
                     players[bi].restart()
                     continue
+                wdb[0 if out == "white" else 1 if out == "draw" else 2] += 1
                 si = 1.0 if (out == "white") == i_white else 0.0 if out != "draw" else 0.5
                 score[i][j] += si
                 score[j][i] += 1.0 - si
@@ -370,10 +494,24 @@ def main() -> int:
             p.close()
 
     elo = bradley_terry_elo(score, n_games)
+    return _finish(args, labels, score, n_games, elo, wdb)
+
+
+def _finish(args, labels, score, n_games, elo, wdb) -> int:
+    """Shared tail for both harnesses: json-out, matrix/Elo render, color physics."""
+    gtot = sum(wdb)
+    white_share = (wdb[0] + 0.5 * wdb[1]) / gtot if gtot else 0.0
     if args.json_out:
         with open(args.json_out, "w") as f:
-            json.dump({"labels": labels, "elo": elo, "score": score, "n_games": n_games}, f)
+            json.dump({"labels": labels, "elo": elo, "score": score, "n_games": n_games,
+                       "white_share": white_share, "wdb": wdb}, f)
     render(labels, score, n_games, elo)
+    # Color physics: any harness playing the production game must roughly reproduce
+    # the fleet's White/Black balance. A big gap = measuring a different game
+    # (07-16: a frozen-fullmove bug had this at 6% White vs the fleet's ~70%).
+    print(f"\nColor physics: White wins {wdb[0]}, draws {wdb[1]}, Black wins {wdb[2]} "
+          f"→ White share {100 * white_share:.0f}% "
+          f"(compare against the fleet's self-play share; cc champs checks this)")
     return 0
 
 

@@ -7,20 +7,28 @@ gated 40-games-vs-best, stored server-side). This audits the gate itself: read
 the promotion history from the server DB, pull the crowned champion + log-spaced
 past champions + the most recent REJECTED candidates from networks/<sha> (stored
 gzipped), gunzip them to .bin, and hand them to ladder.py in --engine mode (these
-nets exist only as fork-loadable .bin — there is no .pt, so no MCTS mode).
+nets exist only as fork-loadable .bin — there is no .pt, so no MCTS mode). Games
+run in the fork's own selfplay TOURNAMENT mode — the gate's exact operating point
+(per-player tree reuse, matchParams temps), the only harness whose Elo is
+trustworthy (run22.md 07-16/17); pass `--harness uci` for the legacy stateless
+driver (diagnostics only).
 
 Field (deduped, labels show the fleet-visible net number):
   best   the server's crowned champion (training_runs.best_network_id)
   cN     past champions, log-spaced back from best (1,2,4,8,... promotions ago —
          mirrors the league pool sampling in main.go)
   rN     newest rejected candidates (did the gate wrongly turn one away?)
+  pN     PINNED champions (--pin N, once): frozen .bin copies under networks/pins/
+         that every later audit of the same run auto-includes — fixed rungs that
+         make best-vs-pN an ABSOLUTE trajectory across the run (the fork-played
+         replacement for the retired anchor-gauntlet cron's absolute scale)
 
-  cc champs                        # 5 past champs + 3 rejected + best, 12 games/pair
-  cc champs --champs 3 --cands 2 --games 20
+  cc champs                        # 5 past champs + 3 rejected + best, 40 games/pair
+  cc champs --champs 3 --cands 2 --games 12   # quick look (noisy: ~±80 Elo/net 95% CI)
   cc champs --list                 # print promotion history + field, play nothing
   cc champs --jsonl champs_audit.jsonl   # nightly cron: also append one audit row
-options: --db PATH  --run-id 1  --champs N  --cands N  --list  --since-net N  --all-runs
-         --jsonl PATH  + every ladder option passes through (--games --visits ...)
+options: --db PATH  --run-id 1  --champs N  --cands N  --games N  --list  --since-net N
+         --all-runs  --jsonl PATH  --pin NET#  + every ladder option passes through
 """
 from __future__ import annotations
 
@@ -124,24 +132,108 @@ def _materialize(net_id: int, label: str, sha_path, out_dir: str) -> str:
     return out
 
 
-def _append_audit(jsonl: str, json_out: str, run: str, best_net: int | None) -> None:
-    """Append one audit row from ladder's --json-out result — the nightly-cron trail
-    answering 'is best actually on top, and is the field spreading?'. Non-fatal: an
-    audit failure must never fail the ladder run that just played."""
+_PINS_DIR = os.path.join(_SERVER_DIR, "networks", "pins")
+_PINS_FILE = os.path.join(_PINS_DIR, "pins.json")
+
+
+def _load_pins(run_name: str) -> list[dict]:
+    """Pinned rungs registered for THIS training run. Pins from another run are
+    skipped silently (different arch — the fork would SIGTRAP loading them);
+    a pin whose frozen .bin vanished is skipped with a warning."""
+    try:
+        with open(_PINS_FILE) as f:
+            entries = json.load(f)
+    except (OSError, ValueError):
+        return []
+    live = []
+    for e in entries:
+        if e.get("run") != run_name:
+            continue
+        if not os.path.exists(e["path"]):
+            print(f"champs: ⚠ pinned {e['label']} missing on disk ({e['path']}) — skipped")
+            continue
+        live.append(e)
+    return live
+
+
+def _register_pin(n: int, num, sha_path, run_name: str) -> None:
+    """Freeze net #n as networks/pins/p<n>.bin + a pins.json entry. Idempotent.
+    The .bin is copied out of networks/<sha> ONCE at registration, so later DB
+    churn (or a net being pruned from the field) can't move the rung."""
+    try:
+        with open(_PINS_FILE) as f:
+            entries = json.load(f)
+    except (OSError, ValueError):
+        entries = []
+    if any(e["num"] == n and e.get("run") == run_name for e in entries):
+        print(f"champs: pin p{n} already registered")
+        return
+    ids = [i for i, nn in num.items() if nn == n]
+    if not ids:
+        raise SystemExit(f"champs: --pin {n}: no network #{n} in the DB")
+    path = _materialize(ids[0], f"p{n}", sha_path, _PINS_DIR)
+    entries.append({"num": n, "label": f"p{n}", "path": path, "run": run_name,
+                    "ts": time.time()})
+    with open(_PINS_FILE, "w") as f:
+        json.dump(entries, f, indent=1)
+    print(f"champs: pinned net #{n} -> {path} (auto-included in every audit of this run)")
+
+
+def _fleet_white_share(db: str) -> float | None:
+    """The fleet's own White-win share from league results (training_games.result
+    enum: 1=White won, 2=Black won, 3=draw; learner POV irrelevant here — this is
+    raw color physics). The audit harness must reproduce it: a divergence means the
+    ladder is not playing the production game (07-16: a frozen-fullmove bug had the
+    ladder at 6% White vs the fleet's ~70%). None until ≥200 result-bearing games."""
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        rows = dict(con.execute("SELECT result, COUNT(*) FROM training_games "
+                                "WHERE result IS NOT NULL GROUP BY result").fetchall())
+        con.close()
+    except sqlite3.Error:
+        return None
+    w, b, d = rows.get(1, 0), rows.get(2, 0), rows.get(3, 0)
+    tot = w + b + d
+    return (w + 0.5 * d) / tot if tot >= 200 else None
+
+
+def _audit_and_calibrate(json_out: str, args, best_net: int | None) -> None:
+    """Harness calibration (always) + audit row (with --jsonl). Calibration: the
+    ladder's White share must sit within 20pts of the fleet's league share — the
+    tripwire that would have caught the 07-16 full-noise harness bug on day one.
+    Non-fatal: a failure here must never fail the ladder run that just played."""
     try:
         with open(json_out) as f:
             res = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        print(f"champs-audit: no ladder result to audit (non-fatal): {e}")
+        return
+    ws = res.get("white_share")
+    fleet = _fleet_white_share(args.db)
+    alert = ws is not None and fleet is not None and abs(ws - fleet) > 0.20
+    if alert:
+        print(f"champs: ⚠ HARNESS CALIBRATION FAILURE — audit games ran "
+              f"{100 * ws:.0f}% White vs the fleet's {100 * fleet:.0f}%. This ladder "
+              f"is not playing the production game; DISTRUST its Elo "
+              f"(see engine/docs/runs/run22.md 07-16).")
+    if not args.jsonl:
+        return
+    try:
         labels, elos, ng = res["labels"], res["elo"], res["n_games"]
         order = sorted(range(len(labels)), key=lambda i: -elos[i])
         rank = next((k for k, i in enumerate(order, 1) if labels[i] == "best"), None)
-        row = {"ts": time.time(), "run": run, "best_net": best_net, "field": labels,
+        row = {"ts": time.time(), "run": _run_ident.run_name(args.db),
+               "best_net": best_net, "field": labels,
                "elo": [round(e, 1) for e in elos],
                "spread": round(max(elos) - min(elos), 1), "best_rank": rank,
-               "games_per_pair": max((g for r in ng for g in r), default=0)}
-        with open(jsonl, "a") as f:
+               "games_per_pair": max((g for r in ng for g in r), default=0),
+               "white_share": None if ws is None else round(ws, 3),
+               "fleet_white_share": None if fleet is None else round(fleet, 3),
+               "white_share_alert": alert}
+        with open(args.jsonl, "a") as f:
             f.write(json.dumps(row) + "\n")
         print(f"champs-audit: spread={row['spread']:.0f} best_rank={rank}/{len(labels)}"
-              f"  → {jsonl}")
+              f"  → {args.jsonl}")
     except Exception as e:  # noqa: BLE001
         print(f"champs-audit: FAILED (non-fatal): {e}")
 
@@ -155,6 +247,10 @@ def main() -> int:
                     help="log-spaced past champions to include (default 5)")
     ap.add_argument("--cands", type=int, default=3,
                     help="newest REJECTED candidates to include (default 3)")
+    ap.add_argument("--games", type=int, default=40,
+                    help="games per pairing, forwarded to ladder (default 40 = the "
+                         "40-game promotion-match convention, ~±40 Elo/net 95%% CI on "
+                         "a 9-net field; 12 left run 22's 84-Elo field inside noise)")
     ap.add_argument("--since-net", type=int, default=None,
                     help="scope to candidates with network_number >= N (default: auto-"
                          "detect the current run's bootstrap boundary)")
@@ -169,7 +265,13 @@ def main() -> int:
                     help="print promotion history + field and exit (no games)")
     ap.add_argument("--jsonl", default="",
                     help="append one audit row {ts, run, best_net, field, elo, spread, "
-                         "best_rank, games_per_pair} here after the ladder (cron mode)")
+                         "best_rank, games_per_pair, white_share, fleet_white_share, "
+                         "white_share_alert} here after the ladder (cron mode)")
+    ap.add_argument("--pin", type=int, action="append", default=[], metavar="NET#",
+                    help="register net #N as a permanent pinned rung (frozen copy under "
+                         "networks/pins/ + pins.json); registered pins auto-load on every "
+                         "later run of the same training run — combine with --list to "
+                         "register without playing")
     args, ladder_args = ap.parse_known_args()
 
     if not os.path.exists(args.db):
@@ -178,6 +280,15 @@ def main() -> int:
     if not args.all_runs:
         rows = _scope_to_current_run(rows, num, args.since_net)
     picked, rejected = _pick_field(rows, best_id, args.champs, args.cands)
+
+    run_name = _run_ident.run_name(args.db)
+    for n in args.pin:
+        _register_pin(n, num, sha_path, run_name)
+    pins = _load_pins(run_name)
+    pin_nums = {p["num"] for p in pins}
+    pins = [p for p in pins if p["num"] != num.get(best_id)]  # best IS the pin: skip
+    picked = [i for i in picked if num.get(i) not in pin_nums]
+    rejected = [i for i in rejected if num.get(i) not in pin_nums]
 
     n_prom = sum(1 for r in rows if r["passed"])
     print(f"champs: {len(rows)} gate matches, {n_prom} promotions | "
@@ -191,26 +302,27 @@ def main() -> int:
     field = ([(f"c{num[i]}", i) for i in sorted(picked, key=lambda i: num[i])]
              + [(f"r{num[i]}", i) for i in sorted(rejected, key=lambda i: num[i])]
              + [("best", best_id)])
-    print(f"  field: {', '.join(lbl for lbl, _ in field)}")
+    print(f"  field: {', '.join([p['label'] for p in pins] + [lbl for lbl, _ in field])}")
     if args.list:
         return 0
 
-    bins = [_materialize(i, lbl, sha_path, args.out_dir) for lbl, i in field]
-    json_out = ""
-    if args.jsonl:  # route ladder's result matrix through a temp --json-out for the audit
-        fd, json_out = tempfile.mkstemp(suffix=".json", prefix="champs-")
-        os.close(fd)
-        ladder_args = [*ladder_args, "--json-out", json_out]
+    bins = ([p["path"] for p in pins]  # pin labels come from the p<N>.bin filename
+            + [_materialize(i, lbl, sha_path, args.out_dir) for lbl, i in field])
+    # Always route ladder's result through a temp --json-out: the harness
+    # calibration check (color physics vs the fleet) runs even without --jsonl.
+    fd, json_out = tempfile.mkstemp(suffix=".json", prefix="champs-")
+    os.close(fd)
+    ladder_args = [*ladder_args, "--json-out", json_out]
     # Hand off to ladder's match loop / Elo / rendering: server nets are raw .bin,
     # so force engine mode with an explicit binary (never bare --engine).
-    sys.argv = ["ladder.py", *bins, "--engine", args.engine, *ladder_args]
+    sys.argv = ["ladder.py", *bins, "--engine", args.engine,
+                "--games", str(args.games), *ladder_args]
     rc = ladder.main()
-    if args.jsonl:
-        _append_audit(args.jsonl, json_out, _run_ident.run_name(args.db), num.get(best_id))
-        try:
-            os.unlink(json_out)
-        except OSError:
-            pass
+    _audit_and_calibrate(json_out, args, num.get(best_id))
+    try:
+        os.unlink(json_out)
+    except OSError:
+        pass
     return rc
 
 

@@ -2,18 +2,25 @@
 """Play a human-vs-net game of Chessckers from any FEN.
 
 YOU pick your moves from a numbered legal-move menu (so you never hand-type the
-cadence/deploy UCI); the trained net replies via PUCT MCTS. Each ply renders the
-10x10 board + the net's raw WDL eval, and on the net's turn its top lines. Loads
-ANY checkpoint via its .arch.json sidecar (V1/V2/V4), like watch_game.py.
+cadence/deploy UCI). The net replies via the REAL akshay-chessckers-0 lc0 fork
+(the default whenever a fork binary is found; .pt nets auto-export to .bin),
+driven with FULL GAME HISTORY (`position fen <start> moves ...`) so it keeps its
+search tree between its moves and sees the true game ply — the production
+operating point (run22.md 07-17; the stateless per-FEN driving used before is a
+different, White-collapsing one). `--mcts` forces the old in-repo Python PUCT
+opponent, which also renders the net's WDL eval + top lines each ply.
 
   cd engine
-  .venv/bin/python scripts/play_net.py --color black --sims 200 --device mps
+  .venv/bin/python scripts/play_net.py --color black                # vs the fork @128v
   .venv/bin/python scripts/play_net.py "<FEN>" --weights X.pt --color white
-  # or play the LIVE fleet champion in one command:  cc play --color black
+  .venv/bin/python scripts/play_net.py --mcts --sims 200 --device mps
+  # or play the LIVE fleet net in one command:  cc play --color black
 
 At your turn: type a move's number, or its raw UCI, 'u' to undo your last move,
-'q' to quit. Options: --color white|black (the side YOU play) --sims 200
---explore 0 (net root noise; 0 = strongest) --device cpu|mps --weights X.pt
+'q' to quit. Options: --color white|black (the side YOU play) --engine PATH
+--visits 128 (do NOT use 800: the fork's UCI mode hard-crashes there — run22.md)
+--mcts  --sims 200  --explore 0 (python-mode noise; 0 = strongest)
+--device cpu|mps  --weights X.pt|X.bin
 """
 from __future__ import annotations
 
@@ -32,6 +39,22 @@ from watch_game import (  # noqa: E402
     _print_net_eval,
     _resolve_weights,
 )
+from engine_uci import DEFAULT_BINARY, UciEngine  # noqa: E402  (fork opponent)
+from ladder import _ensure_bin  # noqa: E402  (.pt -> fork-loadable .bin on demand)
+
+
+def _find_fork_binary() -> str:
+    """First runnable fork build: box layout (fork is a sibling of engine), Mac
+    layout (fork is a sibling of the chessckers repo), then the box default."""
+    eng = os.path.dirname(_HERE)
+    rel = ("akshay-chessckers-0", "build", "release", "akshay-chessckers-0")
+    for p in (os.path.join(eng, "..", *rel),
+              os.path.join(eng, "..", "..", *rel),
+              DEFAULT_BINARY):
+        p = os.path.abspath(p)
+        if os.access(p, os.X_OK):
+            return p
+    return ""
 
 
 def _ask_human(legal: list[dict]) -> str | None:
@@ -80,30 +103,52 @@ def main() -> int:
                     help="checkpoint .pt (default: latest local weights/run/*; --latest for the fleet net)")
     ap.add_argument("--latest", action="store_true",
                     help="use the live fleet net (lczero-server/trainer/run1/weights.pt) if present locally")
-    ap.add_argument("--sims", type=int, default=200, help="net MCTS sims/move (>=50 recommended)")
+    ap.add_argument("--engine", default="",
+                    help="fork binary for the net's moves (default: auto-detect the "
+                         "sibling build, then the box path). Only used without --mcts.")
+    ap.add_argument("--mcts", action="store_true",
+                    help="use the in-repo Python PUCT opponent instead of the fork "
+                         "(renders WDL eval + top-line panels; --sims/--explore/--device)")
+    ap.add_argument("--visits", type=int, default=128,
+                    help="fork nodes/move (default 128 = the gate operating point; do "
+                         "NOT use 800 — the fork's UCI mode hard-crashes, run22.md)")
+    ap.add_argument("--sims", type=int, default=200, help="python-mode MCTS sims/move")
     ap.add_argument("--explore", type=float, default=0.0,
-                    help="net root Dirichlet noise fraction (0 = strongest/greedy; >0 varies its play)")
+                    help="python-mode root Dirichlet noise (0 = strongest/greedy)")
     ap.add_argument("--max-plies", type=int, default=400)
-    ap.add_argument("--device", default="cpu", help="cpu|mps|cuda (default cpu)")
+    ap.add_argument("--device", default="cpu", help="python-mode device: cpu|mps|cuda")
     args = ap.parse_args()
 
-    from chessckers_engine.checkpoints import load_scorer
-    from chessckers_engine.mcts_puct import run_mcts
     from chessckers_engine.render_board import render_board
     from chessckers_engine.selfplay_az import _outcome_from_state
     from chessckers_engine.variant_py import PyVariantClient
 
+    engine_bin = "" if args.mcts else (args.engine or _find_fork_binary())
+    if not args.mcts and not engine_bin:
+        print("(no fork binary found — falling back to the Python MCTS opponent)")
+
     model = weights = None
     last_err: Exception | None = None
-    for cand in _resolve_weights(args.weights, args.latest):  # freshest first
-        try:
-            model = load_scorer(cand).to(args.device).eval()
-            weights = cand
-            break
-        except Exception as e:  # noqa: BLE001 — try the next durable candidate
-            last_err = e
-    if model is None:
-        raise SystemExit(f"could not load any checkpoint; last error: {last_err}")
+    if engine_bin:
+        for cand in _resolve_weights(args.weights, args.latest):  # freshest first
+            try:
+                weights = cand if cand.endswith(".bin") else _ensure_bin(cand)
+                break
+            except Exception as e:  # noqa: BLE001 — try the next durable candidate
+                last_err = e
+        if weights is None:
+            raise SystemExit(f"could not resolve a net .bin; last error: {last_err}")
+    else:
+        from chessckers_engine.checkpoints import load_scorer
+        for cand in _resolve_weights(args.weights, args.latest):  # freshest first
+            try:
+                model = load_scorer(cand).to(args.device).eval()
+                weights = cand
+                break
+            except Exception as e:  # noqa: BLE001 — try the next durable candidate
+                last_err = e
+        if model is None:
+            raise SystemExit(f"could not load any checkpoint; last error: {last_err}")
 
     you = args.color
     net_color = "white" if you == "black" else "black"
@@ -111,43 +156,79 @@ def main() -> int:
     os.environ["CHESSCKERS_START_FEN"] = args.fen  # new_game() reads this
     client = PyVariantClient()
     state = client.new_game()
-    print(f"weights: {weights}\nYOU play: {you} | net: {net_color} | sims: {args.sims} | "
-          f"device: {args.device} | explore: {args.explore:.0%}\n")
+    eng = None
+    if engine_bin:
+        eng = UciEngine(weights, binary=engine_bin, visits=args.visits)
+        eng.new_game()
+        opp = f"lc0 fork @{args.visits}v, history-driven ({engine_bin})"
+    else:
+        opp = f"python MCTS {args.sims} sims on {args.device} | explore {args.explore:.0%}"
+    print(f"weights: {weights}\nYOU play: {you} | net: {net_color} | opponent: {opp}\n")
 
     history = [state]  # FEN-state stack for undo
+    moves: list[str] = []  # UCI history from args.fen (fork driving + undo, both modes)
     ply = 0
-    while not state.get("status") and ply < args.max_plies:
-        legal = state.get("legalMoves") or []
-        if not legal:
-            break
-        mover = state["turn"]
-        print(f"\n=== ply {ply + 1} — {mover} to move"
-              + (" (YOU)" if mover == you else " (net)") + " ===")
-        print(render_board(state["fen"]))
-        if state.get("check"):
-            print("  ** CHECK **")
-        _print_net_eval(model, state["fen"], mover, args.device)
-
-        if mover == you:
-            mv = _ask_human(legal)
-            if mv is None:
-                print("bye.")
-                return 0
-            if mv == "UNDO":
-                state, ply = _undo(history, you)
-                continue
-            state = client.make_move(state["fen"], mv)
-        else:
-            result = run_mcts(state, client, model, n_sims=args.sims, c_puct=1.5,
-                              dirichlet_alpha=alpha, dirichlet_eps=args.explore)
-            _print_analysis(mover, result, args.sims)
-            chosen = result.chosen
-            if chosen is None:
+    try:
+        while not state.get("status") and ply < args.max_plies:
+            legal = state.get("legalMoves") or []
+            if not legal:
                 break
-            print(f"  >> net plays: {chosen['uci']}")
-            state = client.make_move(state["fen"], chosen["uci"])
-        history.append(state)
-        ply += 1
+            mover = state["turn"]
+            print(f"\n=== ply {ply + 1} — {mover} to move"
+                  + (" (YOU)" if mover == you else " (net)") + " ===")
+            print(render_board(state["fen"]))
+            if state.get("check"):
+                print("  ** CHECK **")
+            if model is not None:
+                _print_net_eval(model, state["fen"], mover, args.device)
+
+            if mover == you:
+                mv = _ask_human(legal)
+                if mv is None:
+                    print("bye.")
+                    return 0
+                if mv == "UNDO":
+                    state, ply = _undo(history, you)
+                    del moves[len(history) - 1:]  # keep the UCI history aligned
+                    continue
+                state = client.make_move(state["fen"], mv)
+                moves.append(mv)
+            elif eng is not None:
+                try:
+                    mv = eng.bestmove(args.fen, moves=moves)
+                except RuntimeError as e:
+                    # Intermittent fork crash: full-history driving makes this
+                    # lossless — respawn and replay the same game.
+                    print(f"  (engine died — restarting: {str(e).splitlines()[0]})")
+                    eng.restart()
+                    eng.new_game()
+                    mv = eng.bestmove(args.fen, moves=moves)
+                if mv is None:
+                    break
+                if mv not in {m["uci"] for m in legal}:
+                    raise SystemExit(
+                        f"fork played {mv!r} at ply {ply + 1}, which PyVariant says is "
+                        "illegal — rules-parity bug; capture this FEN + history and "
+                        "run cc verify-chunks")
+                print(f"  >> net plays: {mv}")
+                state = client.make_move(state["fen"], mv)
+                moves.append(mv)
+            else:
+                from chessckers_engine.mcts_puct import run_mcts
+                result = run_mcts(state, client, model, n_sims=args.sims, c_puct=1.5,
+                                  dirichlet_alpha=alpha, dirichlet_eps=args.explore)
+                _print_analysis(mover, result, args.sims)
+                chosen = result.chosen
+                if chosen is None:
+                    break
+                print(f"  >> net plays: {chosen['uci']}")
+                state = client.make_move(state["fen"], chosen["uci"])
+                moves.append(chosen["uci"])
+            history.append(state)
+            ply += 1
+    finally:
+        if eng is not None:
+            eng.close()
 
     print("\n" + render_board(state["fen"]))
     status = state.get("status")

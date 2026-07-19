@@ -92,17 +92,29 @@ class UciEngine:
         """Clear the search tree — call once per game before the first position."""
         self._send("ucinewgame")
 
-    def bestmove(self, fen: str) -> str | None:
-        """Search `fen` for `visits` nodes; return the fork's chosen UCI move, or
-        None if the engine reports no move (`bestmove (none)`).
+    def bestmove(self, fen: str, moves: list[str] | None = None) -> str | None:
+        """Search for `visits` nodes; return the fork's chosen UCI move, or None
+        if the engine reports no move (`bestmove (none)`). Two driving modes:
 
-        Clears the tree (`ucinewgame`) before EVERY search: the fork has an
-        intermittent SIGSEGV in its tree-REUSE path (Edge::GetMove race — the class
-        the selfplay `--no-share-trees` note avoids), and carrying the prior move's
-        subtree in UCI mode trips it. Fresh-tree-per-move also gives every position a
-        full N-node search, which is what a fixed-budget ladder wants anyway."""
-        self._send("ucinewgame")
-        self._send(f"position fen {fen}")
+        • ``moves=None`` — STATELESS: clears the tree (`ucinewgame`) and searches
+          the bare FEN. Fresh-tree-per-move is a NON-production operating point
+          (run22.md 07-16: it collapses White) — kept only for the legacy ladder
+          `--harness uci`. The per-search `ucinewgame` also sidesteps an
+          intermittent SIGSEGV seen in the UCI tree-reuse path.
+
+        • ``moves=[...]`` — HISTORY: sends ``position fen <start> moves ...`` so
+          the fork sees the true game ply (temperature decay correct) and can
+          reuse its own tree across its moves — the production-like operating
+          point for interactive play (play_net.py). The caller keeps the FULL
+          UCI history from the start FEN and resends it every call, which makes
+          a crash lossless: `restart()` + the same call replays the game."""
+        if moves is None:
+            self._send("ucinewgame")
+            self._send(f"position fen {fen}")
+        elif moves:
+            self._send(f"position fen {fen} moves {' '.join(moves)}")
+        else:
+            self._send(f"position fen {fen}")
         self._send(f"go nodes {self.visits}")
         parts = self._read_until("bestmove").split()
         mv = parts[1] if len(parts) > 1 else "(none)"

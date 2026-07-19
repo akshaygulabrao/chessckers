@@ -89,3 +89,23 @@ def test_state_copy_is_independent():
     copy = state.copy()
     copy.stacks[chess.A6] = "S"  # mutate the copy
     assert state.stacks[chess.A6] == "s"  # original untouched
+
+
+def test_fullmove_counter_advances_as_black_moves():
+    """External engines derive game ply from the FEN fullmove field; when it froze
+    at 1, the lc0 fork's temperature never decayed under stateless UCI driving and
+    every ladder game ran full-noise (run22.md 2026-07-16). Guard the tick: Black
+    completing a move advances the counter, White's sub-moves don't."""
+    from chessckers_engine.variant_py import PyVariantClient
+
+    client = PyVariantClient()
+    state = client.new_game()
+
+    def fullmove(s):
+        return int(s["fen"].split("]", 1)[1].split()[4])
+
+    assert fullmove(state) == 1
+    for _ in range(6):
+        state = client.make_move(state["fen"], state["legalMoves"][0]["uci"])
+    # 6 plies from the {wm:2} start = W,W,B,W,B,W -> two completed Black moves.
+    assert fullmove(state) == 3

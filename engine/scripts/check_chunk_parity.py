@@ -24,15 +24,23 @@ from chessckers_engine.variant_py import PyVariantClient
 
 def _norm(fen: str) -> str:
     """Canonicalize a FEN for transition comparison by blanking the en-passant
-    field. En passant is disabled in this variant (board.cc kPawnMask=0, no ep
-    capture), but PyVariant is built on python-chess, which still records an ep
-    target square (e.g. g3) after a White pawn double-step while the fork records
-    '-'. That field is semantically dead here, so comparing it would spuriously
-    flag every White double-step. Board/overlay/turn/castling/clocks stay strict —
-    those are where a real illegal-move divergence (e.g. the ply-75 bug) shows up."""
+    field and the move counters. En passant is disabled in this variant (board.cc
+    kPawnMask=0, no ep capture), but PyVariant is built on python-chess, which
+    still records an ep target square (e.g. g3) after a White pawn double-step
+    while the fork records '-'. The halfmove/fullmove counters are likewise
+    semantically dead for "which move connects position i to i+1" (no 50-move
+    rule; fullmove is derivable) and the two writers disagree: the fork's chunk
+    FENs freeze fullmove at 1, while PyVariant ticks it on Black moves (fixed
+    2026-07-16 for engine temp-decay) — a strict compare would spuriously flag
+    every Black move. Board/overlay/turn/castling stay strict — those are where
+    a real illegal-move divergence (e.g. the ply-75 bug) shows up."""
     head, _, rest = fen.partition(" ")  # head = '<board>[<overlay>]'
     parts = rest.split()
-    if len(parts) >= 3:  # [turn, castling, ep, halfmove, fullmove, {ckstate}?]
+    if len(parts) >= 5:  # [turn, castling, ep, halfmove, fullmove, {ckstate}?]
+        parts[2] = "-"
+        parts[3] = "0"
+        parts[4] = "1"
+    elif len(parts) >= 3:
         parts[2] = "-"
     return head + " " + " ".join(parts)
 

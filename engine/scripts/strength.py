@@ -6,6 +6,9 @@ with the FAST C++ engine and records W-L-D + the promote/reject verdict in the D
 `matches` table (a 40-game match takes ~1 min). This just READS those rows and prints
 a table — per gate match: candidate net#, opponent (best) net#, W-L-D, Elo (the gate's
 calcElo), PROMOTED/rejected — plus the running cumulative Elo over promotions.
+Regression-panel legs (run 20+: candidate vs past champions, pass = calcElo above
+`matches.panel.threshold`) print dim + indented under their gate match, so a reject
+whose main Elo passed −20 is self-explanatory (a panel leg regressed).
 
 Instant (one read-only DB query), and it's the engine's real strength signal — unlike
 the slow Python `cc gauntlet`, which replays games through PyVariant MCTS and starves
@@ -13,6 +16,7 @@ on a box that's busy self-playing. Use `cc gauntlet` only for occasional deep of
 checks (fleet paused).
 """
 import argparse
+import json
 import math
 import os
 import sqlite3
@@ -61,10 +65,29 @@ def main() -> int:
     num = {r["id"]: r["network_number"]
            for r in con.execute("SELECT id, network_number FROM networks")}
     rows = con.execute(
-        "SELECT candidate_id, current_best_id, wins, losses, draws, passed "
+        "SELECT id, candidate_id, current_best_id, wins, losses, draws, passed "
         "FROM matches WHERE done = 1 AND test_only = 0 AND deleted_at IS NULL "
         "ORDER BY id").fetchall()
+    # Regression-panel legs (run 20+): test_only rows tied to their gate match via
+    # panel_parent_id. A leg's own `passed` flag is never set by the server — its
+    # verdict is calcElo vs the panel threshold. Older DBs lack the column entirely.
+    legs = {}
+    try:
+        for leg in con.execute(
+                "SELECT panel_parent_id, current_best_id, wins, losses, draws, done "
+                "FROM matches WHERE test_only = 1 AND panel_parent_id != 0 "
+                "AND deleted_at IS NULL ORDER BY id"):
+            legs.setdefault(leg["panel_parent_id"], []).append(leg)
+    except sqlite3.OperationalError:
+        pass
     con.close()
+
+    panel_thr = -50.0
+    try:
+        with open(os.path.join(_SERVER_DIR, "serverconfig.json")) as f:
+            panel_thr = float(json.load(f)["matches"]["panel"]["threshold"])
+    except Exception:  # noqa: BLE001
+        pass
 
     if not rows:
         print("cc strength: no completed gate matches yet "
@@ -134,10 +157,31 @@ def main() -> int:
                    else "\033[31mreject \033[0m")
         print(f"  {cand:>5} {best:>8}  {wld:>9}  {e:>+5.0f}   {verdict}  "
               f"{cum_at[start + i]:>+7.0f}")
+        for leg in legs.get(r["id"], ()):
+            opp = num.get(leg["current_best_id"], f"id{leg['current_best_id']}")
+            label = f"└ vs {opp}"
+            ln = leg["wins"] + leg["losses"] + leg["draws"]
+            if ln == 0:
+                note = ("skipped (verdict already sealed)" if leg["done"]
+                        else "queued")
+                print(f"  {'':>5} \033[2m{label:>8}  {'—':>9}  {'':>5}   "
+                      f"panel {note}\033[0m")
+                continue
+            le = _elo((leg["wins"] + 0.5 * leg["draws"]) / ln)
+            lwld = f"{leg['wins']}-{leg['losses']}-{leg['draws']}"
+            tag = (f"\033[31mpanel FAIL (≤{panel_thr:g})\033[0m" if le <= panel_thr
+                   else "\033[2mpanel ok\033[0m")
+            running = "" if leg["done"] else " \033[33m(running)\033[0m"
+            print(f"  {'':>5} \033[2m{label:>8}  {lwld:>9}  {le:>+5.0f}\033[0m   "
+                  f"{tag}{running}")
     print(f"\n  cumulative Elo over promotions: {cum_at[-1]:+.0f}  "
           f"(approx; sums each promoted match's calcElo)")
     print("  Elo<0 promoted = the lenient gate (calcElo>-20) let a slightly-worse net "
           "through;\n  sustained drift is what the regression-ladder follow-on would catch.")
+    if any(legs.get(r["id"]) for r in shown):
+        print(f"  reject with a passing main Elo = a panel leg (vs a past champion) came "
+              f"in ≤{panel_thr:g};\n  a 'skipped' leg never played — an earlier leg had "
+              f"already sealed the verdict.")
     return 0
 
 

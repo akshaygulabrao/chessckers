@@ -19,7 +19,10 @@ Anchors (--anchors, comma list):
 
 Run it every ~10 published nets with the SAME --games/--sims/--temperature, and
 the appended JSONL history (--out, on by default) becomes the run's strength
-trajectory. Each row records the operating point so mixed histories are auditable.
+trajectory. Each row records the operating point (incl. start FEN + ply cap) and,
+per anchor, the current net's W-D-L split by color and the ply-cap truncation
+count — at a color-imbalanced start the aggregate score alone hides which side
+the points come from.
 
 The history WATCHES ITSELF (the 8-hourly cron must fire alarms, not grow a file
 nobody reads): each row records the fleet's best net number (best_net, from the
@@ -657,31 +660,46 @@ def main() -> int:
     for anchor in anchors:
         cur_player = NetPlayer(cur_player_name, cur_model, args.sims, args.c_puct,
                                args.temperature, args.temp_plies)
-        w = d = l = 0
-        for gi in range(budgets.get(anchor.name, args.games)):
+        as_w, as_b = [0, 0, 0], [0, 0, 0]  # current net's [w, d, l] as White / as Black
+        a_trunc = 0
+        n_games = budgets.get(anchor.name, args.games)
+        for gi in range(n_games):
             cur_white = gi % 2 == 0
             pw, pb = (cur_player, anchor) if cur_white else (anchor, cur_player)
             out, trunc = play_game(pw, pb, client, args.max_plies, args.start_fen)
             n_trunc += trunc
+            a_trunc += trunc
+            side = as_w if cur_white else as_b
             if out == "draw":
-                d += 1
+                side[1] += 1
             elif (out == "white") == cur_white:
-                w += 1
+                side[0] += 1
             else:
-                l += 1
+                side[2] += 1
+            # per-game heartbeat: at high --sims a game runs many minutes and the
+            # per-anchor summary only lands after the full budget — silence reads as a hang
+            res = "draw" if out == "draw" else ("win" if (out == "white") == cur_white else "LOSS")
+            print(f"    [{anchor.name}] g{gi + 1:>2}/{n_games}: as {'W' if cur_white else 'B'} → "
+                  f"{res}{' (ply-cap)' if trunc else ''}"
+                  f"   as W {as_w[0]}-{as_w[1]}-{as_w[2]} | as B {as_b[0]}-{as_b[1]}-{as_b[2]}",
+                  flush=True)
+        w, d, l = (as_w[0] + as_b[0], as_w[1] + as_b[1], as_w[2] + as_b[2])
         ng = w + d + l
         sc = (w + 0.5 * d) / ng if ng else 0.0
         lo, hi = _wilson(sc, ng)
-        rows.append((anchor.name, w, d, l, sc, lo, hi))
+        rows.append((anchor.name, w, d, l, sc, lo, hi, as_w, as_b, a_trunc))
         print(f"  vs {anchor.name:>8}: {w}-{d}-{l}  ({100 * sc:.0f}%)  "
+              f"as W {as_w[0]}-{as_w[1]}-{as_w[2]} / as B {as_b[0]}-{as_b[1]}-{as_b[2]}"
+              f"{f'  ({a_trunc} ply-capped)' if a_trunc else ''}  "
               f"Elo {_elo(sc):+.0f} [{_elo(lo):+.0f}, {_elo(hi):+.0f}] 95%", flush=True)
 
     wlbl = max(6, max(len(r[0]) for r in rows))
-    print(f"\n  {'anchor':>{wlbl}}   W-D-L    cur%   Elo±  (95% CI)")
-    print("  " + "─" * (wlbl + 40))
-    for lbl, w, d, l, sc, lo, hi in rows:
+    print(f"\n  {'anchor':>{wlbl}}   W-D-L    cur%   Elo±  (95% CI)      as White | as Black  trunc")
+    print("  " + "─" * (wlbl + 66))
+    for lbl, w, d, l, sc, lo, hi, as_w, as_b, tr in rows:
         print(f"  {lbl:>{wlbl}}  {w:>2}-{d}-{l:<2}  {100 * sc:>4.0f}%  {_elo(sc):>+5.0f}  "
-              f"[{_elo(lo):+.0f}, {_elo(hi):+.0f}]")
+              f"[{_elo(lo):+.0f}, {_elo(hi):+.0f}]"
+              f"  {as_w[0]:>2}-{as_w[1]}-{as_w[2]:<2} | {as_b[0]:>2}-{as_b[1]}-{as_b[2]:<2}  {tr:>3}")
     total_g = sum(w + d + l for _, w, d, l, *_ in rows)
     if n_trunc:
         frac = 100 * n_trunc / total_g if total_g else 0
@@ -697,11 +715,13 @@ def main() -> int:
             "games": args.games, "sims": args.sims,
             "temperature": args.temperature, "temp_plies": args.temp_plies,
             "search_time": args.search_time,
+            "start_fen": args.start_fen, "max_plies": args.max_plies,
             "anchors": [
                 {"anchor": lbl, "w": w, "d": d, "l": l, "score": round(sc, 4),
                  "elo": round(_elo(sc), 1),
-                 "elo_lo": round(_elo(lo), 1), "elo_hi": round(_elo(hi), 1)}
-                for lbl, w, d, l, sc, lo, hi in rows
+                 "elo_lo": round(_elo(lo), 1), "elo_hi": round(_elo(hi), 1),
+                 "as_white": as_w, "as_black": as_b, "trunc": tr}
+                for lbl, w, d, l, sc, lo, hi, as_w, as_b, tr in rows
                 if w + d + l > 0  # a 0-game anchor would poison the score history
             ],
         }

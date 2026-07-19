@@ -28,6 +28,7 @@ scripts to run on it.
   cc fresh-run [--run-name=X] [--arch=v5] [--parallelism=32] [--base=<box-net.pt>]
                [--c-filters=N] [--n-blocks=N] [--se-ratio=N]
                [--policy-target=visits|improved] [--value-q-ratio=R]
+               [--ema-decay=D] [--publish-games=N]
                               # provision + launch a fresh training run from scratch
 
 cc games — render the network's actual self-play games (newest by default):
@@ -267,6 +268,9 @@ def cmd_fresh_run(args):
     # Training-target knobs: empty = defer to launch_trainer.sh defaults (visits / 0.5).
     policy_target = ""
     value_q_ratio = ""
+    # Candidate-distinguishability knobs (run 22+): empty = launch_trainer.sh defaults.
+    ema_decay = ""
+    publish_games = ""
     for a in args:
         if a.startswith("--run-name="):
             run_name = a.split("=", 1)[1]
@@ -286,6 +290,10 @@ def cmd_fresh_run(args):
             policy_target = a.split("=", 1)[1]
         elif a.startswith("--value-q-ratio="):
             value_q_ratio = a.split("=", 1)[1]
+        elif a.startswith("--ema-decay="):
+            ema_decay = a.split("=", 1)[1]
+        elif a.startswith("--publish-games="):
+            publish_games = a.split("=", 1)[1]
 
     dims = f" c{c_filters}/b{n_blocks}" if (c_filters or n_blocks) else ""
     tgt = f"  target={policy_target}" if policy_target else ""
@@ -377,6 +385,7 @@ def cmd_fresh_run(args):
         f"{k}={v} " for k, v in (
             ("C_FILTERS", c_filters), ("N_BLOCKS", n_blocks), ("SE_RATIO", se_ratio),
             ("POLICY_TARGET", policy_target), ("VALUE_Q_RATIO", value_q_ratio),
+            ("EMA_DECAY", ema_decay), ("PUBLISH_GAMES", publish_games),
         ) if v
     )
     sh_ok(

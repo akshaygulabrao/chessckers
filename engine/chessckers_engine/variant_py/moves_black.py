@@ -1057,6 +1057,12 @@ def apply_black_move_known(state: State, move: dict[str, Any]) -> State:
     # when pieces are removed, so restore the original rights explicitly.
     new_state.board.castling_rights = saved_castling
     new_state.board.turn = chess.WHITE
+    # Standard FEN semantics: the fullmove number advances when Black completes a
+    # move. Black moves bypass board.push() (overlay apply), so python-chess never
+    # ticks it — leaving every FEN at "move 1", which external engines read as
+    # game-ply 0 (the lc0 fork derives GetGamePly from this field; a frozen counter
+    # pins its temperature decay at move 0, i.e. full-noise games over UCI).
+    new_state.board.fullmove_number += 1
     # Rank-8 counter (#3): a check from Black at any point resets it to 0. Only
     # worth probing when the counter is actually running (skips the cost normally).
     if new_state.rank8_count:
