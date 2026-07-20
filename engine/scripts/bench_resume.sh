@@ -36,6 +36,10 @@ BASE_ENV="ARCH_VERSION=v5 C_FILTERS=64 N_BLOCKS=6 SE_RATIO=8 POLICY_TARGET=impro
 PCR_ENV="PCR_FULL_PROB=0.25 PCR_FAST_VISITS=100"
 log(){ echo "[resume $(date -u '+%m-%d %H:%M')] $*"; }
 
+# Liveness heartbeat BEFORE any early exit: the 07-20 flock wedge was invisible
+# because a blocked fire exits silently — `stat` this file to see the cron is alive.
+date -u '+%F %T' > "$WS/bench_resume.heartbeat" 2>/dev/null || true
+
 # A watcher already driving? Nothing to do.
 pgrep -f 'mate_benc[h].py --trials' >/dev/null && exit 0
 
