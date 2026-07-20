@@ -23,13 +23,17 @@ scripts to run on it.
   cc restart                    # relaunch the whole fleet (warm-resume) if down — idempotent
   cc play [play args]           # play a human-vs-net game against the latest fleet net
   cc lengths [--window=50]      # average game length over training (survival→mate curve)
+  cc bench [args]               # time-to-mate benchmark: report + comparison table;
+                                #   --watch arms the AUTO-ENDING watcher (stops the run
+                                #   at Black ≥90% of trailing 1k games); --stop disarms
   cc backup                     # pull irreplaceable telemetry off the box to telemetry/<run>/
   cc compare [file...]          # compare anchor_gauntlet.jsonl runs — sparklines + alignment table
   cc fresh-run [--run-name=X] [--arch=v5] [--parallelism=32] [--base=<box-net.pt>]
                [--c-filters=N] [--n-blocks=N] [--se-ratio=N]
                [--policy-target=visits|improved] [--value-q-ratio=R]
-               [--ema-decay=D] [--publish-games=N]
+               [--ema-decay=D] [--publish-games=N] [--bench]
                               # provision + launch a fresh training run from scratch
+                              # (--bench: arm the auto-ending mate benchmark watcher)
 
 cc games — render the network's actual self-play games (newest by default):
   cc games                      # newest recorded game, board move-by-move (no net needed)
@@ -276,6 +280,9 @@ def cmd_fresh_run(args):
     # MUST be equals-joined (e.g. --pcr-full-prob=0.25); space-separated is silently ignored.
     pcr_full_prob = ""
     pcr_fast_visits = ""
+    # --bench: after launch, arm the mate_bench watcher (auto-ends the run at the
+    # Black-share threshold and stamps time-to-mate into BENCH_RESULTS.jsonl).
+    bench = False
     for a in args:
         if a.startswith("--run-name="):
             run_name = a.split("=", 1)[1]
@@ -303,6 +310,8 @@ def cmd_fresh_run(args):
             pcr_full_prob = a.split("=", 1)[1]
         elif a.startswith("--pcr-fast-visits="):
             pcr_fast_visits = a.split("=", 1)[1]
+        elif a == "--bench":
+            bench = True
 
     dims = f" c{c_filters}/b{n_blocks}" if (c_filters or n_blocks) else ""
     tgt = f"  target={policy_target}" if policy_target else ""
@@ -437,10 +446,17 @@ def cmd_fresh_run(args):
         f"( crontab -l 2>/dev/null | grep -v restart_fleet.sh; echo '{cron_line}' ) | crontab -; "
         f"echo '[cron] @reboot auto-restart installed'")
 
+    if bench:
+        print("\n--- arming mate-bench watcher (auto-ends the run at Black ≥90%) ---")
+        _push_bench(box)
+        _arm_bench(box, [])
+
     print("\n=== fresh-run complete ===")
     print(f"  ssh -p {port} root@{host} -t tmux attach -t cc     # server + trainer")
     print(f"  ssh -p {port} root@{host} -t tmux attach -t cc-client  # self-play")
     print("  cc status                                           # fleet dashboard")
+    if bench:
+        print("  cc bench                                            # time-to-mate status")
     return 0
 
 
@@ -595,6 +611,59 @@ def cmd_verify_chunks(args):
     print(f"# scanning {len(locals_)} chunk(s) for oracle-illegal moves ...", flush=True)
     checker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_chunk_parity.py")
     return subprocess.call([sys.executable, checker, *locals_])
+
+
+def _push_bench(box):
+    """Sync the LOCAL mate_bench.py to the box before running it — the box engine
+    tree is an rsync copy (not git), so pushing keeps the instrument in lockstep
+    with this repo (instrument-calibration discipline)."""
+    local = os.path.join(LOCAL_ENGINE, "scripts", "mate_bench.py")
+    with open(local, "rb") as f:
+        src = f.read()
+    subprocess.run(
+        _ssh(box) + [f"cat > {ENGINE_DIR}/scripts/mate_bench.py"],
+        input=src, check=True,
+    )
+
+
+def _arm_bench(box, extra):
+    """Start/replace the cc-bench tmux watcher on the box (auto-ends the run).
+    Bench args are simple space-separated flags/numbers — no shell-quoting here
+    (they sit inside the single-quoted tmux send-keys string)."""
+    rest = " ".join(["--watch"] + [a for a in extra if a != "--watch"])
+    cmd = (
+        f"tmux kill-session -t cc-bench 2>/dev/null; sleep 0.5; "
+        f"tmux new-session -d -s cc-bench -n bench -c {ENGINE_DIR} && "
+        f"tmux send-keys -t cc-bench "
+        f"'cd {ENGINE_DIR} && .venv/bin/python scripts/mate_bench.py {rest} "
+        f"2>&1 | tee -a /workspace/chessckers/bench_watch.log' C-m && "
+        f"echo '[cc bench] watcher armed: tmux cc-bench, log /workspace/chessckers/bench_watch.log'"
+    )
+    return subprocess.call(_ssh(box) + [cmd])
+
+
+def cmd_bench(args):
+    """Time-to-mate benchmark (mate_bench.py on the box).
+
+      cc bench                  # report: clock, current Black share, exact crossing
+                                #   if crossed, + the cross-run comparison table
+      cc bench --watch [...]    # arm the AUTO-ENDING watcher (tmux cc-bench): at
+                                #   Black ≥ threshold of the trailing window it stamps
+                                #   BENCH_RESULTS.jsonl and stops client + trainer
+                                #   (server stays up; `cc restart` resumes)
+      cc bench --stop           # disarm the watcher (fleet untouched)
+    Passthrough: --threshold F --window N --max-hours H --interval S --no-stop.
+    """
+    box = resolve()
+    _push_bench(box)
+    if "--stop" in args:
+        return subprocess.call(_ssh(box) + [
+            "tmux kill-session -t cc-bench 2>/dev/null; "
+            "pkill -f 'mate_benc[h].py --watch' 2>/dev/null; "
+            "echo '[cc bench] watcher disarmed (fleet untouched)'"])
+    if "--watch" in args:
+        return _arm_bench(box, args)
+    return _run_on_box("mate_bench.py", ["--report", *args])
 
 
 _TELEMETRY_ROOT = os.path.join(os.path.dirname(LOCAL_ENGINE), "telemetry")
@@ -935,6 +1004,8 @@ def main():
         print("# (Or just use `cc fresh-run`, which does all of the above in one command.)")
     elif cmd == "lengths":
         return _run_on_box("game_lengths.py", args)
+    elif cmd == "bench":
+        return cmd_bench(args)
     elif cmd == "backup":
         return cmd_backup(args)
     elif cmd == "compare":

@@ -20,8 +20,8 @@
 | Gate / publish / EMA / league | 160g gate @ −20 + panel, publish 400, EMA 0.99, league+PFSP on (= runs 22/23) |
 | Key changes | fork (uncommitted, chessckers-port): `tournament.cc/.h` PCR flags+validation+fast dicts, `game.cc/.h` per-move draw + fast search path + conditional record, `selfplay.hpp`/`chunk.hpp` per-record `ply`/`total_plies` (**moves_left density fix** — `n−i` was records-remaining; now true ply distance, byte-identical for dense games). Server (uncommitted): bootstrap env-driven PCR trainParams append; `launch_server.sh` env passthrough. Engine (uncommitted): `cc.py` `--pcr-full-prob=`/`--pcr-fast-visits=` knobs. Box scratch-build verified BUILD_OK w/ CUDA trunk pre-launch. |
 | Fleet box | vast `44287736` (RTX 3060), same box; server `http://23.227.184.228:30153` |
-| Started | <stamp from `cc status` clock line at launch> |
-| Status | **staged — launch via `./run.sh` (archive run 23 → fresh-run)** |
+| Started | 2026-07-20 06:32 UTC (`training_runs.created_at` clock anchor) |
+| Status | **fleet auto-ended by `mate_bench` 2026-07-20 14:54 UTC** (benchmark stamped MATE @3h38m; trainer had died 10:37; conclusion/Result + archive pending) |
 
 ## Hypothesis
 
@@ -97,6 +97,26 @@ wall-clock still wins is fine; both losing = PCR hurts at this start.
   records/game ≈ 0.20-0.25 of plies (band's low edge ✓), improved_policy present. Note for the
   Result: White converting via the rank-8 rule appears in early data ({r8:N} fens) — a legal
   win path the e8/d8 analysis should watch, not a symptom.
+
+- `07-20` **`mate_bench` landed (the standardized time-to-mate benchmark) + watcher armed.**
+  New `cc bench` / `engine/scripts/mate_bench.py`: first moment the trailing-1000-game window
+  reaches Black ≥90% of ALL games (draws count against; decisive share also reported), crossing
+  recomputed retroactively from `training_games.created_at` (exact regardless of watcher uptime),
+  stamps `/workspace/chessckers/BENCH_RESULTS.jsonl` (reset-proof), then **auto-ends the run**
+  (stops client + STOP-file trainer flush; server stays; `cc restart` resumes; `--max-hours` 24
+  DNF bound). Retro-validated on the run-23 archive: **run 23 = 1h44m / 2,972 games** (ledger's
+  ≲1.6h-to-~99% read is consistent; 90% falls earlier on the ramp). **Run 24 first-crossing =
+  3h38m / 15,739 games** (10:10 UTC) — PCR **loses the wall-clock bet ~2.1×** (and ~5.3× on
+  games) despite ~1.7× games/h; draw floor 5.5% ≥ the 5% undecided tripwire (item 5).
+- `07-20` **Trainer death RECURRED** (banked death-watch): SIGKILL (`exited with -9`,
+  OOM-suspect; dmesg blocked) at 10:36:54 UTC / step ~2265, right after a net upload — same
+  signature as run 23 (~step 1867, also ~4h in). Two runs, same box ⇒ systematic; forensics
+  captured per the pre-committed rule → box `/workspace/chessckers/run24-trainer-death-pane.txt`
+  (pane scrollback + free + nvidia-smi). From 10:37 the fleet ran **client-only on a frozen
+  net**, and in THAT era the window regressed 90.0% → 83.6% (W 4.5%→10.9%) — no training was
+  happening, so suspect the league-PFSP opponent mix drifting toward pool nets that beat the
+  frozen best (run 23 never regressed, endpoint 98.8%). Watcher's auto-end at 14:54 = client
+  stop (trainer already dead); server left up; `cc restart` would resume.
 
 ## Result
 
