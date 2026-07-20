@@ -41,6 +41,20 @@
 
 - `07-20` Staged: run-24 archive + arm A `cc fresh-run` + `bench_chain.sh` arming in `run.sh`
   — pending user trigger. Run 24 concluded (see run24.md Result).
+- `07-20` Launched 18:26 UTC. **Trial A1 (seed 0): MATE @ 1h18m / 2,837 self-play games**
+  (window@cross B 90.0%, dec 99.1%, D 9.2%) — faster than run 23's 1h44m on the same config
+  +seed, i.e. run-to-run spread is real and material to the A/B question.
+- `07-20` **OOM massacre → driver redesign.** ~19:45, during the trial-A2 reset/relaunch, the
+  container's cgroup OOM killer killed the tmux SERVER — fleet, watcher, and the tmux-hosted
+  `bench_chain.sh` driver died as one process tree (box `memory.events`: oom 202 /
+  **oom_kill 117** lifetime — also the prime suspect for the run-23/24 trainer SIGKILLs;
+  page-cache-accounted cgroup + bulk-delete dirty-page flood at reset is the likely trigger).
+  Trial A1 was already banked (stamp + trial1.db). Fix: **`bench_resume.sh`** — a */5 cron
+  driver (survives any process-tree kill) that reconstructs state from per-arm trial-stamp
+  counts in `BENCH_RESULTS.jsonl`, syncs the @reboot cron line to arm+seed, fresh-launches or
+  warm-resumes as appropriate, babysits trainer-only AND full-fleet death, and runs
+  `mate_bench --trials <remaining>` (patched to accept `--trials 1`). `reset_fleet.sh` now
+  `sync`s after the wipe. Redeploy staged in `run.sh`.
 
 ## Result
 
