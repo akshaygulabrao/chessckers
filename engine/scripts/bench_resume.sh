@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# bench_resume.sh — self-healing cron driver for the run-25 A/B mate_bench
+# experiment (arm A = Gumbel, arm B = Gumbel+PCR 0.25/100v; 5 trials each,
+# trainer seeds 0-4 per arm).
+#
+# Why cron: the 07-20 first attempt drove the two-arm chain from inside tmux;
+# the box's cgroup OOM killer (memory.events at the time: oom 202 /
+# oom_kill 117 — also the prime suspect for the run-23/24 trainer SIGKILLs)
+# took out the tmux server between trials, killing the driver together with
+# the fleet. Cron re-fires every 5 min under flock; the experiment state is
+# reconstructed from BENCH_RESULTS.jsonl (per-arm trial-stamp counts), and
+# every step is resumable because mate_bench crossings are retro-exact from
+# training_games.created_at.
+#
+# Install on the box:
+#   */5 * * * * flock -n /workspace/chessckers/bench_resume.lock bash /workspace/chessckers/bench_resume.sh >> /workspace/chessckers/bench_watch.log 2>&1
+# Disarm: remove that cron line (and pkill -f 'mate_benc[h].py --trials').
+set -uo pipefail
+export PATH=/usr/local/go/bin:/usr/bin:/usr/local/bin:/usr/sbin:/bin:$PATH
+WS=/workspace/chessckers
+ENG=$WS/engine
+SRV=$WS/lczero-server
+DB=$SRV/chessckers.db
+RES=$WS/BENCH_RESULTS.jsonl
+A_NAME=run25a_e8d8_gumbelS1_bench
+B_NAME=run25b_e8d8_gumbelS1_pcr25_bench
+TRIALS=5
+BASE_ENV="ARCH_VERSION=v5 C_FILTERS=64 N_BLOCKS=6 SE_RATIO=8 POLICY_TARGET=improved VALUE_Q_RATIO=0 EMA_DECAY=0.99 PUBLISH_GAMES=400 PARALLELISM=32"
+PCR_ENV="PCR_FULL_PROB=0.25 PCR_FAST_VISITS=100"
+log(){ echo "[resume $(date -u '+%m-%d %H:%M')] $*"; }
+
+# A watcher already driving? Nothing to do.
+pgrep -f 'mate_benc[h].py --trials' >/dev/null && exit 0
+
+read -r A_DONE B_DONE < <(python3 - "$RES" "$A_NAME" "$B_NAME" <<'PYEOF'
+import json, sys
+path, an, bn = sys.argv[1:4]
+a = b = 0
+try:
+    for line in open(path):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not r.get("trial"):
+            continue
+        if r.get("run_name") == an:
+            a += 1
+        elif r.get("run_name") == bn:
+            b += 1
+except FileNotFoundError:
+    pass
+print(a, b)
+PYEOF
+)
+if [ "$B_DONE" -ge "$TRIALS" ]; then
+  exit 0   # experiment complete; leaving the cron line is a cheap no-op
+fi
+if [ "$A_DONE" -lt "$TRIALS" ]; then
+  NAME=$A_NAME; DONE=$A_DONE
+  ENV_LINE="RUN_NAME=$A_NAME $BASE_ENV SEED=$DONE"
+else
+  NAME=$B_NAME; DONE=$B_DONE
+  ENV_LINE="RUN_NAME=$B_NAME $BASE_ENV $PCR_ENV SEED=$DONE"
+fi
+REMAINING=$((TRIALS - DONE))
+log "driving $NAME: done=$DONE remaining=$REMAINING (seed base $DONE)"
+
+# Keep the @reboot cron line in sync with the arm + next seed — it is the
+# config mate_bench's between-trial relaunches (and a real reboot) read.
+( crontab -l 2>/dev/null | grep -v restart_fleet.sh; \
+  echo "@reboot $ENV_LINE $SRV/scripts/restart_fleet.sh --boot >> /workspace/restart_fleet.log 2>&1" ) | crontab -
+
+# Fleet state: fresh launch if the DB is missing or belongs to the other arm
+# (arm switch, or death mid-reset); warm resume if the right run is on disk but
+# the fleet is down (OOM mid-trial — run clock survives, honest wall-clock);
+# leave a healthy fleet alone.
+CUR=$(python3 -c "
+import sqlite3
+try:
+    c = sqlite3.connect('file:$DB?mode=ro', uri=True, timeout=5)
+    r = c.execute('SELECT description FROM training_runs ORDER BY id DESC LIMIT 1').fetchone()
+    print(r[0] if r else '')
+except Exception:
+    print('')" 2>/dev/null)
+FLEET_UP=0
+tmux has-session -t cc 2>/dev/null && tmux has-session -t cc-client 2>/dev/null && FLEET_UP=1
+if [ "$CUR" != "$NAME" ]; then
+  log "DB run is '${CUR:-none}' != $NAME — reset + fresh launch (seed $DONE)"
+  tmux kill-session -t cc 2>/dev/null || true
+  tmux kill-session -t cc-client 2>/dev/null || true
+  sleep 2
+  bash "$SRV/scripts/reset_fleet.sh" || { log "reset_fleet FAILED"; exit 1; }
+  env $ENV_LINE bash "$SRV/scripts/restart_fleet.sh" || { log "restart_fleet FAILED"; exit 1; }
+elif [ "$FLEET_UP" = 0 ]; then
+  log "fleet down mid-trial — warm resume (seed $DONE)"
+  env $ENV_LINE bash "$SRV/scripts/restart_fleet.sh" || { log "restart_fleet FAILED"; exit 1; }
+fi
+
+# Babysitter, two failure modes the watcher can't fix itself:
+#  - trainer-only SIGKILL under a live client (runs 23/24): the trial free-runs
+#    into the 10h DNF bound;
+#  - full fleet death mid-trial while THIS driver (not under tmux) survives.
+# Normal between-trial resets keep downtime well under the strike windows.
+babysit(){
+  t_strikes=0; f_strikes=0
+  while true; do
+    sleep 120
+    if pgrep -f 'lc0-clien[t]' >/dev/null && ! pgrep -f 'train_continuou[s]' >/dev/null; then
+      t_strikes=$((t_strikes+1))
+    else
+      t_strikes=0
+    fi
+    if ! pgrep -f 'cc-serve[r]' >/dev/null && ! pgrep -f 'lc0-clien[t]' >/dev/null; then
+      f_strikes=$((f_strikes+1))
+    else
+      f_strikes=0
+    fi
+    if [ "$t_strikes" -ge 2 ] || [ "$f_strikes" -ge 3 ]; then
+      ts=$(date -u +%m%d-%H%M)
+      log "FLEET DEGRADED (trainer_dead=$t_strikes fleet_dead=$f_strikes) — forensics + warm restart ($ts)"
+      { tmux capture-pane -p -S -2000 -t cc:trainer 2>&1; free -m; nvidia-smi; } > "$WS/trainer-death-$ts.txt" 2>&1 || true
+      tmux kill-session -t cc 2>/dev/null || true
+      tmux kill-session -t cc-client 2>/dev/null || true
+      sleep 2
+      env $ENV_LINE bash "$SRV/scripts/restart_fleet.sh" >> "$WS/trainer-restarts.log" 2>&1 || true
+      echo "$(date -u) degraded -> warm restart ($ts)" >> "$WS/trainer-restarts.log"
+      t_strikes=0; f_strikes=0
+    fi
+  done
+}
+babysit & BSPID=$!
+trap 'kill $BSPID 2>/dev/null || true' EXIT
+
+cd "$ENG"
+.venv/bin/python scripts/mate_bench.py --trials "$REMAINING" --max-hours 10
+rc=$?
+log "mate_bench exited rc=$rc (cron resumes if trials remain)"
+exit $rc

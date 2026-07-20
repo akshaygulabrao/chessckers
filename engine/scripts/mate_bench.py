@@ -569,15 +569,15 @@ def main() -> int:
                     help="auto-end DNF after this many hours from RUN START (0 = never)")
     ap.add_argument("--watch", action="store_true")
     ap.add_argument("--report", action="store_true", help="(default mode)")
-    ap.add_argument("--trials", type=int, default=1,
+    ap.add_argument("--trials", type=int, default=None,
                     help="run N full trials (reset_fleet + relaunch between each; "
-                         "default 1 = plain --watch)")
+                         "N=1 runs a single stamped trial — used by resume drivers)")
     ap.add_argument("--no-stop", action="store_true",
                     help="with --watch: stamp but don't end the fleet")
     ap.add_argument("--stamp", action="store_true",
                     help="with --report: retro-stamp the crossing into --results")
     args = ap.parse_args()
-    if args.trials > 1:
+    if args.trials:
         return run_trials(args)
     return watch(args) if args.watch else report(args)
 
