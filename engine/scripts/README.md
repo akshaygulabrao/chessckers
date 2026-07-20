@@ -35,7 +35,7 @@ Then, from **any directory**:
 | `cc champs [opts]` | **audit the gate's actual promoted champions + rejected candidates** (server `.bin` nets via DB; 12+ games/pair for ordering claims) — contrast with `cc ladder` (trainer checkpoints) | box |
 | `cc backup` | **pull irreplaceable telemetry off the box** to `telemetry/<run>/` under the repo root | box→local |
 | `cc compare [file.jsonl ...]` | **compare anchor runs** — sparklines + seed13 alignment table across runs (`cc backup` refreshes the data) | local |
-| `cc bench` | **time-to-mate benchmark** — clock, current Black share, exact first ≥90%-of-trailing-1k crossing, cross-run comparison table (`BENCH_RESULTS.jsonl`); `--watch` arms the **auto-ending** watcher (stamps + stops client/trainer at crossing or `--max-hours`, server stays up); `--stop` disarms; works on archived DBs via `cc run mate_bench.py --report --db … [--stamp]` | box |
+| `cc bench` | **time-to-mate benchmark** — clock, current Black share, exact first ≥90%-of-trailing-1k crossing over **self-play games only** (league games excluded: their Black share tracks the pool mix, not mastery — a converged net read 84% with league included vs 98% pure), cross-run comparison table (`BENCH_RESULTS.jsonl`); `--watch` arms the **auto-ending** watcher (stamps + stops client/trainer at crossing or `--max-hours`, server stays up); `--stop` disarms; works on archived DBs via `cc run mate_bench.py --report --db … [--stamp]` | box |
 | `cc fresh-run [opts]` | **provision + launch a complete training run from scratch** (`--bench` arms the auto-ending benchmark watcher at launch) | box |
 | `cc launch` | print the fresh-run runbook (manual steps) | local |
 

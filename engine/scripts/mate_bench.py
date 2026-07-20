@@ -2,11 +2,18 @@
 """mate_bench — wall-clock benchmark: how fast does a run find the Black mate?
 
 Measures time-to-convergence of the current training run: the first moment the
-trailing --window games' Black-win share reaches --threshold (default ≥90% of
-ALL window games — a draw means the mate was NOT found; the decisive-only share
-is also reported). The crossing is recomputed retroactively from
+trailing --window SELF-PLAY games' Black-win share reaches --threshold (default
+≥90% of ALL window games — a draw means the mate was NOT found; the decisive-only
+share is also reported). The crossing is recomputed retroactively from
 training_games.created_at, so the stamped number is exact regardless of when the
 watcher started (or whether it restarted).
+
+League games (opponent_network_id != 0) are EXCLUDED from the metric: they mix in
+learner-vs-old-champ results, so their Black share tracks the pool composition,
+not position mastery (run 24: the fully-converged frozen net read 84% with league
+games included — fossil pool nets farmed as White — vs 98% pure self-play).
+League share is still printed as context. Pre-league archive DBs (no
+opponent_network_id column) fall back to all games.
 
 Modes:
   --report (default)  one-shot: current share, exact crossing if already crossed,
@@ -79,17 +86,28 @@ def run_info(con) -> dict:
             "created_at": row[2], "now": row[3]}
 
 
+def self_filter(con) -> str:
+    """SQL fragment excluding league games; empty on pre-league schemas."""
+    cols = [r[1] for r in con.execute("PRAGMA table_info(training_games)")]
+    return " AND opponent_network_id = 0" if "opponent_network_id" in cols else ""
+
+
 def window_counts(con, window: int) -> dict:
-    """Counts over the trailing `window` games with a recorded result."""
+    """Counts over the trailing `window` self-play games with a recorded result."""
+    flt = self_filter(con)
     rows = con.execute(
-        "SELECT result FROM training_games WHERE result > 0 "
+        f"SELECT result FROM training_games WHERE result > 0{flt} "
         "ORDER BY id DESC LIMIT ?", (window,)).fetchall()
     b = sum(1 for (r,) in rows if r == RES_BLACK)
     w = sum(1 for (r,) in rows if r == RES_WHITE)
     d = sum(1 for (r,) in rows if r == RES_DRAW)
     total = con.execute(
         "SELECT count(*) FROM training_games WHERE result > 0").fetchone()[0]
-    return {"n": len(rows), "b": b, "w": w, "d": d, "total": total}
+    league = con.execute(
+        "SELECT count(*) FROM training_games WHERE result > 0 "
+        "AND opponent_network_id != 0").fetchone()[0] if flt else 0
+    return {"n": len(rows), "b": b, "w": w, "d": d,
+            "total": total, "league": league}
 
 
 def _share_str(b: int, w: int, d: int, n: int) -> str:
@@ -99,15 +117,15 @@ def _share_str(b: int, w: int, d: int, n: int) -> str:
 
 
 def retro_crossing(con, window: int, threshold: float) -> dict | None:
-    """Earliest game at which the FULL trailing window's blackwon/window ≥
-    threshold. Streams id-ordered rows with O(window) memory; returns None if
-    the run never crossed."""
+    """Earliest self-play game at which the FULL trailing window's
+    blackwon/window ≥ threshold. Streams id-ordered rows with O(window) memory;
+    returns None if the run never crossed."""
     dq: deque[int] = deque()
     b_in = 0
     n_seen = 0
     cur = con.execute(
         "SELECT id, result, datetime(created_at) FROM training_games "
-        "WHERE result > 0 ORDER BY id")
+        f"WHERE result > 0{self_filter(con)} ORDER BY id")
     for gid, res, created in cur:
         n_seen += 1
         dq.append(res)
@@ -178,8 +196,9 @@ def build_stamp(con, args, converged: bool, note: str = "") -> dict:
         "run_id": ri["id"], "run_name": ri["name"],
         "run_started_utc": ri["created_at"][:16],
         "threshold": args.threshold, "window": args.window,
+        "basis": "self-play-only",
         "converged": converged, "note": note,
-        "games_total": wc["total"],
+        "games_total": wc["total"], "league_games": wc["league"],
         "window_now": {"b": wc["b"], "w": wc["w"], "d": wc["d"], "n": wc["n"]},
     }
     cross = retro_crossing(con, args.window, args.threshold) if converged else None
@@ -213,7 +232,8 @@ def print_stamp(stamp: dict) -> None:
         print(f"  crossed:  {stamp['crossed_utc']} UTC — elapsed {stamp['elapsed']} "
               f"from run start ({stamp['run_started_utc']} UTC)")
         wcx = stamp["window_cross"]
-        print(f"  games:    {stamp['games']:,} at crossing  (~{stamp['games_per_h']:,} games/h)")
+        print(f"  games:    {stamp['games']:,} self-play games at crossing  "
+              f"(~{stamp['games_per_h']:,}/h)")
         print(f"  window@cross: {_share_str(wcx['b'], wcx['w'], wcx['d'], stamp['window'])}"
               f"   [thr {stamp['threshold']:.0%} of all, window {stamp['window']}]")
     else:
@@ -269,13 +289,16 @@ def report(args) -> int:
     print(f"  clock:   {_humanize(elapsed)}  (run start {ri['created_at'][:16]} → "
           f"newest game {asof[:16]} UTC)")
     gph = wc["total"] / max(1e-9, elapsed / 3600)
-    print(f"  games:   {wc['total']:,}  (~{gph:,.0f} games/h)")
-    print(f"  window {wc['n']}: {_share_str(wc['b'], wc['w'], wc['d'], max(1, wc['n']))}"
+    lg = (f", {100 * wc['league'] / max(1, wc['total']):.0f}% league — excluded "
+          f"from the metric" if wc["league"] else "")
+    print(f"  games:   {wc['total']:,}  (~{gph:,.0f} games/h{lg})")
+    print(f"  self-play window {wc['n']}: "
+          f"{_share_str(wc['b'], wc['w'], wc['d'], max(1, wc['n']))}"
           f"   [thr {args.threshold:.0%} of all]")
     cross = retro_crossing(con, args.window, args.threshold)
     if cross:
         c_elapsed = (_utc(cross["created_at"]) - started).total_seconds()
-        print(f"  CROSSED: {_humanize(c_elapsed)} / {cross['games']:,} games "
+        print(f"  CROSSED: {_humanize(c_elapsed)} / {cross['games']:,} self-play games "
               f"({cross['created_at'][:16]} UTC, game #{cross['game_id']}) — "
               f"{_share_str(cross['b'], cross['w'], cross['d'], args.window)}")
         if args.stamp:
@@ -307,7 +330,7 @@ def watch(args) -> int:
             elapsed = (_utc(ri["now"]) - _utc(ri["created_at"])).total_seconds()
             delta = f" (+{wc['total'] - prev_total})" if prev_total is not None else ""
             prev_total = wc["total"]
-            log(f"games={wc['total']:,}{delta}  window {wc['n']}: "
+            log(f"games={wc['total']:,}{delta}  self window {wc['n']}: "
                 f"{_share_str(wc['b'], wc['w'], wc['d'], max(1, wc['n']))}  "
                 f"elapsed {_humanize(elapsed)}")
             # Authoritative check is the retro scan (cheap: one indexed pass), not

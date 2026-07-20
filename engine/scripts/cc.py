@@ -24,8 +24,9 @@ scripts to run on it.
   cc play [play args]           # play a human-vs-net game against the latest fleet net
   cc lengths [--window=50]      # average game length over training (survival→mate curve)
   cc bench [args]               # time-to-mate benchmark: report + comparison table;
-                                #   --watch arms the AUTO-ENDING watcher (stops the run
-                                #   at Black ≥90% of trailing 1k games); --stop disarms
+                                #   --watch arms the AUTO-ENDING watcher (stops the run at
+                                #   Black ≥90% of trailing 1k SELF-PLAY games — league games
+                                #   excluded, they track pool mix); --stop disarms
   cc backup                     # pull irreplaceable telemetry off the box to telemetry/<run>/
   cc compare [file...]          # compare anchor_gauntlet.jsonl runs — sparklines + alignment table
   cc fresh-run [--run-name=X] [--arch=v5] [--parallelism=32] [--base=<box-net.pt>]

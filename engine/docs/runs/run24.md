@@ -21,7 +21,7 @@
 | Key changes | fork (uncommitted, chessckers-port): `tournament.cc/.h` PCR flags+validation+fast dicts, `game.cc/.h` per-move draw + fast search path + conditional record, `selfplay.hpp`/`chunk.hpp` per-record `ply`/`total_plies` (**moves_left density fix** — `n−i` was records-remaining; now true ply distance, byte-identical for dense games). Server (uncommitted): bootstrap env-driven PCR trainParams append; `launch_server.sh` env passthrough. Engine (uncommitted): `cc.py` `--pcr-full-prob=`/`--pcr-fast-visits=` knobs. Box scratch-build verified BUILD_OK w/ CUDA trunk pre-launch. |
 | Fleet box | vast `44287736` (RTX 3060), same box; server `http://23.227.184.228:30153` |
 | Started | 2026-07-20 06:32 UTC (`training_runs.created_at` clock anchor) |
-| Status | **fleet auto-ended by `mate_bench` 2026-07-20 14:54 UTC** (benchmark stamped MATE @3h38m; trainer had died 10:37; conclusion/Result + archive pending) |
+| Status | **fleet auto-ended by `mate_bench` 2026-07-20 14:54 UTC** (benchmark stamped MATE @3h36m self-play basis; trainer had died 10:37; conclusion/Result + archive pending) |
 
 ## Hypothesis
 
@@ -104,19 +104,34 @@ wall-clock still wins is fine; both losing = PCR hurts at this start.
   recomputed retroactively from `training_games.created_at` (exact regardless of watcher uptime),
   stamps `/workspace/chessckers/BENCH_RESULTS.jsonl` (reset-proof), then **auto-ends the run**
   (stops client + STOP-file trainer flush; server stays; `cc restart` resumes; `--max-hours` 24
-  DNF bound). Retro-validated on the run-23 archive: **run 23 = 1h44m / 2,972 games** (ledger's
+  DNF bound). Metric basis finalized same day = **self-play games only** (league excluded; see
+  the dilution diagnosis below). Stamped: **run 23 = 1h44m / 2,516 self-play games** (ledger's
   ≲1.6h-to-~99% read is consistent; 90% falls earlier on the ramp). **Run 24 first-crossing =
-  3h38m / 15,739 games** (10:10 UTC) — PCR **loses the wall-clock bet ~2.1×** (and ~5.3× on
-  games) despite ~1.7× games/h; draw floor 5.5% ≥ the 5% undecided tripwire (item 5).
+  3h36m / 12,784 self-play games** (10:09 UTC) — PCR **loses the wall-clock bet ~2.1×** (and
+  ~5.1× on games) despite ~1.7× games/h. At run 24's crossing the window was B 90.0% with
+  **dec 100% and 10% draws** — the crossing was DRAW-limited (PCR shuffle-loop floor, the item-5
+  tripwire), not White-resistance-limited.
 - `07-20` **Trainer death RECURRED** (banked death-watch): SIGKILL (`exited with -9`,
   OOM-suspect; dmesg blocked) at 10:36:54 UTC / step ~2265, right after a net upload — same
   signature as run 23 (~step 1867, also ~4h in). Two runs, same box ⇒ systematic; forensics
   captured per the pre-committed rule → box `/workspace/chessckers/run24-trainer-death-pane.txt`
-  (pane scrollback + free + nvidia-smi). From 10:37 the fleet ran **client-only on a frozen
-  net**, and in THAT era the window regressed 90.0% → 83.6% (W 4.5%→10.9%) — no training was
-  happening, so suspect the league-PFSP opponent mix drifting toward pool nets that beat the
-  frozen best (run 23 never regressed, endpoint 98.8%). Watcher's auto-end at 14:54 = client
-  stop (trainer already dead); server left up; `cc restart` would resume.
+  (pane scrollback + free + nvidia-smi). Net 42 (the dying upload) still gate-passed at 10:42
+  (match 116: 82-71-7 vs 41) and played the whole 4h+ client-only era. Watcher's auto-end at
+  14:54 = client stop (trainer already dead); server left up; `cc restart` would resume.
+- `07-20` **"Post-crossing regression" DIAGNOSED — measurement dilution, NOT strength loss.**
+  The all-games window slid 90.0%→83.6% after the crossing, but splitting by
+  `opponent_network_id` shows frozen net 42's **pure self-play is 98.3–99.3% Black, W 0.2–0.5%,
+  stationary for 4h** (run-23-endpoint quality — PCR DID fully converge). The entire White-share
+  rise is league games: their completed-share roughly doubled (config `league.fraction` 0.2,
+  observed 16–20% pre-death → **36%** under the stale best; games/h also ~halved 4.3k→2.3k —
+  open sub-mystery, client-side), and the frozen-era league mix **farms fossil pool nets as
+  White** — learner-as-White vs net 10 (561 Wwins; net 10 is from the W=100% era and cannot play
+  Black) + vs net 26 (277) = ~85% of all "White wins", plus ~580 450-ply shuffle-DRAWS vs nets
+  34/38 (= the 5.5% draw floor). PFSP note: opp 10 drew the most games despite wr≈1 — cached
+  probs from 10:42 + the "no recent data ⇒ 50%" default persisted for 4h (main.go:379).
+  **Consequence: `mate_bench` metric switched to self-play-only** (league share tracks pool
+  composition, not mastery; an armed watcher polling the live all-games window would never have
+  re-seen ≥90% on a fully-converged net) — both runs restamped on the corrected basis.
 
 ## Result
 
