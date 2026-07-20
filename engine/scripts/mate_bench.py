@@ -23,6 +23,18 @@ Modes:
                       stamp the result and AUTO-END the run: stop the self-play
                       client + trainer (clean STOP-file flush), leave the server
                       up for status/strength/archive. `cc restart` resumes.
+  --trials N          run the FULL experiment N times (default 5) to average out
+                      run-to-run randomness: watch the current run to its crossing
+                      (trial 1), then for each further trial reset_fleet (WIPES
+                      fleet state — archive first!) and relaunch with the config
+                      from the @reboot cron line, watch, stamp. Each trial's DB is
+                      saved to /workspace/chessckers/bench_trials/<label>/ before
+                      the wipe, and a per-trial trainParams parity guard aborts if
+                      a relaunch drifts from trial 1's config. Ends with a summary
+                      stamp (median/mean±sd) in BENCH_RESULTS.jsonl. Note: cold
+                      init is deterministic (seed 0), so trials share the initial
+                      net; the measured variance is self-play + async-SGD
+                      stochasticity — exactly the noise between comparable runs.
   --no-stop           with --watch: stamp but leave the fleet running.
   --stamp             with --report: append the crossing to the results ledger
                       (retro-stamping an archived run into the comparison table).
@@ -37,15 +49,26 @@ import argparse
 import datetime
 import json
 import os
+import shutil
 import sqlite3
+import statistics
 import subprocess
 import sys
 import time
 from collections import deque
 
-DB = "/workspace/chessckers/lczero-server/chessckers.db"
+SERVER_DIR = "/workspace/chessckers/lczero-server"
+DB = f"{SERVER_DIR}/chessckers.db"
 RESULTS = "/workspace/chessckers/BENCH_RESULTS.jsonl"
-TRAINER_RUN_DIR = "/workspace/chessckers/lczero-server/trainer/run1"
+TRAINER_RUN_DIR = f"{SERVER_DIR}/trainer/run1"
+TRIALS_DIR = "/workspace/chessckers/bench_trials"
+
+# Env keys that define a run's config in the @reboot cron line (fresh-run installs
+# it; restart_fleet.sh consumes it) — the persisted source of truth trials relaunch
+# from. PCR_* reach bootstrap only on the post-reset empty DB.
+CRON_KEYS = ("RUN_NAME", "ARCH_VERSION", "C_FILTERS", "N_BLOCKS", "SE_RATIO",
+             "POLICY_TARGET", "VALUE_Q_RATIO", "EMA_DECAY", "PUBLISH_GAMES",
+             "PARALLELISM", "PCR_FULL_PROB", "PCR_FAST_VISITS")
 
 # training_games.result codes (lczero-server main.go gameready handler)
 RES_WHITE, RES_BLACK, RES_DRAW = 1, 2, 3
@@ -78,12 +101,12 @@ def _connect(path: str) -> sqlite3.Connection:
 
 def run_info(con) -> dict:
     row = con.execute(
-        "SELECT id, description, datetime(created_at), datetime('now') "
-        "FROM training_runs ORDER BY id DESC LIMIT 1").fetchone()
+        "SELECT id, description, datetime(created_at), datetime('now'), "
+        "train_parameters FROM training_runs ORDER BY id DESC LIMIT 1").fetchone()
     if not row or not row[2]:
         sys.exit("mate_bench: no training_runs row (empty/foreign DB?)")
     return {"id": row[0], "name": row[1] or f"db-run-{row[0]}",
-            "created_at": row[2], "now": row[3]}
+            "created_at": row[2], "now": row[3], "train_params": row[4] or ""}
 
 
 def self_filter(con) -> str:
@@ -199,6 +222,7 @@ def build_stamp(con, args, converged: bool, note: str = "") -> dict:
         "basis": "self-play-only",
         "converged": converged, "note": note,
         "games_total": wc["total"], "league_games": wc["league"],
+        "train_params": ri["train_params"],
         "window_now": {"b": wc["b"], "w": wc["w"], "d": wc["d"], "n": wc["n"]},
     }
     cross = retro_crossing(con, args.window, args.threshold) if converged else None
@@ -226,8 +250,10 @@ def append_stamp(stamp: dict, path: str, log) -> None:
 
 
 def print_stamp(stamp: dict) -> None:
+    trial = (f" (trial {stamp['trial']}/{stamp['trials']})"
+             if stamp.get("trial") else "")
     if stamp["converged"]:
-        print("\n== MATE FOUND — benchmark complete ==")
+        print(f"\n== MATE FOUND{trial} ==")
         print(f"  run:      {stamp['run_name']} (db run {stamp['run_id']})")
         print(f"  crossed:  {stamp['crossed_utc']} UTC — elapsed {stamp['elapsed']} "
               f"from run start ({stamp['run_started_utc']} UTC)")
@@ -237,7 +263,7 @@ def print_stamp(stamp: dict) -> None:
         print(f"  window@cross: {_share_str(wcx['b'], wcx['w'], wcx['d'], stamp['window'])}"
               f"   [thr {stamp['threshold']:.0%} of all, window {stamp['window']}]")
     else:
-        print(f"\n== NOT CONVERGED — {stamp['note'] or 'benchmark incomplete'} ==")
+        print(f"\n== NOT CONVERGED{trial} — {stamp['note'] or 'benchmark incomplete'} ==")
         print(f"  run:      {stamp['run_name']} (db run {stamp['run_id']})")
         print(f"  elapsed:  {stamp['elapsed']}   games {stamp['games_total']:,}")
         wn = stamp["window_now"]
@@ -261,7 +287,18 @@ def print_table(path: str) -> None:
     print(f"\n  -- benchmark ledger ({path}) --")
     print(f"  {'run':<38} {'result':<9} {'elapsed':>8} {'games':>7} {'g/h':>6}  B%all(dec)")
     for r in rows:
-        name = (r.get("run_name") or "?")[:38]
+        name = r.get("run_name") or "?"
+        if r.get("type") == "summary":
+            med = _humanize(r["median_s"]) if "median_s" in r else "-"
+            sd = f" ±{_humanize(r['sd_s'])}" if r.get("sd_s") else ""
+            mg = f"{r['median_games']:,}" if "median_games" in r else "-"
+            label = f"{name} [{r.get('trials', '?')} trials]"[:38]
+            score = f"{r.get('converged', '?')}/{r.get('trials', '?')}"
+            print(f"  {label:<38} {score:<9} {med + sd:>8} {mg:>7} {'':>6}  (median)")
+            continue
+        if r.get("trial"):
+            name = f"{name[:30]} [t{r['trial']}/{r.get('trials', '?')}]"
+        name = name[:38]
         if r.get("converged"):
             res, games = "MATE", f"{r.get('games', 0):,}"
             gph = f"{r.get('games_per_h', 0):,}"
@@ -312,15 +349,20 @@ def report(args) -> int:
     return 0
 
 
-def watch(args) -> int:
-    def log(msg):
-        print(f"[mate_bench {datetime.datetime.now(datetime.timezone.utc):%H:%M}] {msg}",
-              flush=True)
+def _log(msg: str) -> None:
+    print(f"[mate_bench {datetime.datetime.now(datetime.timezone.utc):%H:%M}] {msg}",
+          flush=True)
 
-    log(f"watching {args.db}: thr {args.threshold:.0%} of ALL over window {args.window}, "
-        f"poll {args.interval}s, max {args.max_hours or '∞'}h"
-        + (" (--no-stop: will NOT end the fleet)" if args.no_stop else
-           " — will AUTO-END the run on crossing"))
+
+def _watch_until_crossed(args, trial: int = 0, trials: int = 0) -> dict:
+    """Poll until crossing (or max-hours DNF), stamp, stop client+trainer
+    (unless --no-stop), and return the stamp. The trials loop calls this once
+    per trial; single --watch mode calls it once."""
+    tag = f"[trial {trial}/{trials}] " if trial else ""
+    _log(f"{tag}watching {args.db}: thr {args.threshold:.0%} of ALL over window "
+         f"{args.window}, poll {args.interval}s, max {args.max_hours or '∞'}h"
+         + (" (--no-stop: will NOT end the fleet)" if args.no_stop else
+            " — will AUTO-END the run on crossing"))
     prev_total = None
     while True:
         try:
@@ -330,9 +372,9 @@ def watch(args) -> int:
             elapsed = (_utc(ri["now"]) - _utc(ri["created_at"])).total_seconds()
             delta = f" (+{wc['total'] - prev_total})" if prev_total is not None else ""
             prev_total = wc["total"]
-            log(f"games={wc['total']:,}{delta}  self window {wc['n']}: "
-                f"{_share_str(wc['b'], wc['w'], wc['d'], max(1, wc['n']))}  "
-                f"elapsed {_humanize(elapsed)}")
+            _log(f"{tag}games={wc['total']:,}{delta}  self window {wc['n']}: "
+                 f"{_share_str(wc['b'], wc['w'], wc['d'], max(1, wc['n']))}  "
+                 f"elapsed {_humanize(elapsed)}")
             # Authoritative check is the retro scan (cheap: one indexed pass), not
             # the live window: a run that crossed BEFORE the watcher was armed (or
             # crossed and then regressed) has already produced its benchmark number
@@ -343,19 +385,162 @@ def watch(args) -> int:
                 note = "" if converged else f"max-hours {args.max_hours}h reached"
                 stamp = build_stamp(con, args, converged=converged, note=note)
                 con.close()
-                append_stamp(stamp, args.results, log)
+                if trial:
+                    stamp["trial"], stamp["trials"] = trial, trials
+                append_stamp(stamp, args.results, _log)
                 print_stamp(stamp)
                 if args.no_stop:
-                    log("--no-stop: leaving the fleet running")
+                    _log("--no-stop: leaving the fleet running")
                 else:
-                    stop_fleet(log)
-                return 0
+                    stop_fleet(_log)
+                return stamp
             con.close()
         except SystemExit:
             raise
         except Exception as e:  # noqa: BLE001 — transient DB lock/reset mid-poll
-            log(f"poll failed ({e}) — retrying")
+            _log(f"{tag}poll failed ({e}) — retrying")
         time.sleep(args.interval)
+
+
+def watch(args) -> int:
+    _watch_until_crossed(args)
+    return 0
+
+
+def cron_env() -> dict:
+    """The run's config env from the @reboot cron line (installed by cc fresh-run,
+    consumed by restart_fleet.sh) — the persisted source of truth trials relaunch
+    from. Hard-fails if absent: silently relaunching with restart_fleet.sh
+    DEFAULTS would benchmark the wrong config."""
+    out = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+    line = next((ln for ln in out.splitlines() if "restart_fleet.sh" in ln), "")
+    env = {}
+    for tok in line.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            if k in CRON_KEYS:
+                env[k] = v
+    if "RUN_NAME" not in env:
+        sys.exit("mate_bench: no restart_fleet.sh cron line with RUN_NAME — trials "
+                 "can't replicate the run config (launch the run via cc fresh-run)")
+    return env
+
+
+def relaunch_trial(env: dict) -> None:
+    """DESTRUCTIVE: wipe fleet state (reset_fleet.sh) and relaunch server +
+    trainer + client with the cron-line config. tmux sessions are killed first so
+    restart_fleet.sh's already-running check can't no-op on leftover shells."""
+    for sess in ("cc", "cc-client"):
+        subprocess.run(["tmux", "kill-session", "-t", sess],
+                       check=False, capture_output=True)
+    _log("reset_fleet: WIPING db/networks/games/pgns/trainer ...")
+    r = subprocess.run(["bash", f"{SERVER_DIR}/scripts/reset_fleet.sh"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"mate_bench: reset_fleet.sh failed:\n{r.stdout}\n{r.stderr}")
+    _log("relaunching fleet: " + " ".join(f"{k}={v}" for k, v in sorted(env.items())))
+    r = subprocess.run(["bash", f"{SERVER_DIR}/scripts/restart_fleet.sh"],
+                       env={**os.environ, **env}, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"mate_bench: restart_fleet.sh failed:\n{r.stdout}\n{r.stderr}")
+
+
+def wait_train_params(args, timeout: int = 300) -> str:
+    """Wait for the fresh run's training_runs row after a relaunch; return its
+    train_parameters (for the per-trial config parity guard)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(args.db):
+            try:
+                con = _connect(args.db)
+                row = con.execute(
+                    "SELECT train_parameters FROM training_runs "
+                    "ORDER BY id DESC LIMIT 1").fetchone()
+                con.close()
+                if row and row[0]:
+                    return row[0]
+            except Exception:  # noqa: BLE001 — bootstrap mid-write
+                pass
+        time.sleep(5)
+    sys.exit(f"mate_bench: no training_runs row {timeout}s after relaunch — "
+             "fleet didn't come up (check tmux cc:server)")
+
+
+def save_trial_db(dest_dir: str, trial: int, args) -> None:
+    """Preserve the trial's DB before the next reset wipes it (WAL-checkpointed —
+    the run-22 archive lost a day of rows to a bare-.db copy)."""
+    os.makedirs(dest_dir, exist_ok=True)
+    try:
+        con = sqlite3.connect(args.db, timeout=10)
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.close()
+    except Exception as e:  # noqa: BLE001 — busy checkpoint is non-fatal
+        _log(f"(wal checkpoint failed: {e} — copying -wal alongside)")
+    dst = os.path.join(dest_dir, f"trial{trial}.db")
+    shutil.copyfile(args.db, dst)
+    if os.path.exists(args.db + "-wal") and os.path.getsize(args.db + "-wal"):
+        shutil.copyfile(args.db + "-wal", dst + "-wal")
+    _log(f"trial DB saved → {dst}")
+
+
+def run_trials(args) -> int:
+    if args.no_stop:
+        sys.exit("mate_bench: --no-stop is incompatible with --trials "
+                 "(each trial must stop + reset the fleet)")
+    env = cron_env()
+    label = env["RUN_NAME"]
+    stamp_dir = os.path.join(
+        TRIALS_DIR,
+        f"{label}-{datetime.datetime.now(datetime.timezone.utc):%Y%m%d-%H%M}")
+    _log(f"=== {args.trials} TRIALS of [{label}] — between-trial resets WIPE fleet "
+         f"state; per-trial DBs → {stamp_dir}/ ===")
+    stamps: list[dict] = []
+    base_params = ""
+    for t in range(1, args.trials + 1):
+        if t > 1:
+            relaunch_trial(env)
+            params = wait_train_params(args)
+            if base_params and params != base_params:
+                sys.exit(f"mate_bench: trial {t} trainParams DIVERGED from trial 1 "
+                         f"— aborting the experiment.\n  trial 1: {base_params}\n"
+                         f"  trial {t}: {params}")
+            _log(f"[trial {t}/{args.trials}] fleet up, trainParams verified — watching")
+        stamp = _watch_until_crossed(args, trial=t, trials=args.trials)
+        if not base_params:
+            base_params = stamp.get("train_params", "")
+        stamps.append(stamp)
+        save_trial_db(stamp_dir, t, args)
+    conv = [s for s in stamps if s["converged"]]
+    elap = [s["elapsed_s"] for s in conv]
+    summary = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M"),
+        "type": "summary", "run_name": label,
+        "trials": args.trials, "converged": len(conv),
+        "threshold": args.threshold, "window": args.window,
+        "basis": "self-play-only",
+        "elapsed_s": [s["elapsed_s"] for s in stamps],
+        "games": [s.get("games") for s in stamps],
+        "trial_dbs": stamp_dir,
+    }
+    if elap:
+        summary["median_s"] = int(statistics.median(elap))
+        summary["mean_s"] = int(statistics.mean(elap))
+        summary["sd_s"] = int(statistics.stdev(elap)) if len(elap) > 1 else 0
+        summary["median_games"] = int(statistics.median(
+            s["games"] for s in conv))
+    append_stamp(summary, args.results, _log)
+    print("\n== TRIALS COMPLETE ==")
+    print(f"  {label}: {len(conv)}/{args.trials} converged")
+    for s in stamps:
+        res = _humanize(s["elapsed_s"]) if s["converged"] else f"DNF ({s['note']})"
+        games = f"  {s['games']:,} games" if s["converged"] else ""
+        print(f"    trial {s.get('trial', '?')}: {res}{games}")
+    if elap:
+        print(f"  median {_humanize(summary['median_s'])}   "
+              f"mean {_humanize(summary['mean_s'])} ± {_humanize(summary['sd_s'])}   "
+              f"median games {summary['median_games']:,}")
+    print(f"  per-trial DBs: {stamp_dir}/")
+    return 0
 
 
 def main() -> int:
@@ -371,11 +556,16 @@ def main() -> int:
                     help="auto-end DNF after this many hours from RUN START (0 = never)")
     ap.add_argument("--watch", action="store_true")
     ap.add_argument("--report", action="store_true", help="(default mode)")
+    ap.add_argument("--trials", type=int, default=1,
+                    help="run N full trials (reset_fleet + relaunch between each; "
+                         "default 1 = plain --watch)")
     ap.add_argument("--no-stop", action="store_true",
                     help="with --watch: stamp but don't end the fleet")
     ap.add_argument("--stamp", action="store_true",
                     help="with --report: retro-stamp the crossing into --results")
     args = ap.parse_args()
+    if args.trials > 1:
+        return run_trials(args)
     return watch(args) if args.watch else report(args)
 
 

@@ -24,9 +24,12 @@ scripts to run on it.
   cc play [play args]           # play a human-vs-net game against the latest fleet net
   cc lengths [--window=50]      # average game length over training (survival→mate curve)
   cc bench [args]               # time-to-mate benchmark: report + comparison table;
-                                #   --watch arms the AUTO-ENDING watcher (stops the run at
-                                #   Black ≥90% of trailing 1k SELF-PLAY games — league games
-                                #   excluded, they track pool mix); --stop disarms
+                                #   --trials [N=5] runs the FULL N-trial experiment (watch →
+                                #   stamp → reset_fleet → relaunch from the cron config;
+                                #   median/mean±sd summary — WIPES state between trials);
+                                #   --watch arms the single-run AUTO-ENDING watcher (stops
+                                #   the run at Black ≥90% of trailing 1k SELF-PLAY games —
+                                #   league games excluded, they track pool mix); --stop disarms
   cc backup                     # pull irreplaceable telemetry off the box to telemetry/<run>/
   cc compare [file...]          # compare anchor_gauntlet.jsonl runs — sparklines + alignment table
   cc fresh-run [--run-name=X] [--arch=v5] [--parallelism=32] [--base=<box-net.pt>]
@@ -34,7 +37,8 @@ scripts to run on it.
                [--policy-target=visits|improved] [--value-q-ratio=R]
                [--ema-decay=D] [--publish-games=N] [--bench]
                               # provision + launch a fresh training run from scratch
-                              # (--bench: arm the auto-ending mate benchmark watcher)
+                              # (--bench: arm the 5-TRIAL auto-ending mate benchmark —
+                              #  this run is trial 1, then 4× reset+relaunch+watch)
 
 cc games — render the network's actual self-play games (newest by default):
   cc games                      # newest recorded game, board move-by-move (no net needed)
@@ -439,8 +443,11 @@ def cmd_fresh_run(args):
     # Install/refresh the @reboot auto-restart cron so a vast.ai reboot (which
     # kills tmux but keeps disk state) self-heals instead of silently dying.
     print("\n--- installing @reboot auto-restart cron ---")
+    # pcr_env rides along so the cron line stays the single source of truth for the
+    # run's FULL config — mate_bench trials re-launch from it after each reset, and
+    # bootstrap re-reads PCR on the then-empty DB.
     cron_line = (
-        f"@reboot RUN_NAME={run_name} ARCH_VERSION={arch} {knob_env}PARALLELISM={parallelism} "
+        f"@reboot RUN_NAME={run_name} ARCH_VERSION={arch} {knob_env}{pcr_env}PARALLELISM={parallelism} "
         f"{SERVER_DIR}/scripts/restart_fleet.sh --boot >> /workspace/restart_fleet.log 2>&1")
     sh_ok(
         f"chmod +x {SERVER_DIR}/scripts/restart_fleet.sh; "
@@ -448,9 +455,9 @@ def cmd_fresh_run(args):
         f"echo '[cron] @reboot auto-restart installed'")
 
     if bench:
-        print("\n--- arming mate-bench watcher (auto-ends the run at Black ≥90%) ---")
+        print("\n--- arming mate-bench watcher (5 trials: run→stamp→reset→relaunch, auto-ends) ---")
         _push_bench(box)
-        _arm_bench(box, [])
+        _arm_bench(box, ["--trials", "5"])
 
     print("\n=== fresh-run complete ===")
     print(f"  ssh -p {port} root@{host} -t tmux attach -t cc     # server + trainer")
@@ -648,10 +655,13 @@ def cmd_bench(args):
 
       cc bench                  # report: clock, current Black share, exact crossing
                                 #   if crossed, + the cross-run comparison table
-      cc bench --watch [...]    # arm the AUTO-ENDING watcher (tmux cc-bench): at
-                                #   Black ≥ threshold of the trailing window it stamps
-                                #   BENCH_RESULTS.jsonl and stops client + trainer
-                                #   (server stays up; `cc restart` resumes)
+      cc bench --trials [N]     # N-trial experiment (default 5): watch → stamp →
+                                #   reset_fleet → relaunch (config = the @reboot cron
+                                #   line), aggregate summary. WIPES fleet state
+                                #   between trials — archive anything you need first.
+      cc bench --watch [...]    # single-run watcher only (no resets): at Black ≥
+                                #   threshold it stamps BENCH_RESULTS.jsonl and stops
+                                #   client + trainer (server stays; `cc restart` resumes)
       cc bench --stop           # disarm the watcher (fleet untouched)
     Passthrough: --threshold F --window N --max-hours H --interval S --no-stop.
     """
@@ -661,7 +671,16 @@ def cmd_bench(args):
         return subprocess.call(_ssh(box) + [
             "tmux kill-session -t cc-bench 2>/dev/null; "
             "pkill -f 'mate_benc[h].py --watch' 2>/dev/null; "
+            "pkill -f 'mate_benc[h].py --trials' 2>/dev/null; "
             "echo '[cc bench] watcher disarmed (fleet untouched)'"])
+    if "--trials" in args:
+        # bare --trials → default 5 (mate_bench argparse default when valueless)
+        i = args.index("--trials")
+        if i + 1 >= len(args) or not args[i + 1].isdigit():
+            args = args[:i + 1] + ["5"] + args[i + 1:]
+        print("[cc bench] trials mode WIPES fleet state between trials (reset_fleet) — "
+              "make sure the current run is archived.")
+        return _arm_bench(box, args)
     if "--watch" in args:
         return _arm_bench(box, args)
     return _run_on_box("mate_bench.py", ["--report", *args])
