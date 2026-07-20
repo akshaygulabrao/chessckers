@@ -323,8 +323,13 @@ fewer, chunkier promotions (league pool grows slower early).
 ## Result
 
 **Concluded 2026-07-19 by user decision (pivot to run 23) — the gate-and-instrument
-overhaul run; the q-blend value read left incomplete.** ~4.5 days, best ≥ #91
-(final endpoint counts: stamp from the archived DB). What it delivered:
+overhaul run; the q-blend value read left incomplete.** ~4.5 days, best ≥ #91.
+Endpoint per the archived DB: **78 networks / 31,315 training games / 226 gate+panel
+matches (75 passed)** — with a caveat: live counters showed best #88–91 on 07-19, so
+the archived `chessckers.db` misses the final ~day of rows (likely un-checkpointed
+SQLite WAL; the tar took the bare `.db`). **Future archives: `PRAGMA
+wal_checkpoint(TRUNCATE)` first, or include `-wal`/`-shm` in the tar.** Game *files*
+are complete regardless (chunks live on disk, all tar'd). What it delivered:
 
 1. **Gate machinery validated in production** — first-ever panel rejection on a live
    RPS triangle (#22, 07-15); publish 200→400 mid-run moved promotions from

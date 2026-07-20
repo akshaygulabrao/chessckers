@@ -132,8 +132,19 @@ def strength_trend(root, run):
                       f"slope {f'{slope:+.0f}/24h' if slope is not None else 'n/a':>9}{flags}")
         alerts = os.path.abspath(os.path.join(root, "..", "ALERTS.log"))
         if os.path.exists(alerts):
-            tail = open(alerts).readlines()[-5:]
-            print(f"alerts ({alerts}, last {len(tail)}):")
+            lines = open(alerts).readlines()
+            # ALERTS.log deliberately outlives fleet resets, so after an archive it
+            # opens with the PREVIOUS run's alarms — show only this run's (+untagged).
+            import _run_ident
+            rn = _run_ident.run_name()
+            n_other = 0
+            if rn:
+                mine = [ln for ln in lines if f"run={rn} " in ln or "run=" not in ln]
+                n_other = len(lines) - len(mine)
+                lines = mine
+            tail = lines[-5:]
+            print(f"alerts ({alerts}, last {len(tail)}"
+                  + (f"; {n_other} from other runs suppressed" if n_other else "") + "):")
             for ln in tail:
                 print(f"   {ln.rstrip()}")
         screen = ag.gate_stall_screen(f"{root}/chessckers.db")
