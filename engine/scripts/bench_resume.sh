@@ -78,14 +78,17 @@ log "driving $NAME: done=$DONE remaining=$REMAINING (seed base $DONE)"
 # (arm switch, or death mid-reset); warm resume if the right run is on disk but
 # the fleet is down (OOM mid-trial — run clock survives, honest wall-clock);
 # leave a healthy fleet alone.
-CUR=$(python3 -c "
+db_run(){
+  python3 -c "
 import sqlite3
 try:
     c = sqlite3.connect('file:$DB?mode=ro', uri=True, timeout=5)
     r = c.execute('SELECT description FROM training_runs ORDER BY id DESC LIMIT 1').fetchone()
     print(r[0] if r else '')
 except Exception:
-    print('')" 2>/dev/null)
+    print('')" 2>/dev/null
+}
+CUR=$(db_run)
 FLEET_UP=0
 tmux has-session -t cc 2>/dev/null && tmux has-session -t cc-client 2>/dev/null && FLEET_UP=1
 if [ "$CUR" != "$NAME" ]; then
@@ -98,6 +101,17 @@ if [ "$CUR" != "$NAME" ]; then
 elif [ "$FLEET_UP" = 0 ]; then
   log "fleet down mid-trial — warm resume (seed $DONE)"
   env $ENV_LINE bash "$SRV/scripts/restart_fleet.sh" || { log "restart_fleet FAILED"; exit 1; }
+fi
+
+# A fresh launch bootstraps the DB asynchronously; mate_bench hard-exits on a
+# missing DB (the 07-20 20:25 rc=1 race). Wait for the run row before watching.
+for _ in $(seq 1 24); do
+  [ "$(db_run)" = "$NAME" ] && break
+  sleep 5
+done
+if [ "$(db_run)" != "$NAME" ]; then
+  log "run row for $NAME never appeared after launch — retrying next cron fire"
+  exit 1
 fi
 
 # Babysitter, two failure modes the watcher can't fix itself:
