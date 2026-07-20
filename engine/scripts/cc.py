@@ -271,6 +271,11 @@ def cmd_fresh_run(args):
     # Candidate-distinguishability knobs (run 22+): empty = launch_trainer.sh defaults.
     ema_decay = ""
     publish_games = ""
+    # PCR (probabilistic chain reduction) flags — self-play engine knobs, seeded into
+    # DB trainParams at bootstrap. Empty = off (engine defaults: full-prob=1.0 / fast-visits=100).
+    # MUST be equals-joined (e.g. --pcr-full-prob=0.25); space-separated is silently ignored.
+    pcr_full_prob = ""
+    pcr_fast_visits = ""
     for a in args:
         if a.startswith("--run-name="):
             run_name = a.split("=", 1)[1]
@@ -294,12 +299,18 @@ def cmd_fresh_run(args):
             ema_decay = a.split("=", 1)[1]
         elif a.startswith("--publish-games="):
             publish_games = a.split("=", 1)[1]
+        elif a.startswith("--pcr-full-prob="):
+            pcr_full_prob = a.split("=", 1)[1]
+        elif a.startswith("--pcr-fast-visits="):
+            pcr_fast_visits = a.split("=", 1)[1]
 
     dims = f" c{c_filters}/b{n_blocks}" if (c_filters or n_blocks) else ""
     tgt = f"  target={policy_target}" if policy_target else ""
     qr = f"  qratio={value_q_ratio}" if value_q_ratio else ""
+    pcr = f"  pcr-full-prob={pcr_full_prob}" if pcr_full_prob else ""
+    pcr += f"  pcr-fast-visits={pcr_fast_visits}" if pcr_fast_visits else ""
     print(
-        f"=== fresh-run: box={host}:{port}  run={run_name}  arch={arch}{dims}{tgt}{qr}  p={parallelism}"
+        f"=== fresh-run: box={host}:{port}  run={run_name}  arch={arch}{dims}{tgt}{qr}{pcr}  p={parallelism}"
         f"  init={'warm:' + base if base else 'cold'} ==="
     )
 
@@ -388,11 +399,18 @@ def cmd_fresh_run(args):
             ("EMA_DECAY", ema_decay), ("PUBLISH_GAMES", publish_games),
         ) if v
     )
+    # PCR env for bootstrap (only when set; bootstrap detects absence of PCR_FULL_PROB
+    # and leaves trainParams at the baseline literal — no silent inheritance).
+    pcr_env = "".join(
+        f"{k}={v} " for k, v in (
+            ("PCR_FULL_PROB", pcr_full_prob), ("PCR_FAST_VISITS", pcr_fast_visits),
+        ) if v
+    )
     sh_ok(
         f"tmux kill-session -t cc 2>/dev/null; sleep 1; "
         f"cd {SERVER_DIR} && tmux new-session -d -s cc -n server -c {SERVER_DIR} && "
         f"tmux send-keys -t cc:server "
-        f"'cd {SERVER_DIR} && PATH=/usr/local/go/bin:$PATH RUN_NAME={run_name} scripts/launch_server.sh 2>&1 | tee -a server.log' C-m && "
+        f"'cd {SERVER_DIR} && PATH=/usr/local/go/bin:$PATH RUN_NAME={run_name} {pcr_env}scripts/launch_server.sh 2>&1 | tee -a server.log' C-m && "
         f"tmux new-window -t cc -n trainer -c {SERVER_DIR} && sleep 0.5 && "
         f"tmux send-keys -t cc:trainer "
         f"'cd {SERVER_DIR} && sleep 6 && {base_env}{knob_env}ENGINE_DIR={ENGINE_DIR} SERVER=http://localhost:10100 ARCH_VERSION={arch} scripts/launch_trainer.sh 2>&1 | tee -a trainer.log' C-m"

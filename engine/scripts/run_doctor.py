@@ -12,7 +12,7 @@ Elo/24h slope, saturation/PLATEAU flags, ALERTS.log tail, gate stall screen).
   cc doctor --block 2000            # trend bucket size
   cc doctor --rate-window 60        # minutes to average steps/s + games/s over
 """
-import argparse, glob, json, os, re, subprocess, sys, time
+import argparse, datetime, glob, json, os, re, subprocess, sys, time
 
 SERVER = "/workspace/chessckers/lczero-server"
 LEDGER = "/workspace/chessckers/engine/docs/runs"  # synced repo ledger — human run numbers
@@ -28,6 +28,39 @@ def latest_run(root):
     runs = sorted(glob.glob(os.path.join(root, "trainer", "run*")),
                   key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0))
     return os.path.basename(runs[-1]) if runs else "run1"
+
+
+def _humanize_elapsed(seconds: float) -> str:
+    """Format elapsed seconds as '3d 4h' / '5h 12m' / '48m'."""
+    s = int(seconds)
+    days, s = divmod(s, 86400)
+    hours, s = divmod(s, 3600)
+    minutes = s // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
+def run_clock(root) -> str | None:
+    """Return a clock line for the current training run, or None on failure."""
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{root}/chessckers.db?mode=ro", uri=True, timeout=2)
+        row = con.execute(
+            "SELECT datetime(created_at), datetime('now') FROM training_runs "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        con.close()
+        if not row or not row[0]:
+            return None
+        start = datetime.datetime.fromisoformat(row[0]).replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.fromisoformat(row[1]).replace(tzinfo=datetime.timezone.utc)
+        elapsed = _humanize_elapsed((now - start).total_seconds())
+        return f"clock:   {elapsed}  (run started {row[0][:16]} UTC)"
+    except Exception:
+        return None
 
 
 def run_label(root):
@@ -177,6 +210,9 @@ def main():
     rows = trend(pgn_dir, a.block)
 
     print(f"== {label}  (dir {run}) ==" if label else f"== run {run} ==")
+    clk = run_clock(a.root)
+    if clk:
+        print(clk)
     print("procs:   " + "  ".join(f"{lbl}{'✓' if up[lbl] else '✗'}" for lbl in PROCS.values()))
     if st:
         stale = time.time() - st.get("updated", 0)

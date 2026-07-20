@@ -176,13 +176,30 @@ def _print_analysis(turn: str, result, n_sims: int, top_n: int = TOP_N) -> None:
 def _replay(args, client, state, model, show_board, outcome_from_state) -> int:
     """Replay --moves token-by-token from `state`, rendering each ply (and the net's
     WDL eval unless --no-eval). Each token is fed straight to make_move: PyVariant's
-    emitted uci matches the selfplay PGN tokens exactly (cadence/deploy/sub-move)."""
+    emitted uci matches the selfplay PGN tokens exactly (cadence/deploy/sub-move).
+
+    Special token ``FEN:<fen>`` (injected by _moves_from_chunk for PCR gaps) jumps
+    the game state to the given FEN instead of applying a move — rendering a gap
+    marker in place of a move line."""
     toks = _parse_movelist(args.moves)
     if not toks:
         raise SystemExit("--moves had no playable tokens")
     print(f"replaying {len(toks)} plies"
           + ("" if args.no_eval else f"  (net WDL each ply; weights loaded)") + "\n")
     for ply, tok in enumerate(toks, 1):
+        if tok.startswith("FEN:"):
+            # PCR gap: several plies were skipped by the fork's playout-cap randomization.
+            # Jump directly to the next recorded position instead of stepping through moves.
+            # Decode the null-byte in-FEN space surrogate back to real spaces.
+            next_fen = tok[4:].replace("\x00", " ")
+            state = client.new_game(next_fen)
+            print("\n·· gap (PCR fast moves — plies skipped) ··")
+            show_board(ply, "·· gap ··", state["fen"])
+            if state.get("status"):
+                break
+            if not _advance(args):
+                break
+            continue
         if args.clear:
             _clear_screen()
         if model is not None:
@@ -249,17 +266,29 @@ def _moves_from_chunk(path: str) -> tuple[str, list[str]]:
     visit counts, so it is NOT the visit-argmax. We recover each move by finding
     the legal move whose result matches the NEXT ply's FEN; the final ply (-> the
     terminal/mate, which has no next FEN) falls back to the visit-argmax. This is
-    why --chunk exists: hand-rolling decode + argmax silently mislabels the game."""
+    why --chunk exists: hand-rolling decode + argmax silently mislabels the game.
+
+    PCR gap handling: under playout-cap randomization the fork emits only ~25% of
+    plies, so consecutive records may be several plies apart.  When no single legal
+    move connects a pair and the transition has a PCR gap signature (side-to-move
+    repeats, raw halfmove jump >1, or ply-delta >1), we emit a special
+    ``FEN:<fen>`` sentinel in place of a move token.  _replay detects this and
+    jumps the game state instead of calling make_move."""
+    import gzip
+    import json
+
     from chessckers_engine.training_chunk import decode_chunk
     from chessckers_engine.variant_py import PyVariantClient
     # Reuse the parity checker's FEN canonicalizer: it blanks the dead en-passant
     # field (disabled in this variant) so a legal pawn double-step landing next to a
     # Black Stone isn't spuriously marked '?'. Single source of truth for both tools.
-    from check_chunk_parity import _norm as norm
+    from check_chunk_parity import _is_gap_signature, _norm as norm, _reachable_in_hops
 
-    exs = decode_chunk(open(path, "rb").read())
+    data = open(path, "rb").read()
+    exs = decode_chunk(data)
     if not exs:
         raise SystemExit(f"--chunk {path}: empty or undecodable chunk")
+    raw_exs = json.loads(gzip.decompress(data))["examples"]
     client = PyVariantClient()
 
     def applied_fen(fen: str, uci: str) -> str | None:
@@ -273,6 +302,22 @@ def _moves_from_chunk(path: str) -> tuple[str, list[str]]:
         nxt = norm(exs[i + 1].fen)
         played = next((m["uci"] for m in exs[i].legal_moves
                        if applied_fen(exs[i].fen, m["uci"]) == nxt), "?")
+        if played == "?":
+            # No single legal move connects these records.  Check whether this
+            # looks like a PCR gap (several skipped plies) rather than real
+            # corruption.  Fast path: FEN heuristics; slow path: 3-hop reachability.
+            # If so, emit a FEN-jump sentinel so _replay can skip gracefully;
+            # otherwise keep "?" and let _replay surface the error.
+            is_gap = _is_gap_signature(exs[i].fen, exs[i + 1].fen,
+                                       before_raw=raw_exs[i],
+                                       after_raw=raw_exs[i + 1])
+            if not is_gap:
+                is_gap = _reachable_in_hops(exs[i].fen, norm(exs[i + 1].fen), client)
+            if is_gap:
+                # Encode the gap FEN using \x00 as an in-FEN space surrogate so
+                # the sentinel survives " ".join() and _parse_movelist's split().
+                # FENs never contain null bytes; _replay decodes them back.
+                played = "FEN:" + exs[i + 1].fen.replace(" ", "\x00")
         moves.append(played)
     vd = exs[-1].visit_distribution
     j = max(range(len(vd)), key=lambda k: vd[k])

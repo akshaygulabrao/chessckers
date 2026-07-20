@@ -19,8 +19,8 @@
 | Gate | run-22 config carried: 160g main gate @ thr −20 + regression panel, publish 400, EMA 0.99, league+PFSP enabled (watch for degenerate pool behavior on a fast-converging start) |
 | Key commits / branch | branch reunification 2026-07-19: engine/fork/server `ctl/pre-gumbel-run16` merged back to main lines; Gumbel restored (engine revert of `5615196`, fork merge carries `79702a7`, server revert of `dcbe1df`); c_scale 1→0.1; `board.cc` → e8/d8 |
 | Fleet box | vast id `44287736` (RTX 3060) — server `http://23.227.184.228:30153` |
-| Started | 2026-07-19 |
-| Status | **active** |
+| Started | 2026-07-19 (19:31 PDT = 2026-07-20 02:31:42 UTC, `training_runs.created_at` — the `cc` clock anchor) |
+| Status | **concluded 2026-07-19 (~21:45 PDT) — SUCCESS** → run 24 |
 
 ## Hypothesis
 
@@ -63,12 +63,22 @@ instruments and would re-convict the target itself rather than the harness.
   share vs the runs-5/6 curve; agreement trend; re-run the one-hot read at first promotion.
   ALERTS.log cleared post-archive (stale run-22 python-gauntlet plateau lines); run_doctor
   now filters alerts to the current run.
+- `07-19` **Mate found within ~the first hour** (user wall-clock observation; runs 5/6 took
+  ~overnight). Caveat: wall-clock is throughput-confounded (this fleet runs P32 + tree reuse +
+  publish-400 at ~2k games/h) — the Gumbel-attributable read is **games-domain**: Black share
+  2.9% → **44%** of the newest-2000 window by ~2.8k games (run 5 needed ~38k games to converge).
+  Verified live @ step 1530: balance W51/B44/d4 and climbing, len p50 ↑+31, **6/6 gate promotions**
+  (best #7, last gate 81-79-0 +4), latest `cc games` replay = clean Black mate in 42 plies.
+  No PCR / no visits change in the tree — the S1 target (+pure z, cold) is the delta vs runs 5/6.
+  Pending per decision rules: one-hot re-read now that promotions exist (banked req #2), Black
+  ≥95% over a 1k window + `watch_game` forced mate before concluding SUCCESS.
 
 ## Decision rules (pre-committed)
 
 - **Success / conclude** — Black share of decisive self-play games ≥95% sustained over a 1k-game
   window AND `watch_game` shows a clean forced mate from the start FEN → conclude SUCCESS, write
-  Result with games-to-convergence vs the runs-5/6 reference.
+  Result with games-to-convergence AND wall-clock-to-convergence (the `cc` run clock; primary
+  metric going forward — run 24 PCR bets on wall-clock, not games) vs the runs-5/6 reference.
 - **Freeze watch (banked run-16 req #2)** — ≥5 consecutive gate rejections → run the chunk-level
   one-hot read FIRST (fraction of plies with improved-policy argmax mass >0.9, σ magnitude)
   before any strength conclusion; champs-pin regression is the distill-below-teacher tripwire.
@@ -82,4 +92,29 @@ instruments and would re-convict the target itself rather than the harness.
 
 ## Result
 
-<staged — leave empty until the run ends.>
+**SUCCESS — the Gumbel S1 improved-policy target is vindicated at c_scale=0.1.** Concluded
+2026-07-19 ~21:45 PDT at clock **2h06m** / **5,455 games** / trainer step ~1867: Black **99%**
+of the newest-2000 window (criterion ≥95%/1k cleared), 8/8 gate promotions (best #9), zero
+draws, `cc games` replays showing clean tower mates. The `watch_game` forced-mate verification
+was waived by user pivot (run-22 style); archived weights allow it retroactively.
+
+- **Wall-clock-to-converge ≲1.6h** (the new primary metric): the trainer+bridge **died ~step
+  1867** (~30-40 min before conclusion; cause undiagnosed — pane scrollbacks + dmesg preserved
+  in the archive) and Black share was already ~99% on clients running net #9, so learning
+  finished *before* the death. Reference for run 24: call it **~1.5-2h**.
+- **Games-domain ≈8× vs the visit-target baseline**: converged ≲5k games vs run 5's ~38k (same
+  start; confounds: arch c64/b6 vs c48/b5, 2026-07 fleet config — publish 400/EMA 0.99/160g
+  gate/tree reuse — so 8× is indicative, not controlled).
+- **Run-15 failure signature absent on every axis**: no gate freeze (8/8 promoted), no one-hot
+  (day-1 read: ≥7-legal argmax mass 0.766, 42%>0.9), no distill-below-teacher tripwire. The
+  c_scale=1 one-hot arithmetic remains the sole confirmed run-15 defect.
+- Mechanism read (day-1): improved-vs-visits argmax agreement 27% on the cold net — the target
+  taught Q-discoveries while visit counts were still Dirichlet noise; exactly the S1 pitch.
+- Throughput context: ~2.6k games/h avg (P32 + tree reuse + publish 400 fleet).
+- Open items carried out of the run: trainer/bridge death forensics (archived panes), the
+  promotion-time one-hot re-read (waived), Stage-2 Sequential Halving (still unported).
+
+Successor: **run 24** (`run24.md`) — KataGo playout-cap randomization (PCR 0.25/100v) on the
+identical config; the bet is wall-clock-to-mate ≲ run 23's on ~2.9×-cheaper games. Archive:
+`~/chessckers-backups/run23-e8d8-c64b6-gumbelS1-20260720/` (DB WAL-checkpointed per the run-22
+lesson, networks, games+pgns, trainer/run1, telemetry, tmux panes + dmesg).
