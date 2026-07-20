@@ -21,7 +21,7 @@
 | Key changes | fork (uncommitted, chessckers-port): `tournament.cc/.h` PCR flags+validation+fast dicts, `game.cc/.h` per-move draw + fast search path + conditional record, `selfplay.hpp`/`chunk.hpp` per-record `ply`/`total_plies` (**moves_left density fix** — `n−i` was records-remaining; now true ply distance, byte-identical for dense games). Server (uncommitted): bootstrap env-driven PCR trainParams append; `launch_server.sh` env passthrough. Engine (uncommitted): `cc.py` `--pcr-full-prob=`/`--pcr-fast-visits=` knobs. Box scratch-build verified BUILD_OK w/ CUDA trunk pre-launch. |
 | Fleet box | vast `44287736` (RTX 3060), same box; server `http://23.227.184.228:30153` |
 | Started | 2026-07-20 06:32 UTC (`training_runs.created_at` clock anchor) |
-| Status | **fleet auto-ended by `mate_bench` 2026-07-20 14:54 UTC** (benchmark stamped MATE @3h36m self-play basis; trainer had died 10:37; conclusion/Result + archive pending) |
+| Status | **concluded 2026-07-20 — PCR converged but LOST the wall-clock bet ~2.1× (n=1)** → run 25 (5-trial A/B noise check); archived `run24-e8d8-gumbelS1-pcr25-20260720` |
 
 ## Hypothesis
 
@@ -135,4 +135,17 @@ wall-clock still wins is fine; both losing = PCR hurts at this start.
 
 ## Result
 
-<staged — leave empty until the run ends.>
+**PCR (0.25/100v) converged but LOST the wall-clock bet at this start — ~2.1× slower (n=1;
+noise check = run 25).** Self-play-only basis: run 24 first-crossing **3h36m / 12,784 self-play
+games** vs run 23's **1h44m / 2,516** — ~2.1× slower wall-clock and ~5.1× more games, despite
+~1.7× games/h (short of the hypothesis' ≥1.8×, and throughput alone didn't buy convergence).
+The crossing was **DRAW-limited** (window@cross B 90.0% with dec 100% / 10% draws — the
+fast-argmax shuffle-loop floor, the pre-committed item-5 tripwire), not White-resistance-limited.
+The net itself DID fully master the position: frozen net 42's pure self-play ran 98.3–99.3%
+Black, stationary for 4h (run-23-endpoint quality) — PCR learns the mate, just slower here.
+Emission/`ml`/ratio checks all passed (ratio ~0.20-0.25, band's low edge), so the loss is not an
+implementation artifact of the emission path. Both arms are n=1 runs ⇒ **run 25 = the 5-trial
+mate_bench A/B** (Gumbel vs Gumbel+PCR, distinct trainer seeds) to separate a real PCR penalty
+from run-to-run randomness. Trainer death recurred (~step 2265, SIGKILL/OOM-suspect, same box +
+signature as run 23, forensics in the archive) — run 25's chain adds a death-watch auto-restart.
+Archive: `~/chessckers-backups/run24-e8d8-gumbelS1-pcr25-20260720/`.
