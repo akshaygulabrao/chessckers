@@ -35,7 +35,7 @@ scripts to run on it.
   cc fresh-run [--run-name=X] [--arch=v5] [--parallelism=32] [--base=<box-net.pt>]
                [--c-filters=N] [--n-blocks=N] [--se-ratio=N]
                [--policy-target=visits|improved] [--value-q-ratio=R]
-               [--ema-decay=D] [--publish-games=N] [--bench]
+               [--ema-decay=D] [--publish-games=N] [--seed=N] [--bench]
                               # provision + launch a fresh training run from scratch
                               # (--bench: arm the 5-TRIAL auto-ending mate benchmark —
                               #  this run is trial 1, then 4× reset+relaunch+watch)
@@ -280,6 +280,9 @@ def cmd_fresh_run(args):
     # Candidate-distinguishability knobs (run 22+): empty = launch_trainer.sh defaults.
     ema_decay = ""
     publish_games = ""
+    # Trainer RNG seed (torch init + replay sampling): empty = launch_trainer.sh
+    # default (0). mate_bench --trials overrides it per trial for independent inits.
+    seed = ""
     # PCR (probabilistic chain reduction) flags — self-play engine knobs, seeded into
     # DB trainParams at bootstrap. Empty = off (engine defaults: full-prob=1.0 / fast-visits=100).
     # MUST be equals-joined (e.g. --pcr-full-prob=0.25); space-separated is silently ignored.
@@ -311,6 +314,8 @@ def cmd_fresh_run(args):
             ema_decay = a.split("=", 1)[1]
         elif a.startswith("--publish-games="):
             publish_games = a.split("=", 1)[1]
+        elif a.startswith("--seed="):
+            seed = a.split("=", 1)[1]
         elif a.startswith("--pcr-full-prob="):
             pcr_full_prob = a.split("=", 1)[1]
         elif a.startswith("--pcr-fast-visits="):
@@ -411,6 +416,7 @@ def cmd_fresh_run(args):
             ("C_FILTERS", c_filters), ("N_BLOCKS", n_blocks), ("SE_RATIO", se_ratio),
             ("POLICY_TARGET", policy_target), ("VALUE_Q_RATIO", value_q_ratio),
             ("EMA_DECAY", ema_decay), ("PUBLISH_GAMES", publish_games),
+            ("SEED", seed),
         ) if v
     )
     # PCR env for bootstrap (only when set; bootstrap detects absence of PCR_FULL_PROB
@@ -548,7 +554,7 @@ def cmd_restart_trainer(args):
     _ssh_out(box, f"rm -f {SERVER_DIR}/trainer/run1/STOP")
     cron = _ssh_out(box, "crontab -l 2>/dev/null | grep restart_fleet.sh | tail -1")
     keep = ("ARCH_VERSION", "C_FILTERS", "N_BLOCKS", "SE_RATIO",
-            "POLICY_TARGET", "VALUE_Q_RATIO")
+            "POLICY_TARGET", "VALUE_Q_RATIO", "SEED")
     knob_env = " ".join(
         t for t in cron.split() if "=" in t and t.split("=", 1)[0] in keep)
     if "ARCH_VERSION=" not in knob_env:

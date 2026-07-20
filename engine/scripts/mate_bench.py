@@ -31,10 +31,11 @@ Modes:
                       saved to /workspace/chessckers/bench_trials/<label>/ before
                       the wipe, and a per-trial trainParams parity guard aborts if
                       a relaunch drifts from trial 1's config. Ends with a summary
-                      stamp (median/mean±sd) in BENCH_RESULTS.jsonl. Note: cold
-                      init is deterministic (seed 0), so trials share the initial
-                      net; the measured variance is self-play + async-SGD
-                      stochasticity — exactly the noise between comparable runs.
+                      stamp (median/mean±sd) in BENCH_RESULTS.jsonl. Each trial
+                      gets a DISTINCT trainer seed (cron SEED + trial - 1, via
+                      restart_fleet SEED → launch_trainer → bridge →
+                      train_continuous --seed): independent net inits + replay
+                      sampling on top of self-play stochasticity.
   --no-stop           with --watch: stamp but leave the fleet running.
   --stamp             with --report: append the crossing to the results ledger
                       (retro-stamping an archived run into the comparison table).
@@ -68,7 +69,7 @@ TRIALS_DIR = "/workspace/chessckers/bench_trials"
 # from. PCR_* reach bootstrap only on the post-reset empty DB.
 CRON_KEYS = ("RUN_NAME", "ARCH_VERSION", "C_FILTERS", "N_BLOCKS", "SE_RATIO",
              "POLICY_TARGET", "VALUE_Q_RATIO", "EMA_DECAY", "PUBLISH_GAMES",
-             "PARALLELISM", "PCR_FULL_PROB", "PCR_FAST_VISITS")
+             "PARALLELISM", "PCR_FULL_PROB", "PCR_FAST_VISITS", "SEED")
 
 # training_games.result codes (lczero-server main.go gameready handler)
 RES_WHITE, RES_BLACK, RES_DRAW = 1, 2, 3
@@ -354,10 +355,12 @@ def _log(msg: str) -> None:
           flush=True)
 
 
-def _watch_until_crossed(args, trial: int = 0, trials: int = 0) -> dict:
+def _watch_until_crossed(args, trial: int = 0, trials: int = 0,
+                         seed: int | None = None) -> dict:
     """Poll until crossing (or max-hours DNF), stamp, stop client+trainer
     (unless --no-stop), and return the stamp. The trials loop calls this once
-    per trial; single --watch mode calls it once."""
+    per trial (passing that trial's trainer seed for the stamp); single --watch
+    mode calls it once."""
     tag = f"[trial {trial}/{trials}] " if trial else ""
     _log(f"{tag}watching {args.db}: thr {args.threshold:.0%} of ALL over window "
          f"{args.window}, poll {args.interval}s, max {args.max_hours or '∞'}h"
@@ -387,6 +390,8 @@ def _watch_until_crossed(args, trial: int = 0, trials: int = 0) -> dict:
                 con.close()
                 if trial:
                     stamp["trial"], stamp["trials"] = trial, trials
+                if seed is not None:
+                    stamp["seed"] = seed
                 append_stamp(stamp, args.results, _log)
                 print_stamp(stamp)
                 if args.no_stop:
@@ -496,16 +501,23 @@ def run_trials(args) -> int:
          f"state; per-trial DBs → {stamp_dir}/ ===")
     stamps: list[dict] = []
     base_params = ""
+    # Distinct trainer seed per trial => independent net inits + replay sampling.
+    # Trial 1 keeps the seed the run was LAUNCHED with (cron SEED, default 0);
+    # later trials increment from it.
+    base_seed = int(env.get("SEED", "0") or 0)
     for t in range(1, args.trials + 1):
+        trial_seed = base_seed + t - 1
         if t > 1:
-            relaunch_trial(env)
+            relaunch_trial({**env, "SEED": str(trial_seed)})
             params = wait_train_params(args)
             if base_params and params != base_params:
                 sys.exit(f"mate_bench: trial {t} trainParams DIVERGED from trial 1 "
                          f"— aborting the experiment.\n  trial 1: {base_params}\n"
                          f"  trial {t}: {params}")
-            _log(f"[trial {t}/{args.trials}] fleet up, trainParams verified — watching")
-        stamp = _watch_until_crossed(args, trial=t, trials=args.trials)
+            _log(f"[trial {t}/{args.trials}] fleet up (seed {trial_seed}), "
+                 "trainParams verified — watching")
+        stamp = _watch_until_crossed(args, trial=t, trials=args.trials,
+                                     seed=trial_seed)
         if not base_params:
             base_params = stamp.get("train_params", "")
         stamps.append(stamp)
@@ -520,6 +532,7 @@ def run_trials(args) -> int:
         "basis": "self-play-only",
         "elapsed_s": [s["elapsed_s"] for s in stamps],
         "games": [s.get("games") for s in stamps],
+        "seeds": [s.get("seed") for s in stamps],
         "trial_dbs": stamp_dir,
     }
     if elap:
@@ -534,7 +547,7 @@ def run_trials(args) -> int:
     for s in stamps:
         res = _humanize(s["elapsed_s"]) if s["converged"] else f"DNF ({s['note']})"
         games = f"  {s['games']:,} games" if s["converged"] else ""
-        print(f"    trial {s.get('trial', '?')}: {res}{games}")
+        print(f"    trial {s.get('trial', '?')} (seed {s.get('seed', '?')}): {res}{games}")
     if elap:
         print(f"  median {_humanize(summary['median_s'])}   "
               f"mean {_humanize(summary['mean_s'])} ± {_humanize(summary['sd_s'])}   "
