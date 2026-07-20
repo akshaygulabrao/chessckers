@@ -56,6 +56,19 @@
   `mate_bench --trials <remaining>` (patched to accept `--trials 1`). `reset_fleet.sh` now
   `sync`s after the wipe. Redeploy staged in `run.sh`.
 
+- `07-20` **Resume-driver shakedown: two more bugs, both mine, both fixed.** (a) Fresh-launch
+  race: the driver started `mate_bench` right after `restart_fleet` returned, but bootstrap
+  creates the DB asynchronously → `mate_bench` hard-exited (rc=1, 20:25); harmless to the
+  metric (crossings are retro-exact from `training_games.created_at` — trial A2's clock runs
+  from 20:25 regardless) and self-healing by design, but now fixed with a wait-for-run-row
+  loop. (b) **flock-fd inheritance wedge**: cron's `flock` holds the lock on fd 3, inherited
+  by every child — `restart_fleet`'s `tmux new-session` DAEMONIZED a tmux server that kept
+  fd 3 open forever, so the lock stayed held after the driver exited and all later cron fires
+  silently no-oped (the fleet ran trial A2 with NO watcher, 20:25→20:45). Fix: every
+  daemon-spawning child (`reset_fleet`/`restart_fleet`/`mate_bench`) runs with `3>&-`;
+  recovery was `rm` of the lock file (relock on a fresh inode). Watcher re-armed ~20:50;
+  trial A2 unaffected (memguard live from 20:25: dirty≈0, oom_kill flat at 117).
+
 ## Result
 
 <staged — leave empty until both arms complete.>

@@ -15,6 +15,13 @@
 # Install on the box:
 #   */5 * * * * flock -n /workspace/chessckers/bench_resume.lock bash /workspace/chessckers/bench_resume.sh >> /workspace/chessckers/bench_watch.log 2>&1
 # Disarm: remove that cron line (and pkill -f 'mate_benc[h].py --trials').
+#
+# LOCK-FD FOOTGUN (bit us 07-20 20:25): cron's flock holds the lock on fd 3,
+# inherited by every child. `tmux new-session` DAEMONIZES a tmux server that
+# keeps fd 3 open forever -> the lock stays held after this script exits and
+# all later fires silently no-op. Every child that can spawn a daemon
+# (restart_fleet, mate_bench -> relaunch_trial -> restart_fleet) MUST run with
+# 3>&- . If the wedge ever recurs: rm the lock file (relocks on a fresh inode).
 set -uo pipefail
 export PATH=/usr/local/go/bin:/usr/bin:/usr/local/bin:/usr/sbin:/bin:$PATH
 WS=/workspace/chessckers
@@ -96,11 +103,11 @@ if [ "$CUR" != "$NAME" ]; then
   tmux kill-session -t cc 2>/dev/null || true
   tmux kill-session -t cc-client 2>/dev/null || true
   sleep 2
-  bash "$SRV/scripts/reset_fleet.sh" || { log "reset_fleet FAILED"; exit 1; }
-  env $ENV_LINE bash "$SRV/scripts/restart_fleet.sh" || { log "restart_fleet FAILED"; exit 1; }
+  bash "$SRV/scripts/reset_fleet.sh" 3>&- || { log "reset_fleet FAILED"; exit 1; }
+  env $ENV_LINE bash "$SRV/scripts/restart_fleet.sh" 3>&- || { log "restart_fleet FAILED"; exit 1; }
 elif [ "$FLEET_UP" = 0 ]; then
   log "fleet down mid-trial — warm resume (seed $DONE)"
-  env $ENV_LINE bash "$SRV/scripts/restart_fleet.sh" || { log "restart_fleet FAILED"; exit 1; }
+  env $ENV_LINE bash "$SRV/scripts/restart_fleet.sh" 3>&- || { log "restart_fleet FAILED"; exit 1; }
 fi
 
 # A fresh launch bootstraps the DB asynchronously; mate_bench hard-exits on a
@@ -140,17 +147,17 @@ babysit(){
       tmux kill-session -t cc 2>/dev/null || true
       tmux kill-session -t cc-client 2>/dev/null || true
       sleep 2
-      env $ENV_LINE bash "$SRV/scripts/restart_fleet.sh" >> "$WS/trainer-restarts.log" 2>&1 || true
+      env $ENV_LINE bash "$SRV/scripts/restart_fleet.sh" 3>&- >> "$WS/trainer-restarts.log" 2>&1 || true
       echo "$(date -u) degraded -> warm restart ($ts)" >> "$WS/trainer-restarts.log"
       t_strikes=0; f_strikes=0
     fi
   done
 }
 babysit & BSPID=$!
-trap 'kill $BSPID 2>/dev/null || true' EXIT
+trap 'pkill -TERM -P $BSPID 2>/dev/null; kill $BSPID 2>/dev/null || true' EXIT
 
 cd "$ENG"
-.venv/bin/python scripts/mate_bench.py --trials "$REMAINING" --max-hours 10
+.venv/bin/python scripts/mate_bench.py --trials "$REMAINING" --max-hours 10 3>&-
 rc=$?
 log "mate_bench exited rc=$rc (cron resumes if trials remain)"
 exit $rc
