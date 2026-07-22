@@ -132,6 +132,16 @@ was never going to be clean on this data. Decision: fix the engine first (POD tr
 edges/stacks — the root of both the OOM class and the malloc-churn CPU cost), then RE-RUN
 this exact experiment on the fixed engine. Benchmark tooling (mate_bench `--trials`,
 bench_resume cron driver, memguard, monitor) is retained and battle-tested for the re-run.
+**Post-scrap engine work (same day): the POD fix LANDED** — fork commits `6bf9e5a`
+(fullmove parity w/ PyVariant) + `365486f` (packed stacks) + `55d0cab` (POD moves) +
+`3688a2a` (backend Item-buffer pool, fixing the refactor's own glibc mmap-threshold
+regression — pin-only `6e5d503` halved throughput via mmap zero-fill page faults).
+Verified: full parity battery green, ccz1 chunk bytes identical (`cc_chunk_dump` golden),
+quiesced-box match-config benches (tail-6min): **p8 14.3 games/min @1.36GB flat (pre-POD:
+11.5 @0.97GB → +25% games / +33% moves)**; **p32 flat @2.0GB** — the config that OOM-looped
+at 190GB. The re-run of this experiment should use this engine; `matches.parameters
+--parallelism=8` kept as belt-and-suspenders (revisit if gate wall-clock matters).
+
 Partial finding worth keeping: arm A completed 5/5 trials — 1h18m / DNF@10h (draw-lock) /
 5h38m / 1h41m / 5h27m — a bimodal spread wide enough that run 23 (1h44m) and run 24 (3h36m)
 both sit inside ONE config's seed noise, i.e. the original "PCR costs 2.1×" read was
