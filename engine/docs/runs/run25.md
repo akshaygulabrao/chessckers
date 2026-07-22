@@ -69,6 +69,23 @@
   recovery was `rm` of the lock file (relock on a fresh inode). Watcher re-armed ~20:50;
   trial A2 unaffected (memguard live from 20:25: dirty≈0, oom_kill flat at 117).
 
+- `07-21/22` **ENGINE MEMORY-LEAK LIVELOCK poisons trial B2 (measurement caveat: B2's DNF is
+  infrastructure-censored, NOT a learning verdict).** During B2's gate phase (~02:00 UTC on,
+  candidates 21/22), the 128v match engine leaks anon memory at **~45GiB/min** — a clean
+  sawtooth 5G→190G→OOM-kill→restart every ~4 min (`memguard.jsonl`; lifetime oom_kill
+  117→247+). memguard's victim steering worked (engine dies, tmux/fleet survive, client
+  restarts the assignment) but the assignment is deterministic → **livelock**: generation
+  STOPPED ~2.6h, trainer idle, match games trickling ~1-3/min between kills. Crucially B2's
+  self-play trend was **B 23.2% and climbing** (blocks: 4.0%→23.2%) when learning froze — its
+  10h DNF must be scored as *censored-by-bug*, unlike A2's genuine draw-equilibrium DNF.
+  Monitor blind spot exposed: kills reset the FROZEN counter (moving-but-livelocked); memguard
+  ALERTS + `cc doctor` caught it. Decision: NO mid-trial surgery — let the 10h bound stamp
+  (~07:20 UTC), reset clears the poisoned assignment, B3 starts fresh. Repro preserved:
+  `/workspace/chessckers/bug-repro-oomleak/` (both nets + exact selfplay match args) — leak
+  suspect: pathological capture-chain/edge explosion on a shuffle position at 128v
+  `--no-share-trees`. **Post-bench TODO: repro locally, fix fork-side; consider match-engine
+  RLIMIT_AS + gate-timeout guard.**
+
 ## Result
 
 <staged — leave empty until both arms complete.>
