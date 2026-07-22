@@ -103,6 +103,27 @@
   SIGKILLs and revises the memguard page-cache theory: the killer was **anon record
   accumulation**, worst in draw-heavy phases.
 
+- `07-22` **GATE OOM ROOT CAUSE REVISED (record-leak fix was real but PARTIAL) + match-p8
+  mitigation staged.** Mid-B3, gate kills resumed (oom_kill 260→299, same ~4-min sawtooth,
+  ~23GB/min) despite the fixed `fc460f5` binary — B3 ran **5.4h of self-play with ZERO kills**
+  (07:21→12:48 UTC), then kills started exactly at its gate. Bisection (isolated box repros,
+  same nets/args as the live gate): **p4 flat ~800MB · p32 explodes 0.9→9.8GB in 40s**; Mac
+  Metal p4 flat; `MALLOC_ARENA_MAX=2` cuts p32 growth ~6× (still climbs ~2.3GB/min,
+  decelerating, only 2 games DONE in 6 min). Diagnosis: the reused search tree grows ~100
+  nodes/ply with **fat edges (each edge stores a full NativeMove — uci + waypoint strings,
+  ~9KB/node)** → a 400-ply marathon draw game holds ~300MB; 32 concurrent match games ≈
+  10GB+ logical, and glibc's per-thread arenas (~256 on the box) amplify that into the
+  ~190GB RSS that trips the cgroup killer. Matches are the trigger (draw-heavy = longest
+  games) and the idle self-play engine + trainer already hold most of the 197GiB budget.
+  Mitigation (staged in run.sh, user-triggered): append `--parallelism=8` to
+  `matches.parameters` — server-sent match params land AFTER the client's `--parallelism=32`
+  and **last flag wins (verified on the box: p32→p8 override ≡ p8-only, 90 vs 93 threads,
+  both flat ~860MB)**; self-play (the bench metric) untouched; server bounce only (state
+  preserved). Meanwhile **B3's gate survived the kill-loop: candidate 33 PROMOTED** (63%/
+  75% vs best 32 + panel) and self-play resumed ~14:50 UTC. Real fix (post-bench TODO):
+  slim tree edges to POD (the movegen-CPU-profile item), or jemalloc/tcmalloc +
+  `MALLOC_ARENA_MAX` for the engine env.
+
 ## Result
 
 <staged — leave empty until both arms complete.>
