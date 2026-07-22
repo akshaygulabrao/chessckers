@@ -126,4 +126,14 @@
 
 ## Result
 
-<staged — leave empty until both arms complete.>
+**SCRAPPED 2026-07-22 (user decision), data deleted without archive.** The OOM kill-loops
+(see Log) contaminated every gate phase — B2 censored, B3+ gates taxed — so the A/B answer
+was never going to be clean on this data. Decision: fix the engine first (POD tree
+edges/stacks — the root of both the OOM class and the malloc-churn CPU cost), then RE-RUN
+this exact experiment on the fixed engine. Benchmark tooling (mate_bench `--trials`,
+bench_resume cron driver, memguard, monitor) is retained and battle-tested for the re-run.
+Partial finding worth keeping: arm A completed 5/5 trials — 1h18m / DNF@10h (draw-lock) /
+5h38m / 1h41m / 5h27m — a bimodal spread wide enough that run 23 (1h44m) and run 24 (3h36m)
+both sit inside ONE config's seed noise, i.e. the original "PCR costs 2.1×" read was
+already unsupportable at n=1. Arm B never completed cleanly (B1 ~2h, B2 censored-by-bug,
+B3 interrupted by the scrap).
