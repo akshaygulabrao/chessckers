@@ -86,6 +86,23 @@
   `--no-share-trees`. **Post-bench TODO: repro locally, fix fork-side; consider match-engine
   RLIMIT_AS + gate-timeout guard.**
 
+- `07-22` **LEAK FOUND + FIXED + DEPLOYED (fork `fc460f5`), mid-B2.** Root cause: every
+  recorded ply stored the position's FULL legal `NativeMove` list (uci + waypoint strings —
+  thousands of chain moves on shuffle positions ⇒ ~10MB/move) in `PureRecord.legal`, held until
+  game end — 450-ply games never flushed. Repro'd locally off the preserved nets (~1.6GB/min at
+  p4; `--no-reuse-tree` exonerated the tree). Fix: canonicalize each record to uci-lex order
+  (edge order is lc0-prior-sorted, NOT movegen order — caught by the guard on its first run),
+  drop `legal` after recording (FNV hash stamped), regenerate from the FEN at `encode_chunk`
+  + re-sort + **abort on hash mismatch** (no silent misalignment). Verified: RSS plateaus;
+  990-record battery decodes aligned/uci-sorted with **PyVariant oracle parity**; consumers
+  order-agnostic (train_az pairing, watch_game argmax/lookup); cc test suite deltas = zero
+  (parity/rules corpus failures byte-identical pre/post = stale fixtures). Box deploy 05:48
+  UTC: memory FLAT at 0.8G, oom_kill frozen at 260, gate matches unblocked (56 done, 57
+  racing). NOTE for comparability: post-fix chunks emit `legal_moves` uci-sorted (semantically
+  identical, not byte-identical to pre-fix). This also retro-explains the run-23/24 trainer
+  SIGKILLs and revises the memguard page-cache theory: the killer was **anon record
+  accumulation**, worst in draw-heavy phases.
+
 ## Result
 
 <staged — leave empty until both arms complete.>
