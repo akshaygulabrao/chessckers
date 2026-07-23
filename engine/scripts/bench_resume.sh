@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # bench_resume.sh — self-healing cron driver for the run-25 A/B mate_bench
-# experiment (arm A = Gumbel, arm B = Gumbel+PCR 0.25/100v; 5 trials each,
-# trainer seeds 0-4 per arm).
+# experiment (arm A = Gumbel, arm B = Gumbel+PCR 0.25/100v; TRIALS per arm,
+# trainer seeds 0..TRIALS-1 per arm). 2026-07-23: TRIALS 5→2 — the metric moved
+# to search-visits-to-crossing (bench_visits.py, ops-noise-immune), which needs
+# far fewer trials than wall-clock did on a noisy shared box.
 #
 # Why cron: the 07-20 first attempt drove the two-arm chain from inside tmux;
 # the box's cgroup OOM killer (memory.events at the time: oom 202 /
@@ -31,7 +33,7 @@ DB=$SRV/chessckers.db
 RES=$WS/BENCH_RESULTS.jsonl
 A_NAME=run25a_e8d8_gumbelS1_bench
 B_NAME=run25b_e8d8_gumbelS1_pcr25_bench
-TRIALS=5
+TRIALS=2
 BASE_ENV="ARCH_VERSION=v5 C_FILTERS=64 N_BLOCKS=6 SE_RATIO=8 POLICY_TARGET=improved VALUE_Q_RATIO=0 EMA_DECAY=0.99 PUBLISH_GAMES=400 PARALLELISM=32"
 PCR_ENV="PCR_FULL_PROB=0.25 PCR_FAST_VISITS=100"
 log(){ echo "[resume $(date -u '+%m-%d %H:%M')] $*"; }

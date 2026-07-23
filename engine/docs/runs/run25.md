@@ -147,3 +147,28 @@ Partial finding worth keeping: arm A completed 5/5 trials — 1h18m / DNF@10h (d
 both sit inside ONE config's seed noise, i.e. the original "PCR costs 2.1×" read was
 already unsupportable at n=1. Arm B never completed cleanly (B1 ~2h, B2 censored-by-bug,
 B3 interrupted by the scrap).
+
+## RE-RUN (post-POD engine 3688a2a)
+
+- `07-22 19:13 UTC` Re-launched, same 5+5 design, engine `3688a2a` (POD fix + backend pool).
+  Ran clean end-to-end through arm A (5/5 MATE: 1h13m/2,144g · 3h28m/2,701g · 2h43m/3,278g ·
+  2h11m/3,085g · 3h41m/3,536g; median 2h44m/3,085g) and into arm B (B1 MATE 1h39m/5,610g @
+  3,378 g/h — a *wall-clock win* over the arm-A median despite 1.8× the games; B2 MATE ~9h/
+  ~10.5k g; B3 interrupted mid-trial). No kill-loops (the POD fix held: memory flat, sporadic
+  single oom_kills only — #319/320/321, each inside a trial window but self-recovered).
+- `07-23` **SCRAPPED AGAIN (user decision) — wall-clock is the wrong metric on a shared box.**
+  Throughput swung 777–3,378 games/h with tenant contention + gate pauses + OOM recoveries;
+  the arm medians measure the neighbors, not the learner. Data preserved on the box
+  (`BENCH_RESULTS.scrapped-20260723.jsonl`, `bench_trials.scrapped-20260723/`).
+- `07-23` **RESTRUCTURED: 2+2 trials, primary metric = SEARCH VISITS TO CROSSING.**
+  V = Σ_games (records×800 + (plies−records)×100) from the per-trial chunk tars —
+  `records` = full-search moves (= all moves in arm A), game plies exact from any one
+  record's `fen_ply + moves_left_target` (PCR-sparse-proof). Ops-noise-immune (gate pauses,
+  OOM idle, tenant contention don't appear in it), hardware-portable, and fair to PCR (its
+  games are cheap by design — games-to-crossing penalizes it, visits don't). Tooling:
+  `mate_bench.save_trial_db` now tars the server games dir per trial (the only moment the
+  chunks exist — reset wipes them); `bench_visits.py` (new) replays crossings at thresholds
+  0.5/0.75/0.9 and computes V per trial + per-arm medians; `bench_resume.sh` TRIALS=2.
+  Scrapped-run demo of the metric (games×E[v], plies assumed equal): arm A median ≈ 2.50M
+  visit-moves vs B1 ≈ 1.54M — PCR *ahead* on compute, the opposite of the wall-clock read.
+  Relaunched 18:47 UTC via the cron driver (arm A seed 0 first; seeds 0–1 per arm).

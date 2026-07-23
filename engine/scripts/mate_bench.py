@@ -486,6 +486,20 @@ def save_trial_db(dest_dir: str, trial: int, args) -> None:
     if os.path.exists(args.db + "-wal") and os.path.getsize(args.db + "-wal"):
         shutil.copyfile(args.db + "-wal", dst + "-wal")
     _log(f"trial DB saved → {dst}")
+    # Archive the trial's ccz1 chunks (server games dir) alongside the DB: they
+    # carry per-game record counts + moves_left (→ exact plies + full/fast move
+    # split), which bench_visits.py turns into the ops-noise-immune metric
+    # (search visits to crossing). reset_fleet wipes the dir — this is the only
+    # moment the data exists.
+    games_dir = os.path.join(SERVER_DIR, "games")
+    if os.path.isdir(games_dir):
+        tar = os.path.join(dest_dir, f"trial{trial}_games.tar.gz")
+        r = subprocess.run(["tar", "czf", tar, "-C", games_dir, "."],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            _log(f"trial chunks archived → {tar}")
+        else:
+            _log(f"(chunk archive FAILED rc={r.returncode}: {r.stderr.strip()})")
 
 
 def run_trials(args) -> int:
