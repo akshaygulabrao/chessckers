@@ -185,3 +185,33 @@ B3 interrupted by the scrap).
   counter ≡ train counter (no gate pauses), faster wall-clock per trial, publishes still
   every 400 games. Post-experiment TODO: deploy fork movegen opt `4a2399f` (6.3× corpus
   bench, held back mid-experiment), then decide gating posture for real runs.
+- `07-24` **GATES-OFF RESULT (experiment CLOSED, 3/4 trials clean; B2 censored-by-bug).**
+  Per `bench_visits.py` (window 1000, threshold 0.9, self-play-only):
+
+  | trial | games | plies | V@90% |
+  |---|---|---|---|
+  | A1 (seed 0) | 2,323 | 184,016 | **147.2M** |
+  | A2 (seed 1) | 2,933 | 233,955 | **187.2M** |
+  | B1 (seed 0) | 7,625 | 534,066 | **147.2M** [EST] |
+  | B2 (seed 1) | DNF | — | censored (OOM kill-loop, see below) |
+
+  **Verdict: PCR-25 reaches MATE-crossing on equal-or-fewer search visits** (B1 147.2M =
+  arm A's best seed; arm A median 167.2M) **while its wall-clock was the fastest of the
+  batch** (B1 1h01m vs A 1h09m/1h51m) — i.e. no sample-efficiency loss detected, and the
+  original "PCR costs 2.1×" wall-clock read is dead. Caveats: n=1 clean arm-B trial (B2
+  lost to infra), and PCR plays 2.6–3.3× more games for the same visit budget (games are
+  cheap by design). Data: `bench_trials/` tars + DBs pulled to Mac
+  (`engine/weights/run25-bench-artifacts/`), `bench_visits.json` alongside.
+- `07-24` **B2 = OOM kill-loop, NEW balloon on the POD-fixed engine.** B2 (seed 1, from
+  ~04:31 UTC) ballooned to the 197GiB cgroup ceiling every ~25–45min (kills #322–328),
+  ~10–15 games surviving per cycle → survivorship-censored data + soft livelock; halted
+  08:14 UTC, partial data archived (`bench_trials/run25b_DNF_b2-20260724/`). **Live-process
+  forensics captured pre-halt** (`bug-repro-balloon/`, also on Mac): engine RSS 163GB =
+  **~2,600 anon mappings of exactly 63–64MB (glibc HEAP_MAX_SIZE), RSS≈VSZ** — the
+  fat-reuse-trees × glibc-arena signature again, at the selfplay 800v/PCR/marathon-net
+  op-point that the POD verification (match config, 128v) never covered. ~163GB / 32
+  in-flight games ≈ 5GB/game ≈ ~18KB/node at 800v×400ply — an order above POD-edge cost,
+  so something big is still retained (or arena fragmentation amplifies it). Repro matrix
+  running (box: baseline / MALLOC_ARENA_MAX=2 / --no-share-trees @p8; Mac: same op-point
+  for malloc-stack attribution), net snapshot preserved (`bug-repro-balloon/net.bin` — the
+  exact mid-training net whose marathon games trigger it).
