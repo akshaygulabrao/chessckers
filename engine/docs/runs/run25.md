@@ -172,3 +172,16 @@ B3 interrupted by the scrap).
   Scrapped-run demo of the metric (games×E[v], plies assumed equal): arm A median ≈ 2.50M
   visit-moves vs B1 ≈ 1.54M — PCR *ahead* on compute, the opposite of the wall-clock read.
   Relaunched 18:47 UTC via the cron driver (arm A seed 0 first; seeds 0–1 per arm).
+- `07-23` First 2+2 attempt ran arm A clean and fast (A1 MATE 1h30m/2,765g with the trial-1
+  chunk tar archiving verified; A2 MATE ~1h55m) — then **RESTARTED GATE-FREE (user decision)**:
+  gates are invisible to the visits metric but burn most of the wall-clock, so **promotion
+  gating is now DISABLED** for the experiment (`lczero-server` `matches.disabled=true`, new
+  config flag: every upload auto-promotes, pre-06-13 behavior). Known side effect (flagged):
+  the champion pool comes from promotion matches, so the **regression panel AND league
+  self-play are inert** — both arms become plain self-play + auto-promote; identity vs runs
+  23/24 is further reduced, but the arms stay mutually comparable, which is what the A/B
+  needs. Arm-A-gated stamps scrapped (`BENCH_RESULTS.scrapped-20260723-gatesoff.jsonl`,
+  `bench_trials.scrapped-20260723-gatesoff/`). Relaunched 00:25 UTC Jul 24. Expected: work
+  counter ≡ train counter (no gate pauses), faster wall-clock per trial, publishes still
+  every 400 games. Post-experiment TODO: deploy fork movegen opt `4a2399f` (6.3× corpus
+  bench, held back mid-experiment), then decide gating posture for real runs.
