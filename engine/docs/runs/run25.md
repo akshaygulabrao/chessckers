@@ -234,6 +234,30 @@ B3 interrupted by the scrap).
   opt `4a2399f` rode along in the same rebuild — box engine now has both. Fleet left
   QUIESCED (experiment closed); NOTE `matches.disabled=true` still set in box
   serverconfig — decide gating posture before the next run.
+- `07-24` **B2 RE-RUN COMPLETE on the fixed engine — 2+2 design DONE (experiment CLOSED for real).**
+  B2 (seed 1, gates-off, slim-edge engine `4545d43`, launched 11:10 UTC) MATE-crossed at
+  **2h47m / 8,766 games**, window at crossing b=900 w=6 d=94, **zero OOM kills end-to-end**
+  (counter pinned at 328; cgroup peaked ~5GB total vs the 197GiB kill-loop that censored
+  the first B2). Mid-trial it entered the marathon-game regime (~46 → ~12 games/min) and
+  cruised straight through — the exact phase that used to be lethal. Final table
+  (`bench_visits.py`, V@90%):
+
+  | trial | games | plies | V@90% | wall |
+  |---|---|---|---|---|
+  | A1 (seed 0) | 2,323 | 184,016 | 147.2M | 1h09m |
+  | A2 (seed 1) | 2,933 | 233,955 | 187.2M | 1h51m |
+  | B1 (seed 0) | 7,625 | 534,066 | 147.2M [EST] | 1h01m |
+  | B2 (seed 1) | 8,766 | 735,109 | 202.4M | 2h47m |
+
+  **VERDICT: PCR-25 is visit-neutral.** Arm medians 167.2M (A) vs 174.8M (B) — +4.5%,
+  far inside arm A's own seed spread (147–187M); seed-paired: seed 0 ties (147.2 = 147.2),
+  seed 1 B +8% (202.4 vs 187.2). No sample-efficiency loss OR gain in search visits, while
+  PCR plays ~3× the games (and thus ~3× the distinct positions) per visit budget — the
+  original "PCR costs 2.1×" wall-clock read is conclusively dead. Caveat: B2 ran on the
+  slim-edge engine vs `3688a2a` for the other three (semantically neutral — byte-identical
+  moves/chunks — but noted). All artifacts on Mac: `engine/weights/run25-bench-artifacts/`
+  (4 trial DBs + game tars + `bench_visits.json` + `BENCH_RESULTS.jsonl` + the balloon
+  forensics kit). Fleet + driver fully idle; box kept (user may delete).
 - `07-24` **Throughput at parity (fork `4545d43` memo tuning).** Interleaved Mac A/B
   (240s rounds, 128v matchcfg, B2 net): pre-fix 132k/142k nodes/min vs fixed 128k/212k,
   **npm identical 133–135** — no per-move cost change. Memo tuning: 512 slots (32
