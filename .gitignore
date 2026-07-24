@@ -22,3 +22,4 @@ reference/
 
 # Off-box telemetry pulls (cc backup)
 telemetry/
+engine/weights/run26-bench-artifacts/
