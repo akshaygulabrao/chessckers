@@ -215,3 +215,30 @@ B3 interrupted by the scrap).
   running (box: baseline / MALLOC_ARENA_MAX=2 / --no-share-trees @p8; Mac: same op-point
   for malloc-stack attribution), net snapshot preserved (`bug-repro-balloon/net.bin` — the
   exact mid-training net whose marathon games trigger it).
+- `07-24` **BALLOON ROOT-CAUSED AND FIXED (fork `fba8f8c`, deployed to box + Mac).**
+  Matrix: glibc AND tcmalloc balloon (→ not allocator), `--no-share-trees` balloons (→ not
+  tree sharing), no-training balloons, **v128 flat even with PCR+noise+training** (→ scales
+  with search size), Mac/Metal flat (games miss the explosion phase in-window), matchcfg
+  flat (box healthy; the POD verification was honest but never covered this op-point).
+  20-min heaptrack at the killer config: **19.6GB live held from `GenerateLegalMoves`, 277M
+  move allocations, 15.6M expanded nodes** — every tree Edge owned a `shared_ptr<NativeMove>`
+  (~300B: uci string + chain vectors) retained for the node's lifetime. Late-game
+  chain-explosion positions (500–1000+ legal moves) × 800v expansion (~300 new nodes/move)
+  × 450-ply no-draw-rule marathons × tree reuse = multi-GB per in-flight game × p32 = the
+  197GiB ceiling. **Fix = the real POD tree-edge slimming**: Edge → {uint16 gen_idx,
+  uint16 p} (4B), expanded Node keeps ONE POD ChessBoard copy, moves re-materialize on
+  demand via deterministic movegen (exact by construction) behind a content-keyed
+  thread-local memo. Verified: rules battery green; box CUDA at the exact B2 config
+  **783MB FLAT over 8 min vs 91GB pre-fix (~120× at that point, unbounded vs bounded)**;
+  Mac flat; UCI sane; ccz1 chunks decode aligned (legal_hash canary). The movegen 6.3×
+  opt `4a2399f` rode along in the same rebuild — box engine now has both. Fleet left
+  QUIESCED (experiment closed); NOTE `matches.disabled=true` still set in box
+  serverconfig — decide gating posture before the next run.
+- `07-24` **Throughput at parity (fork `4545d43` memo tuning).** Interleaved Mac A/B
+  (240s rounds, 128v matchcfg, B2 net): pre-fix 132k/142k nodes/min vs fixed 128k/212k,
+  **npm identical 133–135** — no per-move cost change. Memo tuning: 512 slots (32
+  thrashed on descent paths), CreateEdges seeds the memo (kills the double-movegen per
+  expansion), board hash cached on Node (no rehash per materialization). **Bench
+  footguns for the file:** `tournamentstatus nodes/moves are CUMULATIVE` (summing them
+  per-line overstates ~30×), and single-shot box benches are tenant-noise-dominated
+  (±2× swings) — throughput A/Bs belong on the Mac, interleaved.
