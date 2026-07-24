@@ -69,7 +69,8 @@ TRIALS_DIR = "/workspace/chessckers/bench_trials"
 # from. PCR_* reach bootstrap only on the post-reset empty DB.
 CRON_KEYS = ("RUN_NAME", "ARCH_VERSION", "C_FILTERS", "N_BLOCKS", "SE_RATIO",
              "POLICY_TARGET", "VALUE_Q_RATIO", "EMA_DECAY", "PUBLISH_GAMES",
-             "PARALLELISM", "PCR_FULL_PROB", "PCR_FAST_VISITS", "SEED")
+             "PARALLELISM", "PCR_FULL_PROB", "PCR_FAST_VISITS",
+             "GUMBEL_SH", "GUMBEL_M", "VISITS", "SEED")
 
 # training_games.result codes (lczero-server main.go gameready handler)
 RES_WHITE, RES_BLACK, RES_DRAW = 1, 2, 3

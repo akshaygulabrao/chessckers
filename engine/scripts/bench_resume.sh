@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# bench_resume.sh — self-healing cron driver for the run-25 A/B mate_bench
-# experiment (arm A = Gumbel, arm B = Gumbel+PCR 0.25/100v; TRIALS per arm,
-# trainer seeds 0..TRIALS-1 per arm). 2026-07-23: TRIALS 5→2 — the metric moved
-# to search-visits-to-crossing (bench_visits.py, ops-noise-immune), which needs
-# far fewer trials than wall-clock did on a noisy shared box.
+# bench_resume.sh — self-healing cron driver for mate_bench experiments.
+# 2026-07-24: rewritten single-arm for RUN 26 — Gumbel S2 (Sequential Halving,
+# --visits=64 --gumbel-sh --gumbel-m=16), TRIALS=2, trainer seeds 0..TRIALS-1.
+# The control arm is run 25's gates-off arm A (already banked in
+# BENCH_RESULTS.jsonl + bench_trials tars) and is NOT re-run.
+# Metric: search-visits-to-crossing (bench_visits.py, ops-noise-immune).
 #
 # Why cron: the 07-20 first attempt drove the two-arm chain from inside tmux;
 # the box's cgroup OOM killer (memory.events at the time: oom 202 /
@@ -31,11 +32,12 @@ ENG=$WS/engine
 SRV=$WS/lczero-server
 DB=$SRV/chessckers.db
 RES=$WS/BENCH_RESULTS.jsonl
-A_NAME=run25a_e8d8_gumbelS1_bench
-B_NAME=run25b_e8d8_gumbelS1_pcr25_bench
+A_NAME=run26_e8d8_gumbelS2_bench
 TRIALS=2
-BASE_ENV="ARCH_VERSION=v5 C_FILTERS=64 N_BLOCKS=6 SE_RATIO=8 POLICY_TARGET=improved VALUE_Q_RATIO=0 EMA_DECAY=0.99 PUBLISH_GAMES=400 PARALLELISM=32"
-PCR_ENV="PCR_FULL_PROB=0.25 PCR_FAST_VISITS=100"
+# S2 env: bootstrap emits trainParams ["--visits=64","--gumbel-sh=true","--gumbel-m=16"]
+# (no Dirichlet/temperature flags — Gumbel root perturbation IS the exploration).
+# Deploy-order: the engine binary must have the S2 commit BEFORE this arms.
+BASE_ENV="ARCH_VERSION=v5 C_FILTERS=64 N_BLOCKS=6 SE_RATIO=8 POLICY_TARGET=improved VALUE_Q_RATIO=0 EMA_DECAY=0.99 PUBLISH_GAMES=400 PARALLELISM=32 GUMBEL_SH=true GUMBEL_M=16 VISITS=64"
 log(){ echo "[resume $(date -u '+%m-%d %H:%M')] $*"; }
 
 # Liveness heartbeat BEFORE any early exit: the 07-20 flock wedge was invisible
@@ -45,10 +47,10 @@ date -u '+%F %T' > "$WS/bench_resume.heartbeat" 2>/dev/null || true
 # A watcher already driving? Nothing to do.
 pgrep -f 'mate_benc[h].py --trials' >/dev/null && exit 0
 
-read -r A_DONE B_DONE < <(python3 - "$RES" "$A_NAME" "$B_NAME" <<'PYEOF'
+read -r A_DONE < <(python3 - "$RES" "$A_NAME" <<'PYEOF'
 import json, sys
-path, an, bn = sys.argv[1:4]
-a = b = 0
+path, an = sys.argv[1:3]
+a = 0
 try:
     for line in open(path):
         line = line.strip()
@@ -62,23 +64,16 @@ try:
             continue
         if r.get("run_name") == an:
             a += 1
-        elif r.get("run_name") == bn:
-            b += 1
 except FileNotFoundError:
     pass
-print(a, b)
+print(a)
 PYEOF
 )
-if [ "$B_DONE" -ge "$TRIALS" ]; then
+if [ "$A_DONE" -ge "$TRIALS" ]; then
   exit 0   # experiment complete; leaving the cron line is a cheap no-op
 fi
-if [ "$A_DONE" -lt "$TRIALS" ]; then
-  NAME=$A_NAME; DONE=$A_DONE
-  ENV_LINE="RUN_NAME=$A_NAME $BASE_ENV SEED=$DONE"
-else
-  NAME=$B_NAME; DONE=$B_DONE
-  ENV_LINE="RUN_NAME=$B_NAME $BASE_ENV $PCR_ENV SEED=$DONE"
-fi
+NAME=$A_NAME; DONE=$A_DONE
+ENV_LINE="RUN_NAME=$A_NAME $BASE_ENV SEED=$DONE"
 REMAINING=$((TRIALS - DONE))
 log "driving $NAME: done=$DONE remaining=$REMAINING (seed base $DONE)"
 
