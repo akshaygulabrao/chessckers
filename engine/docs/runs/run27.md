@@ -94,6 +94,64 @@
     (~150M ⇒ ~6h) both fit; only a PUCT cost >240M would DNF — and that DNF
     would itself be decisive for H_algo (>7× worse than SH), not a defect.
 
+- `07-24 19:32 UTC` Trial 1 (seed 0): crossed **8,000 games / 37m**, window b=900 w=41 d=59.
+- `07-24 20:30 UTC` Trial 2 (seed 1): crossed **8,809 games / 50m**, window b=900 w=100 d=0.
+  Zero OOM kills across both trials (counter 328 throughout).
+
 ## Result
 
-<pending>
+**H_budget CONFIRMED. The run-26 win belongs to the VISIT BUDGET, not to
+Sequential Halving.** PUCT@64v median **28.1M** vs SH@64v **31.8M** — PUCT is
+if anything ~12% BETTER on visits, far inside the H_budget band (decisive if
+≤ 1.3× SH, i.e. ≤ 41M; H_algo would have needed ≥ 64M). Both PUCT trials beat
+both SH trials.
+
+### The completed 2×2 (V@90%, median of 2 seeds)
+
+| | 800 visits | 64 visits | budget effect |
+|---|---|---|---|
+| **PUCT + Dirichlet + temp** | 167.2M *(147.2 / 187.2)* | **28.1M** *(28.0 / 28.2)* | **5.9×** |
+| **Gumbel + Seq. Halving** | *(not run)* | 31.8M *(31.8 / 31.9)* | — |
+| **algorithm effect @64v** | — | **0.89× (PUCT better)** | |
+
+- **Budget effect: 5.9×** (167.2M → 28.1M). This is the entire run-26 result.
+- **Algorithm effect: none detectable** — 28.1M vs 31.8M is a 13% gap in
+  PUCT's favour, smaller than run-25's 27% seed spread at 800v, though both
+  low-visit arms are individually very tight (PUCT 28.0/28.2, SH 31.8/31.9).
+- Robust across thresholds: PUCT ≤ SH at 50% (22.0 vs 19.7–11.7 — mixed),
+  75% (24.7 vs 21.7–31.3 — mixed) and 90% (28.0/28.2 vs 31.8/31.9 — PUCT
+  better on all four pairings). The 90% verdict is the clean one.
+
+### What SURVIVES for Gumbel S2
+
+**Wall-clock, via throughput — not sample efficiency.** S2 crossed in
+**18m/23m** vs PUCT's **37m/50m**, despite spending ~14% MORE visits, because
+it sustains ~4.4× more visits/hour on the same GPU (106M/h vs 24M/h, measured;
+plies/game comparable). So on this hardware S2 still reaches the milestone in
+roughly **half the wall-clock**. Caveat: that throughput edge may be a property
+of THIS implementation's batch formation (SH makes many root children eligible
+per gather pass; PUCT at n=64 is sequentially dependent), not of the algorithm
+in general — unconfirmed.
+
+### Honest process note
+
+Mid-run directional calls from Black-share readings were WRONG (I read run 27's
+0% at 2.6k games and 21% at ~21.7M visits as evidence for H_algo). The learning
+curve on this task SNAPS — run 27 T1 went 21% → 90% in its last ~6M visits,
+T2 went 10% → 49% → 90% within ~20 minutes. **Share-so-far is not a predictor
+of visits-to-crossing on this metric; only the crossing is.** Do not score
+these A/Bs before the stamp.
+
+### Caveats
+
+- n=2 per arm; e8/d8 endgame only; gates off; one net size.
+- **This says nothing about 64v being right for HARDER tasks.** The finding is
+  "800 visits is overkill on this small endgame", which is exactly the kind of
+  result that may invert on the full start (higher branching, deeper tactics).
+- The literature's prior (Gumbel exists because PUCT degrades at small n) is
+  NOT contradicted in general — only shown not to bind at n=64 on this task.
+  A lower budget (n=16, n=8) is where SH should start to separate, and is the
+  natural place to look for the effect if it exists here.
+
+Artifacts: `engine/weights/run27-bench-artifacts/`. Fleet idle; box kept;
+`matches.disabled=true` still set.

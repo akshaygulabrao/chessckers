@@ -147,8 +147,19 @@ control's BEST seed) with ~4.6× margin to spare.**
   censoring. Wall-clock 18m/23m vs 1h09m/1h51m (directionally consistent, but
   wall-clock remains tenant-noise-dominated — visits is the verdict).
 
+> **⚠ ABLATION RESOLVED 2026-07-24 — see [run27.md](run27.md). Caveat 1 below is
+> now ANSWERED, and it reassigns the credit for this run's win.** PUCT at 64
+> visits (the control's root algorithm, control's flags, budget dropped 800→64)
+> crosses at **28.1M median — BETTER than S2's 31.8M**. So the 5.3× reported
+> here is a **VISIT-BUDGET effect (5.9×), not a Sequential Halving effect**;
+> the algorithm contributes no detectable sample-efficiency gain at n=64 on
+> this task. What survives for S2 is **wall-clock**: it crossed in 18m/23m vs
+> PUCT's 37m/50m by sustaining ~4.4× more visits/hour on the same GPU.
+> Read this run's "S2 wins 5.3×" claim as "64 visits wins 5.9×".
+
 **Caveats (what this does NOT establish):**
-1. **The ablation is missing.** S2 changes TWO things at once vs the control:
+1. **The ablation is missing.** *(ANSWERED — see the box above and run27.md.)*
+   S2 changes TWO things at once vs the control:
    visit budget (800→64) AND root algorithm (PUCT+Dirichlet+temperature →
    Gumbel-top-m + Sequential Halving). This run cannot say whether plain PUCT at
    64v would win too — i.e. whether the credit belongs to "low visits are enough
