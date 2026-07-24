@@ -32,12 +32,16 @@ ENG=$WS/engine
 SRV=$WS/lczero-server
 DB=$SRV/chessckers.db
 RES=$WS/BENCH_RESULTS.jsonl
-A_NAME=run26_e8d8_gumbelS2_bench
+A_NAME=run27_e8d8_puct64_bench
 TRIALS=2
-# S2 env: bootstrap emits trainParams ["--visits=64","--gumbel-sh=true","--gumbel-m=16"]
-# (no Dirichlet/temperature flags — Gumbel root perturbation IS the exploration).
-# Deploy-order: the engine binary must have the S2 commit BEFORE this arms.
-BASE_ENV="ARCH_VERSION=v5 C_FILTERS=64 N_BLOCKS=6 SE_RATIO=8 POLICY_TARGET=improved VALUE_Q_RATIO=0 EMA_DECAY=0.99 PUBLISH_GAMES=400 PARALLELISM=32 GUMBEL_SH=true GUMBEL_M=16 VISITS=64"
+# RUN 27 = the run-26 ABLATION. Same 64-visit budget, but the run-25 control's
+# ROOT ALGORITHM (PUCT + Dirichlet + temperature) instead of Gumbel+SH — i.e.
+# GUMBEL_SH is deliberately NOT set, so bootstrap emits
+# ["--noise-epsilon=0.25","--noise-alpha=0.3","--temperature=1.0","--tempdecay-moves=15","--visits=64"].
+# Completes the 2x2 with run-25 arm A (800v PUCT) and run-26 (64v Gumbel+SH):
+#   800v PUCT vs 64v PUCT  -> the budget effect
+#   64v PUCT  vs 64v SH    -> the algorithm effect (the open question)
+BASE_ENV="ARCH_VERSION=v5 C_FILTERS=64 N_BLOCKS=6 SE_RATIO=8 POLICY_TARGET=improved VALUE_Q_RATIO=0 EMA_DECAY=0.99 PUBLISH_GAMES=400 PARALLELISM=32 VISITS=64"
 log(){ echo "[resume $(date -u '+%m-%d %H:%M')] $*"; }
 
 # Liveness heartbeat BEFORE any early exit: the 07-20 flock wedge was invisible
